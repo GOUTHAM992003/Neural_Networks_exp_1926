@@ -1,0 +1,33 @@
+// =============================================================================
+// FILE: ops/attention.def
+// PURPOSE: Attention mechanisms and transformer building blocks
+// =============================================================================
+//
+// Attention is the core innovation behind Transformers (GPT, BERT, etc.)
+// These are FUSED operations - they combine multiple steps for efficiency.
+//
+// Standard Attention formula:
+//   Q = X @ Wq,  K = X @ Wk,  V = X @ Wv
+//   scores = softmax(Q @ K.T / √d_k)
+//   output = scores @ V
+//
+// Why fused ops?
+//   - Fewer kernel launches
+//   - Better memory locality
+//   - Can use FlashAttention-style optimizations
+//
+// Variants implemented:
+//   - Attention: Standard scaled dot-product attention
+
+//
+// These operations SAVE Q, K, V, scores on tape for backward pass!
+// =============================================================================
+
+// --- Standard Attention ---
+OP(Attention,      4, "attention")       // Full attention: (X, Wq, Wk, Wv)
+                                         // Computes: softmax(XWq @ (XWk).T / √d) @ XWv
+
+
+// --- Gated Activations (transformer FFN blocks) ---
+OP(SWIGLU,         1, "swiglu")          // SwiGLU: swish(xW) ⊙ (xV)
+                                         // Used in LLaMA, PaLM FFN blocks

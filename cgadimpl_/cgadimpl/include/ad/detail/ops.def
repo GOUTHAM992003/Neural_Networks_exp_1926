@@ -1,0 +1,98 @@
+// =============================================================================
+// FILE: cgadimpl/include/ad/detail/ops.def
+// PURPOSE: Master operation definition file - includes all operation categories
+// =============================================================================
+//
+// HOW THIS WORKS:
+// ---------------
+// This file is the SINGLE ENTRY POINT for all operation definitions.
+// It uses C preprocessor #include to pull in operations from category files.
+//
+// USAGE PATTERN (X-macro technique):
+// ----------------------------------
+// In consuming code (e.g., vjp_lookup, op_name, enum generation):
+//
+//   #define OP(name, arity, str) case Op::name: return &vjp_##name;
+//   #include "ad/detail/ops.def"
+//   #undef OP
+//
+// The preprocessor expands this to include ALL operations from ALL categories,
+// generating a complete switch statement or enum automatically.
+//
+// WHY SPLIT INTO FILES?
+// ---------------------
+// 1. ORGANIZATION: Each category (activation, linalg, etc.) is self-contained
+// 2. SCALABILITY: As ops grow to 500+, files stay manageable (10-20 ops each)
+// 3. COLLABORATION: Team members can edit different categories without conflicts
+// 4. NAVIGATION: Easy to find ops by category instead of scrolling 500 lines
+// 5. DOCUMENTATION: Each category file has its own explanatory comments
+//
+// ADDING A NEW OPERATION:
+// -----------------------
+// 1. Find the appropriate category file in ops/<category>.def
+// 2. Add your OP(Name, Arity, "string") line
+// 3. Implement the forward function in nodeops.cpp
+// 4. Implement the VJP function in autodiff_vjp_ops.cpp
+// 5. (Optional) Implement JVP in autodiff_jvp_ops.cpp
+//
+// PERFORMANCE NOTE:
+// -----------------
+// This split is PURELY organizational. At compile time, all ops are expanded
+// into a single switch statement - ZERO runtime overhead compared to a
+// single monolithic ops.def file.
+//
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// CATEGORY: Core Operations
+// Operations that form the foundation of the computation graph
+// -----------------------------------------------------------------------------
+#include "ops/core.def"
+
+// -----------------------------------------------------------------------------
+// CATEGORY: Element-wise Operations
+// Binary arithmetic (Add, Sub, Mul, Div) and unary math (Exp, Log, etc.)
+// -----------------------------------------------------------------------------
+#include "ops/elementwise.def"
+
+// -----------------------------------------------------------------------------
+// CATEGORY: Trigonometric Functions
+// Sin, Cos, Sinh, Cosh - used in positional encodings and some activations
+// -----------------------------------------------------------------------------
+#include "ops/trigonometry.def"
+
+// -----------------------------------------------------------------------------
+// CATEGORY: Activation Functions
+// ReLU, Sigmoid, Tanh, GELU, SiLU, Mish, and other non-linearities
+// -----------------------------------------------------------------------------
+#include "ops/activation.def"
+
+// -----------------------------------------------------------------------------
+// CATEGORY: Reduction Operations
+// Sum, Mean, RowSum, Softmax - aggregate values across dimensions
+// -----------------------------------------------------------------------------
+#include "ops/reduction.def"
+
+// -----------------------------------------------------------------------------
+// CATEGORY: Linear Algebra Operations
+// MatMul, Linear, Transpose - the workhorses of neural networks
+// -----------------------------------------------------------------------------
+#include "ops/linalg.def"
+
+// -----------------------------------------------------------------------------
+// CATEGORY: Normalization Layers
+// LayerNorm, RMSNorm - critical for stable deep network training
+// -----------------------------------------------------------------------------
+#include "ops/normalization.def"
+
+// -----------------------------------------------------------------------------
+// CATEGORY: Attention Mechanisms
+// Attention variants, SwiGLU, MOE - transformer building blocks
+// -----------------------------------------------------------------------------
+#include "ops/attention.def"
+
+// -----------------------------------------------------------------------------
+// CATEGORY: Loss Functions
+// CrossEntropy, MSE, MAE - measure prediction error for training
+// -----------------------------------------------------------------------------
+#include "ops/loss.def"

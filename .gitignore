@@ -1,0 +1,61 @@
+# =========================
+# Build Artifacts
+# =========================
+*.o
+*.so
+*.a
+*.out
+*.exe
+snippet_runner
+
+# =========================
+# Build Directories
+# =========================
+build/
+lib/objects/
+*/lib/objects/
+
+# =========================
+# IDE & Editor
+# =========================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+venv/
+.env
+
+# =========================
+# Temporary & Log Files
+# =========================
+*.tmp
+*.log
+*.bak
+core
+core.*
+
+# =========================
+# OS Generated
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Large Data Files (optional - uncomment if needed)
+# =========================
+# *.csv
+# *.bin
+# *.pt
+# *.pth
+libtorch_tests/libtorch/
+libtorch_tests/*.zip
