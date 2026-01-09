@@ -1,0 +1,508 @@
+//============================================================
+// file: cgadimpl/src/core/inplace.cpp
+//============================================================
+//
+// This file implements the core logic for **in-place checkpointing,
+// tensor versioning, and alias tracking** within the autodiff engine.
+//
+// It maintains consistency when tensors are modified in-place
+// (e.g., via add_, mul_, or in-place parameter updates) while still
+// supporting checkpoint recomputation, gradient propagation,
+// and memory safety.
+//
+// The key mechanisms provided here are:
+//   Version tracking — Detects when tensors have been modified.
+//   Snapshot storage — Saves and restores safe copies of tensors.
+//   Alias tracking — Handles tensors that share underlying memory.
+//   Integration with checkpoint recomputation and careful deletion.
+//
+// It mirrors behavior similar to PyTorch’s internal `version counter`
+// and `view tracking` systems.
+//
+#include "ad/autodiff/careful_deletion.hpp"
+#include "ad/autodiff/inplace.hpp"
+#include "ad/autodiff/checkpoint.hpp"
+#include "ad/utils/debug.hpp"
+#include <iostream>
+#include <mutex>
+#include <sstream>
+
+namespace ag {
+namespace inplace {
+
+using NodePtr = std::shared_ptr<Node>; // alias for shared Node references
+
+// -----------------------------------------------------------------------------
+// Global Tracking Tables
+// -----------------------------------------------------------------------------
+
+/*
+ * These global data structures maintain state about in-place operations.
+ * They are shared across all nodes and guarded by a global mutex (g_lock)
+ * to ensure thread safety.
+ *
+ * - g_snapshots : maps Node* → snapshot entry (Tensor + version at save)
+ * - g_meta      : maps Node* → TensorMeta (current version + alias roots)
+ * - g_alias     : maps storage pointer → set of all Nodes sharing that data
+ */
+static std::unordered_map<Node*, SnapshotEntry> g_snapshots;         
+static std::unordered_map<Node*, TensorMeta>    g_meta;              
+static std::unordered_map<void*, std::unordered_set<Node*>> g_alias; 
+static std::mutex g_lock; // protects all global maps from concurrent access
+
+// Statistics for snapshot memory tracking
+static size_t g_total_snapshot_memory = 0;
+
+static size_t estimate_snapshot_memory(const Tensor& t) {
+    if (t.numel() == 0) return 0;
+    return t.numel() * sizeof(float); // Rough estimate
+}
+
+// -----------------------------------------------------------------------------
+// Internal Helper Functions
+// -----------------------------------------------------------------------------
+
+/*
+ * register_tensor_alias():
+ * -------------------------
+ *  Registers that a given tensor storage (identified by its raw data pointer)
+ *  belongs to a particular node. If multiple nodes share the same pointer,
+ *  they are linked as *aliases* — meaning in-place modification to one affects all.
+ *
+ *  This forms a many-to-one mapping:
+ *      storage_ptr → {nodes sharing this buffer}
+ */
+void register_tensor_alias(void* data_ptr, Node* node) {
+    if (!node || !data_ptr) return;
+    std::lock_guard<std::mutex> guard(g_lock);
+    g_alias[data_ptr].insert(node);
+    g_meta[node].alias_roots.insert(data_ptr);
+}
+
+/*
+ * bump_tensor_version():
+ * -----------------------
+ *  Increments a node’s tensor version counter.
+ *  Called after every in-place modification to detect stale snapshots later.
+ */
+void bump_tensor_version(Node* node) {
+    if (!node) return;
+    g_meta[node].version++;
+}
+
+/*
+ * get_tensor_version():
+ * ----------------------
+ *  Retrieves the current version number of a node’s tensor.
+ *  Returns 0 if no version metadata exists (new tensor or not tracked).
+ */
+size_t get_tensor_version(Node* node) {
+    if (!node) return 0;
+    auto it = g_meta.find(node);
+    return (it == g_meta.end()) ? 0 : it->second.version;
+}
+
+/*
+ * propagate_to_aliases():
+ * ------------------------
+ *  Synchronizes a recomputed tensor’s value with all other nodes
+ *  that share the same data storage pointer (aliases).
+ *
+ *  For example, if node A and node B share memory, and A is recomputed,
+ *  this ensures B’s value pointer is updated as well.
+ */
+static void propagate_to_aliases(Node* node, const Tensor& new_value) {
+    if (!node) return;
+    void* data_ptr = (void*)new_value.data();
+    std::lock_guard<std::mutex> guard(g_lock);
+    auto it = g_alias.find(data_ptr);
+    if (it != g_alias.end()) {
+        for (Node* alias_node : it->second) {
+            alias_node->value = new_value; // shallow copy (shared buffer)
+            g_meta[alias_node].version = g_meta[node].version;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// In-place Checkpoint Core
+// -----------------------------------------------------------------------------
+
+/*
+ * mark_inplace_checkpoint():
+ * ---------------------------
+ *  Marks a node as an in-place checkpoint and stores a snapshot
+ *  of its current tensor along with its version number.
+ *
+ *  This allows restoring the tensor later if it’s modified or deleted.
+ *
+ *  Steps:
+ *    1 Mark node as checkpoint.
+ *    2 Save minimal references to input nodes (for recomputation).
+ *    3 Save a copy of its tensor as a snapshot (with version number).
+ *    4 Register alias tracking for its data pointer.
+ *    5 Optionally print debug info if `opts.verbose` is true.
+ */
+void mark_inplace_checkpoint(const NodePtr& node, const InplaceOptions& opts) {
+    if (!node) return;
+    if (node->is_checkpoint) return; // avoid re-marking
+
+    node->is_checkpoint = true;
+
+    // Save direct input references (like normal checkpoints)
+    node->saved_inputs.clear();
+    for (auto& p : node->inputs)
+        node->saved_inputs.emplace_back(p ? Value(p) : Value());
+
+    // Create snapshot entry
+    Tensor snapshot_copy = node->value.clone();
+    size_t snapshot_mem = estimate_snapshot_memory(snapshot_copy);
+    
+    SnapshotEntry entry {
+        .snapshot = snapshot_copy,
+        .version_at_save = get_tensor_version(node.get())
+    };
+    
+    {
+        std::lock_guard<std::mutex> guard(g_lock);
+        g_snapshots[node.get()] = entry;
+        g_total_snapshot_memory += snapshot_mem;
+    }
+
+    // Link alias tracking
+    register_tensor_alias((void*)node->value.data(), node.get());
+
+    if (opts.verbose) {
+        std::stringstream shape_ss;
+        const auto& dims = node->value.shape().dims;
+        shape_ss << "[";
+        for(size_t i = 0; i < dims.size(); ++i) {
+            shape_ss << dims[i] << (i == dims.size() - 1 ? "" : ", ");
+        }
+        shape_ss << "]";
+
+        std::cout << "[inplace] checkpoint @" << node.get()
+                  << " shape=" << shape_ss.str()
+                  << " version=" << entry.version_at_save
+                  << " mem=" << (snapshot_mem / 1024.0) << "KB\n";
+    }
+}
+
+// -----------------------------------------------------------------------------
+// In-place Recompute Logic
+// -----------------------------------------------------------------------------
+
+/*
+ * g_recompute_in_progress:
+ * -------------------------
+ *  Thread-local set of nodes currently being recomputed.
+ *  Prevents recursive recomputation (which could cause infinite loops).
+ */
+static thread_local std::unordered_set<Node*> g_recompute_in_progress;
+
+/*
+ * recompute_inplace():
+ * ---------------------
+ *  Recomputes a node’s tensor if its stored snapshot is stale or missing.
+ *  Integrates with `checkpoint_impl::recompute_subgraph()` to rebuild
+ *  the tensor using its input dependencies.
+ *
+ *  Steps:
+ *    1️⃣ Prevent recursive recompute (guard via thread-local set).
+ *    2️⃣ Recompute forward pass of node via checkpoint subsystem.
+ *    3️⃣ Update version and snapshot upon success.
+ *    4️⃣ Propagate result to alias nodes.
+ *    5️⃣ Clear in-progress flag.
+ */
+bool recompute_inplace(const NodePtr& node) {
+    if (!node) return false;
+    if (!node->is_checkpoint) return false;
+
+    Node* raw = node.get();
+
+    // Prevent infinite recursion (cycle guard)
+    if (g_recompute_in_progress.find(raw) != g_recompute_in_progress.end()) {
+        std::cerr << "[inplace][ERROR] recursive recompute detected for node@" << raw << "\n";
+        return false;
+    }
+
+    g_recompute_in_progress.insert(raw);
+
+    // Use checkpoint system to recompute without locking
+    bool ok = ag::checkpoint_impl::recompute_subgraph(node);
+
+    if (!ok) {
+        std::cerr << "[inplace] recompute failed for node@" << raw << "\n";
+        g_recompute_in_progress.erase(raw);
+        return false;
+    }
+
+    // Update version and snapshot atomically
+    {
+        std::lock_guard<std::mutex> guard(g_lock);
+        size_t current_ver = g_meta[raw].version;
+        size_t new_ver = current_ver + 1;
+        g_meta[raw].version = new_ver;
+        g_snapshots[raw] = { node->value, new_ver };
+    }
+
+    // Update any aliased nodes
+    propagate_to_aliases(raw, node->value);
+
+    // Done
+    g_recompute_in_progress.erase(raw);
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// ensure_inplace_value()
+// -----------------------------------------------------------------------------
+
+/*
+ * ensure_inplace_value():
+ * ------------------------
+ *  Ensures that a node’s tensor value exists and is valid.
+ *  It checks snapshots, compares versions, and if necessary,
+ *  triggers recomputation or restoration.
+ *
+ *  Flow:
+ *    - If tensor is already valid → return immediately.
+ *    - Else, if a snapshot exists → restore if up-to-date, or recompute if stale.
+ *    - Else, if no snapshot but node is checkpointed → recompute.
+ *    - Else → nothing can be done (tensor unavailable).
+ */
+bool ensure_inplace_value(const NodePtr& node) {
+    if (!node) return false;
+    Node* raw = node.get();
+
+    std::cerr << "[inplace] ensure enter node@" << raw << "\n";
+
+    // Fast path: tensor already present
+    if (node->value.numel() != 0) {
+        std::cerr << "[inplace] node@" << raw << " already has value\n";
+        return true;
+    }
+
+    // Retrieve snapshot safely - copy the snapshot to avoid holding lock
+    bool has_snapshot = false;
+    Tensor snapshot_copy;
+    size_t snapshot_version = 0;
+    
+    {
+        std::lock_guard<std::mutex> guard(g_lock);
+        auto sit = g_snapshots.find(raw);
+        if (sit != g_snapshots.end()) {
+            has_snapshot = true;
+            snapshot_copy = sit->second.snapshot;  // Copy tensor
+            snapshot_version = sit->second.version_at_save;
+        }
+    }
+
+    size_t meta_ver = get_tensor_version(raw);
+
+    if (has_snapshot) {
+        std::cerr << "[inplace] found snapshot for node@" << raw
+                  << " snap_ver=" << snapshot_version
+                  << " meta_ver=" << meta_ver << "\n";
+
+        // Case 1: snapshot is valid
+        if (meta_ver == 0 || snapshot_version == meta_ver) {
+            node->value = snapshot_copy;
+            propagate_to_aliases(raw, node->value);
+            std::cerr << "[inplace] restored snapshot for node@" << raw << "\n";
+            {
+                std::lock_guard<std::mutex> guard(g_lock);
+                if (g_meta.find(raw) == g_meta.end())
+                    g_meta[raw].version = snapshot_version;
+            }
+            return true;
+        }
+
+        // Case 2: snapshot is outdated → prefer recomputation
+        std::cerr << "[inplace] snapshot stale (snap=" << snapshot_version
+                  << " meta=" << meta_ver << ") -> recompute\n";
+        bool recomputed = recompute_inplace(node);
+        if (recomputed) {
+            std::cerr << "[inplace] recompute succeeded for node@" << raw << "\n";
+            return true;
+        }
+
+        // Case 3: recompute failed → fallback to snapshot anyway
+        std::cerr << "[inplace] recompute failed; fallback to stale snapshot\n";
+        node->value = snapshot_copy;
+        propagate_to_aliases(raw, node->value);
+        return true;
+    }
+
+    // Case 4: no snapshot but checkpointed → recompute
+    if (node->is_checkpoint) {
+        std::cerr << "[inplace] no snapshot, attempting recompute\n";
+        bool rc = recompute_inplace(node);
+        if (!rc) std::cerr << "[inplace] recompute failed (no snapshot)\n";
+        return rc;
+    }
+
+    // Case 5: no snapshot and not checkpointed
+    std::cerr << "[inplace] no snapshot and not checkpointed for node@" << raw << "\n";
+    return false;
+}
+
+// -----------------------------------------------------------------------------
+// on_recomputed(): public hook called after recomputation
+// -----------------------------------------------------------------------------
+
+/*
+ * on_recomputed():
+ * -----------------
+ *  Updates global metadata when a node is recomputed externally
+ *  (for example, by `checkpoint.cpp`).
+ *
+ *  It increments the version, updates the snapshot,
+ *  and propagates the new tensor to aliases.
+ */
+void on_recomputed(Node* raw) {
+    if (!raw) return;
+    {
+        std::lock_guard<std::mutex> guard(g_lock);
+        size_t new_ver = g_meta[raw].version + 1;
+        g_meta[raw].version = new_ver;
+        g_snapshots[raw] = { raw->value, new_ver };
+    }
+    propagate_to_aliases(raw, raw->value);
+}
+
+/*
+ * clear_inplace_checkpoints():
+ * -----------------------------
+ *  Clears all internal tables — used when resetting or rebuilding the graph.
+ *  Frees all snapshots, metadata, and alias records.
+ */
+void clear_inplace_checkpoints() {
+    std::lock_guard<std::mutex> guard(g_lock);
+    g_snapshots.clear();
+    g_meta.clear();
+    g_alias.clear();
+    g_total_snapshot_memory = 0;
+}
+
+// Get current snapshot memory usage
+size_t get_snapshot_memory_usage() {
+    std::lock_guard<std::mutex> guard(g_lock);
+    return g_total_snapshot_memory;
+}
+
+// Clean up stale snapshots to free memory
+size_t cleanup_stale_snapshots() {
+    std::lock_guard<std::mutex> guard(g_lock);
+    size_t freed = 0;
+    std::vector<Node*> to_remove;
+    
+    for (auto& [node_ptr, entry] : g_snapshots) {
+        // Remove snapshots for nodes that have been deleted or have current values
+        if (!node_ptr || (node_ptr->value.numel() != 0)) {
+            size_t mem = estimate_snapshot_memory(entry.snapshot);
+            freed += mem;
+            to_remove.push_back(node_ptr);
+        }
+    }
+    
+    for (Node* n : to_remove) {
+        g_snapshots.erase(n);
+    }
+    
+    g_total_snapshot_memory -= freed;
+    return freed;
+}
+
+// -----------------------------------------------------------------------------
+// Debug Utilities
+// -----------------------------------------------------------------------------
+
+/*
+ * debug_alias_table():
+ * ---------------------
+ *  Prints a human-readable summary of all alias groups and their nodes.
+ *  Shows which storage addresses are shared and each node’s version.
+ */
+void debug_alias_table() {
+    std::lock_guard<std::mutex> guard(g_lock);
+    std::cout << "=== Inplace alias table ===\n";
+    for (auto& [ptr, nodes] : g_alias) {
+        std::cout << "Storage@" << ptr << " shared by " << nodes.size() << " nodes\n";
+        for (Node* n : nodes)
+            std::cout << "   node@" << n << " version=" << get_tensor_version(n) << "\n";
+    }
+}
+
+// -----------------------------------------------------------------------------
+// detail namespace — helpers for memory management
+// -----------------------------------------------------------------------------
+namespace detail {
+
+/*
+ * has_alias():
+ * -------------
+ *  Checks whether a node is part of any alias group.
+ *  Used by the memory manager (careful_deletion.cpp)
+ *  to decide if freeing a node’s tensor is safe.
+ */
+bool has_alias(Node* node) {
+    if (!node) return false;
+    std::lock_guard<std::mutex> guard(g_lock);
+    for (auto& [ptr, nodes] : g_alias) {
+        if (nodes.find(node) != nodes.end())
+            return true;
+    }
+    return false;
+}
+
+/*
+ * erase_snapshot():
+ * ------------------
+ *  Deletes a node’s snapshot entry from g_snapshots if it exists.
+ *  Used by aggressive deletion policies to reclaim memory quickly.
+ */
+bool erase_snapshot(Node* node) {
+    if (!node) return false;
+    std::lock_guard<std::mutex> guard(g_lock);
+    auto it = g_snapshots.find(node);
+    if (it != g_snapshots.end()) {
+        size_t mem = estimate_snapshot_memory(it->second.snapshot);
+        g_snapshots.erase(it);
+        g_total_snapshot_memory -= mem;
+        return true;
+    }
+    return false;
+}
+
+} // namespace detail
+
+// -----------------------------------------------------------------------------
+// debug namespace — runtime visualization tools
+// -----------------------------------------------------------------------------
+namespace debug {
+
+/*
+ * print_version_table():
+ * -----------------------
+ *  Prints the complete version tracking table.
+ *  Displays each node’s pointer, operation type, and current version.
+ *
+ *  Useful for verifying that version counters increment correctly
+ *  after in-place operations or recomputation events.
+ */
+void print_version_table() {
+    std::lock_guard<std::mutex> guard(g_lock);
+    std::cout << "\n=== Inplace Version Table Dump ===\n";
+    for (auto& [node_ptr, meta] : g_meta) {
+        std::cout << " Node@" << node_ptr
+                  << " op=" << op_name(node_ptr->op)
+                  << " version=" << meta.version << "\n";
+    }
+    std::cout << "===============================\n";
+}
+
+} // namespace debug
+
+} // namespace inplace
+} // namespace ag

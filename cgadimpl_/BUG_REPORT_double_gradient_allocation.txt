@@ -1,0 +1,198 @@
+================================================================================
+BUG REPORT: Double Gradient Buffer Allocation
+================================================================================
+Date: 2026-01-07
+Severity: MEDIUM (Memory Inefficiency)
+Component: cgadimpl_ Autodiff + OwnTensor Integration
+Reporter: Code Review Session
+
+================================================================================
+SUMMARY
+================================================================================
+When a Tensor with requires_grad=true is wrapped using ag::make_tensor(), 
+TWO separate gradient buffers are allocated, effectively doubling the memory 
+usage for gradients.
+
+================================================================================
+AFFECTED FILES
+================================================================================
+1. cgadimpl_/tensor/src/core/Tensor.cpp (lines 145-164)
+2. cgadimpl_/cgadimpl/src/core/graph.cpp (lines 28-34)
+3. cgadimpl_/cgadimpl/src/nn/nn.cpp (lines 27-31)
+
+================================================================================
+DETAILED DESCRIPTION
+================================================================================
+
+STEP 1: Tensor Creation with requires_grad=true
+-----------------------------------------------
+File: tensor/src/core/Tensor.cpp
+
+When a Tensor is created with requires_grad=true:
+
+    Tensor W(Shape{{1000, 1000}}, TensorOptions().with_req_grad(true));
+
+The constructor (lines 145-164) allocates grad_ptr_:
+
+    if (requires_grad_) {
+        void* raw_grad_ptr = alloc->allocate(total_bytes);  // ← ALLOCATION #1
+        alloc->memset(raw_grad_ptr, 0, total_bytes);
+        grad_ptr_ = std::shared_ptr<uint8_t[]>(...);
+    }
+
+For a 1000x1000 Float32 tensor: 4MB allocated for grad_ptr_
+
+
+STEP 2: Wrapping in ag::make_tensor()
+-------------------------------------
+File: cgadimpl/include/ad/core/graph.hpp (line 77-79)
+
+    inline Value make_tensor(const Tensor& v, const char* name = "") {
+        return Value(std::make_shared<Node>(v, Op::Leaf, v.requires_grad(), name));
+    }
+
+This passes v.requires_grad() (which is TRUE) to the Node constructor.
+
+
+STEP 3: Node Constructor Creates ANOTHER Gradient Buffer
+---------------------------------------------------------
+File: cgadimpl/src/core/graph.cpp (lines 28-34)
+
+    Node::Node(const Tensor& v, Op op_, bool req_grad, const char* nm) 
+        : op(op_), 
+          value(v),                      // ← COPIES the tensor (including grad_ptr_)
+          requires_grad_flag_(req_grad),
+          ...
+    {
+        if (requires_grad_flag_) {
+            grad = OwnTensor::Tensor::zeros(v.shape(), ...);  // ← ALLOCATION #2 !!!
+        }
+    }
+
+For the same 1000x1000 Float32 tensor: ANOTHER 4MB allocated for Node.grad
+
+TOTAL: 8MB for gradients instead of 4MB!
+
+================================================================================
+IMPACT
+================================================================================
+
+For nn::Linear layers (nn.cpp lines 25-34):
+- Every weight tensor gets double gradient allocation
+- For a model with 100MB of weights → 200MB wasted on unused grad_ptr_ buffers
+
+Example calculation:
+- ResNet-50 has ~25M parameters = 100MB weights
+- With current implementation: 200MB gradient buffers (100MB unused!)
+- 50% memory waste on gradients
+
+================================================================================
+REPRODUCTION
+================================================================================
+
+Code that triggers the bug:
+
+    #include "ad/ag_all.hpp"
+    
+    int main() {
+        // Create 100MB tensor with requires_grad=true
+        auto opts = OwnTensor::TensorOptions().with_req_grad(true);
+        OwnTensor::Tensor W(OwnTensor::Shape{{25000000}}, opts);  // 100MB
+        
+        // Wrap in Value - THIS ALLOCATES ANOTHER 100MB for Node.grad
+        ag::Value W_val = ag::make_tensor(W, "W");
+        
+        // Total gradient memory: 200MB (100MB in Tensor.grad_ptr_ + 100MB in Node.grad)
+        // Tensor.grad_ptr_ is NEVER USED by backward()!
+    }
+
+================================================================================
+ROOT CAUSE
+================================================================================
+
+1. OwnTensor::Tensor allocates grad_ptr_ for its own standalone gradient storage
+2. ag::Node allocates Node.grad for autodiff gradient accumulation
+3. These two systems don't share the gradient buffer
+4. backward() only uses Node.grad, making Tensor.grad_ptr_ wasteful
+
+================================================================================
+PROPOSED SOLUTIONS
+================================================================================
+
+OPTION A: Share the buffer (Recommended)
+----------------------------------------
+Modify Node constructor to REUSE Tensor.grad_ptr_ instead of creating new:
+
+    Node::Node(const Tensor& v, ...) {
+        if (requires_grad_flag_) {
+            if (v.requires_grad() && v.grad_ptr_) {
+                // Reuse existing gradient buffer
+                grad = v.grad_view();  // Create view of existing grad
+            } else {
+                grad = OwnTensor::Tensor::zeros(...);
+            }
+        }
+    }
+
+
+OPTION B: Remove Tensor.grad_ptr_ entirely
+------------------------------------------
+Make Tensor a pure data container, let Node handle all gradients:
+- Remove requires_grad and grad_ptr_ from Tensor class
+- Only allocate gradients in Node
+- Pro: Cleaner separation of concerns
+- Con: Breaking change, need to update all existing code
+
+
+OPTION C: Lazy allocation in Tensor
+-----------------------------------
+Don't allocate Tensor.grad_ptr_ at construction time:
+- Add a method like ensure_grad() that allocates on first access
+- Only allocate if actually needed (and Node doesn't already have one)
+
+
+OPTION D: Flag to skip Tensor grad allocation
+---------------------------------------------
+Add a parameter to Tensor constructor:
+    Tensor(Shape, TensorOptions, bool skip_grad_alloc = false);
+
+When make_tensor is used, pass skip_grad_alloc=true.
+
+================================================================================
+WORKAROUND (Immediate)
+================================================================================
+
+Until fixed, users can avoid double allocation by NOT setting requires_grad 
+on the raw Tensor:
+
+    // DON'T do this:
+    Tensor W(..., TensorOptions().with_req_grad(true));  // Allocates grad_ptr_
+    Value W_val = make_tensor(W, "W");                    // Allocates Node.grad too
+
+    // DO this instead:
+    Tensor W(...);  // requires_grad=false (default) - NO grad_ptr_
+    Value W_val = make_tensor_with_grad(W, "W");  // Only Node.grad allocated
+
+Note: This requires adding a new factory function or modifying make_tensor 
+to accept a requires_grad parameter.
+
+================================================================================
+FILES TO MODIFY FOR FIX
+================================================================================
+
+1. cgadimpl/src/core/graph.cpp - Node constructor
+2. cgadimpl/include/ad/core/graph.hpp - make_tensor function
+3. cgadimpl/src/nn/nn.cpp - Linear constructor (remove .with_req_grad(true))
+4. tensor/include/core/Tensor.h - Potentially add methods for grad sharing
+
+================================================================================
+TESTING RECOMMENDATIONS
+================================================================================
+
+1. Add memory tracking test to compare gradient memory usage
+2. Run existing test suite after fix to ensure no regressions
+3. Benchmark memory usage with a large model (e.g., MLP with 10M parameters)
+
+================================================================================
+END OF REPORT
+================================================================================
