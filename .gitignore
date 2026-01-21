@@ -41,8 +41,9 @@ venv/
 *.tmp
 *.log
 *.bak
-core
-core.*
+# Core dump files (in root only, not directories named 'core')
+/core
+/core.*
 
 # =========================
 # OS Generated
