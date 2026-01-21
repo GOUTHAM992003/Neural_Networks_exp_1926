@@ -2,7 +2,7 @@
 
 This repository contains experiments with neural networks using custom tensor and autograd libraries.
 
-## ⚠️ Dependencies Not Included
+## Dependencies Not Included
 
 The following dependencies are **NOT included** in this repository due to size:
 

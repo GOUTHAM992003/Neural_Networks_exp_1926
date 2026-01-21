@@ -59,7 +59,8 @@ int main() {
     ag::nn::Linear layer1(1, 4,OwnTensor::Device::CUDA); //Input(1) --->Hidden(4)
     ag::nn::Linear layer2(4,8,OwnTensor::Device::CUDA); //Hidden1(4) --->Hidden2(8)
 ag::nn::Linear layer3(8,1,OwnTensor::Device::CUDA); //Hidden2(8) --->Output(1)
-
+// ag::nn::ReLU relu1;
+// ag::nn::ReLU relu2;
     float learning_rate = 0.1f;
     std::vector<ag::Value> all_params;
     for (auto& p : layer1.parameters()) all_params.push_back(p);
