@@ -18,24 +18,7 @@ wget https://download.pytorch.org/libtorch/cu118/libtorch-cxx11-abi-shared-with-
 unzip libtorch-*.zip
 ```
 
-## Structure
 
-```
-test_env_gau/
-├── cgadimpl_/           # Custom autograd implementation
-├── Tensor_Implementations_kota/  # Custom tensor library
-├── libtorch_tests/      # LibTorch benchmarks (libtorch not included)
-├── pytorch_tests/       # PyTorch Python benchmarks
-└── numpy_tests/         # NumPy benchmarks
-```
-
-## Building
-
-```bash
-cd cgadimpl_
-make
-make run-snippet FILE="regression_own_using_linear.cpp"
-```
 
 ## Author
-Goutham
+Goutham_Reddy_K_1926.
