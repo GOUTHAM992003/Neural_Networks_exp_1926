@@ -80,7 +80,7 @@ namespace OwnTensor
     #ifdef WITH_CUDA
        cudaStream_t stream = OwnTensor::cuda::getCurrentStream(); //~change
         memsetAsync(ptr, value, bytes, stream); //~change
-        // cudaStreamSynchronize(0);
+         cudaStreamSynchronize(0);
     #endif
     }
 
@@ -88,7 +88,7 @@ namespace OwnTensor
     #ifdef WITH_CUDA
         cudaStream_t stream = OwnTensor::cuda::getCurrentStream(); //~change
         memcpyAsync(dst, src, bytes, kind, stream); //~change
-        // cudaStreamSynchronize(0);
+        cudaStreamSynchronize(0);
     #endif
     }
 }
