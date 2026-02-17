@@ -8,7 +8,7 @@
 #include "core/TensorImpl.h"
 #include "core/Shape.h"
 #include "core/Stride.h"
-
+#include "device/AllocatorRegistry.h"
 namespace OwnTensor
 {
     // Forward declarations
@@ -23,6 +23,7 @@ namespace OwnTensor
         Dtype dtype = Dtype::Float32;
         DeviceIndex device = DeviceIndex(Device::CPU);
         bool requires_grad = false;
+        Pinned_Flag pin_ten = Pinned_Flag::None;
 
         // Builder patterns
         TensorOptions with_dtype(Dtype d) const
@@ -44,6 +45,13 @@ namespace OwnTensor
             opts.requires_grad = g;
             return opts;
         }
+
+        TensorOptions with_pinned(Pinned_Flag p) const
+        {
+            TensorOptions opts = *this;
+            opts.pin_ten = p;
+            return opts;
+        }
     };
 
     // ########################################################################
@@ -62,14 +70,14 @@ namespace OwnTensor
 
         Tensor(Shape shape, Dtype dtype,
             DeviceIndex device = DeviceIndex(Device::CPU),
-            bool requires_grad = false);
+            bool requires_grad = false, Pinned_Flag pin_ten = Pinned_Flag::None);
 
         // Constructor with options
         Tensor(Shape shape, TensorOptions opts);
 
         //✨✨✨
         Tensor(Shape shape, bool requires_grad = false)
-        : Tensor(shape, Dtype::Float32, DeviceIndex(Device::CPU), requires_grad) {}
+        : Tensor(shape, Dtype::Float32, DeviceIndex(Device::CPU), requires_grad, Pinned_Flag::None) {}
 
         // Default constructor
         Tensor() = default;
@@ -290,12 +298,24 @@ namespace OwnTensor
         void release();
         bool is_valid() const;
 
+        
+      //Pinned Memory Methods :  
+        // Method to check whether a tensor is pinned or not using cudaPointerGetAttributes
+     bool is_pinned() const;
+
+     // In-place pin memory using cudaHostRegister
+     void pin_memory();
+    
+
+
         private:
             // Private constructor for creating views (shares storage)
             Tensor(intrusive_ptr<TensorImpl> impl,
                    Shape shape,
                    Stride stride,
                    size_t offset);
+         
+
     };
 }
 

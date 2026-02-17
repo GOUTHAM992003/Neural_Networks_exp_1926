@@ -299,13 +299,110 @@ void launch_optimized_matmul(const Tensor& A, const Tensor& B, Tensor& output, c
    if (err != cudaSuccess) throw std::runtime_error("Kernel failed: " + std::string(cudaGetErrorString(err)));
 }
 
+#include "device/CublasWrapper.h"
+
+// Forward declaration of custom kernels (keep implementation above)
+
+// ============================================================================
+// CUBLAS DISPATCH
+// ============================================================================
+
+template<typename T>
+void launch_cublas_matmul(const Tensor& A, const Tensor& B, Tensor& output, cudaStream_t stream) {
+    auto& handle = device::CublasHandle::instance();
+    cublasSetStream(handle, stream);
+    
+    // Check for contiguous memory (cuBLAS requires contiguous or regular strides)
+    // Here we assume standard row-major contiguous for simplicity or check strides
+    // If not contiguous, fall back to custom kernel? Or copy?
+    // TensorLib usually ensures contiguous for matmul inputs or handles it.
+    // Let's check strides.
+    // A: [M, K], B: [K, N], C: [M, N]
+    const auto& ash = A.shape().dims; const auto& bsh = B.shape().dims; const auto& osh = output.shape().dims;
+    int M = ash[ash.size()-2], K = ash[ash.size()-1], N = bsh[bsh.size()-1];
+    
+    // Pointers
+    const T* alpha = nullptr; const T* beta = nullptr;
+    static const float alpha_f = 1.0f, beta_f = 0.0f;
+    static const double alpha_d = 1.0, beta_d = 0.0;
+    
+    // Logic: C = A * B (Row Major)
+    // cuBLAS is Col Major.
+    // We treat A, B, C as Col Major matrices A', B', C'.
+    // A (MxK Row) -> A' (KxM Col).
+    // B (KxN Row) -> B' (NxK Col).
+    // C (MxN Row) -> C' (NxM Col).
+    // We want C = A * B.
+    // Mathematical Transpose: C^T = (A * B)^T = B^T * A^T.
+    // In Col Major storage, A^T is exactly A (if A is Row Major contiguous).
+    // So we invoke C' = B' * A'. 
+    // m=N, n=M, k=K.
+    // lda=N (leading dim of B'), ldb=K (leading dim of A'), ldc=N (leading dim of C').
+    
+    void* p_alpha = (void*)&alpha_f;
+    void* p_beta = (void*)&beta_f;
+    if constexpr (std::is_same<T, double>::value) {
+        p_alpha = (void*)&alpha_d; p_beta = (void*)&beta_d;
+    }
+    
+    cublasStatus_t status;
+    
+    if constexpr (std::is_same<T, float>::value) {
+        status = cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, 
+                           N, M, K, 
+                           (const float*)p_alpha, 
+                           (const float*)B.data<float>(), N, 
+                           (const float*)A.data<float>(), K, 
+                           (const float*)p_beta, 
+                           output.data<float>(), N);
+    } else if constexpr (std::is_same<T, double>::value) {
+        status = cublasDgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, 
+                           N, M, K, 
+                           (const double*)p_alpha, 
+                           (const double*)B.data<double>(), N, 
+                           (const double*)A.data<double>(), K, 
+                           (const double*)p_beta, 
+                           output.data<double>(), N);
+    } else if constexpr (std::is_same<T, float16_t>::value || std::is_same<T, __half>::value) {
+        // Use pseudo-half logic or TensorCores
+        float a_h = 1.0f, b_h = 0.0f;
+        status = cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                            N, M, K,
+                            &a_h,
+                            B.data<T>(), CUDA_R_16F, N,
+                            A.data<T>(), CUDA_R_16F, K,
+                            &b_h,
+                            output.data<T>(), CUDA_R_16F, N,
+                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    } else if constexpr (std::is_same<T, bfloat16_t>::value || std::is_same<T, __nv_bfloat16>::value) {
+         float a_h = 1.0f, b_h = 0.0f;
+         status = cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                            N, M, K,
+                            &a_h,
+                            B.data<T>(), CUDA_R_16BF, N,
+                            A.data<T>(), CUDA_R_16BF, K,
+                            &b_h,
+                            output.data<T>(), CUDA_R_16BF, N,
+                            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    }
+    
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        // Fallback to custom kernel if cuBLAS fails (e.g. alignment?)
+        launch_optimized_matmul<T>(A, B, output, stream);
+    }
+}
+
 void cuda_matmul(const Tensor& A, const Tensor& B, Tensor& output, cudaStream_t stream) {
    dispatch_by_dtype(A.dtype(), [&](auto d) {
       using T = decltype(d);
-      if constexpr (std::is_same<T, float16_t>::value || std::is_same<T, bfloat16_t>::value || std::is_same<T, float>::value || std::is_same<T, double>::value) launch_optimized_matmul<T>(A, B, output, stream);
+      if constexpr (std::is_same<T, float16_t>::value || std::is_same<T, bfloat16_t>::value || std::is_same<T, float>::value || std::is_same<T, double>::value) {
+          // launch_optimized_matmul<T>(A, B, output, stream);
+          launch_cublas_matmul<T>(A, B, output, stream);
+      }
       else throw std::runtime_error("Unsupported type");
    });
 }
 
 } // namespace OwnTensor
 #endif
+

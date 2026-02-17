@@ -212,6 +212,22 @@ public:
                DeviceIndex device,
                bool requires_grad);
     
+    /**
+     * Constructor: Create TensorImpl with custom allocator
+     * Used for creating tensors with specific memory allocation (e.g., pinned memory)
+     * 
+     * @param shape Tensor shape
+     * @param dtype Data type
+     * @param device Device location
+     * @param requires_grad Whether to track gradients
+     * @param allocator Custom allocator to use (if nullptr, uses default)
+     */
+    TensorImpl(const Shape& shape,
+               Dtype dtype,
+               DeviceIndex device,
+               bool requires_grad,
+               Allocator* allocator);
+    
     // Destructor
     ~TensorImpl() override;
     
