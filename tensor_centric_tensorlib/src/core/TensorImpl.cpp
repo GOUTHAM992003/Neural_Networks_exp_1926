@@ -63,6 +63,45 @@ TensorImpl::TensorImpl(const Shape& shape,
     }
 }
 
+// Constructor with custom allocator (for pinned memory support)
+TensorImpl::TensorImpl(const Shape& shape,
+                       Dtype dtype,
+                       DeviceIndex device,
+                       bool requires_grad,
+                       Allocator* allocator)
+    : shape_(shape),
+      dtype_(dtype),
+      device_(device),
+      storage_offset_(0) {
+    
+    // Calculate storage size
+    size_t elem_count = 1;
+    for (auto dim : shape.dims) {
+        elem_count *= dim;
+    }
+    
+    size_t elem_size = Tensor::dtype_size(dtype);
+    size_t nbytes = elem_count * elem_size;
+    
+    // Align memory for performance
+    if (device.is_cpu()) {
+        nbytes = (nbytes + 63) & ~63;  // 64-byte alignment for CPU
+    } else {
+        nbytes = ((nbytes + 256 - 1) / 256) * 256;  // 256-byte alignment for GPU
+    }
+    
+    // Create storage with custom allocator
+    storage_ = Storage(nbytes, dtype, device, allocator);
+    
+    // Compute strides
+    stride_ = ViewUtils::compute_strides(shape);
+    
+    // Create autograd metadata if requires_grad
+    if (requires_grad) {
+        autograd_meta_ = std::make_unique<AutogradMeta>(true);
+    }
+}
+
 TensorImpl::~TensorImpl() {
     release_resources();
 }

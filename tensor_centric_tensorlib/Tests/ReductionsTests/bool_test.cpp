@@ -1,12 +1,14 @@
 #include <iostream>
 #include "TensorLib.h"
+#include "device/GPUCachingAllocator.h"
 using namespace OwnTensor;
 using namespace std;
 // #include <iostream>
 int main(){
+    device::GPUCachingAllocator::set_allow_growth(true);
 
  cout<<"hi"<<endl;
-Tensor T({{3,2}},Dtype::Complex32,Device::CPU);
+Tensor T({{3,2}},Dtype::Complex32,Device::CUDA);
 //std::vector<bool> data = {false,false,false,false,true,false,true,false,true};
 cout<<"hi"<<endl;
 //std::vector<signed char> data = {100,79,60,90,10,0};
@@ -15,12 +17,12 @@ std::vector data = {complex32_t(100.0,5.0),complex32_t(100.0,5.0),complex32_t(10
 T.set_data(data);
 T.display();
 
-Tensor T1({{2}},Dtype::Complex32,Device::CPU);
-T1.fill(complex32_t(40.0,5.0));
+Tensor T1({{2}},Dtype::Complex32,Device::CUDA);
+//T1.fill(complex32_t(40.0,5.0));
 
 Tensor res = T + T1 ;
 res.display();
-
+std::cin.get();
 // Tensor res = reduce_max(T);
 // res.display(std::cout, 4);
 // Tensor Honey = reduce_all(T);

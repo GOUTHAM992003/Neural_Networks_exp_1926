@@ -34,7 +34,7 @@ namespace OwnTensor
     // Constructors - Now create TensorImpl
     // ========================================================================
     
-    Tensor::Tensor(Shape shape, Dtype dtype, DeviceIndex device, bool requires_grad) {
+    Tensor::Tensor(Shape shape, Dtype dtype, DeviceIndex device, bool requires_grad, Pinned_Flag pin_ten) {
         #ifdef WITH_DEBUG
         std::cout << "Tensor constructor: device=" << (device.is_cpu() ? "CPU" : "CUDA") << "\n" << std::endl;
         #endif
@@ -56,8 +56,11 @@ namespace OwnTensor
 
         // Validate shape
         if (shape.dims.empty()) {
-            // Allow empty tensors
-            impl_ = make_intrusive<TensorImpl>(shape, dtype, device, requires_grad);
+            // Allow empty tensors - use the allocator-based constructor
+            impl_ = make_intrusive<TensorImpl>(shape, dtype, device, requires_grad, 
+                device.is_cpu() ? (pin_ten == Pinned_Flag::None ? AllocatorRegistry::get_cpu_allocator() 
+                                                               : AllocatorRegistry::get_pinned_cpu_allocator(pin_ten))
+                               : AllocatorRegistry::get_cuda_allocator());
             return;
         }
 
@@ -72,13 +75,26 @@ namespace OwnTensor
             }
         }
 
-        // Create TensorImpl - it handles everything
-        impl_ = make_intrusive<TensorImpl>(shape, dtype, device, requires_grad);
+        // Select allocator based on device and pin_ten flag
+        Allocator* allocator = nullptr;
+        if (device.is_cpu()) {
+            if (pin_ten == Pinned_Flag::None) {
+                allocator = AllocatorRegistry::get_cpu_allocator();
+            } else {
+                allocator = AllocatorRegistry::get_pinned_cpu_allocator(pin_ten);
+            }
+        } else {
+            // CUDA device - silently ignore pin_ten
+            allocator = AllocatorRegistry::get_cuda_allocator();
+        }
+
+        // Create TensorImpl with the selected allocator
+        impl_ = make_intrusive<TensorImpl>(shape, dtype, device, requires_grad, allocator);
     }
 
     // Tensor Options constructor
     Tensor::Tensor(Shape shape, TensorOptions opts)
-        : Tensor(shape, opts.dtype, opts.device, opts.requires_grad) {
+        : Tensor(shape, opts.dtype, opts.device, opts.requires_grad, opts.pin_ten) {
     }
 
     // Private constructor for creating views (shares TensorImpl's storage)
@@ -760,6 +776,54 @@ void Tensor::release() {
     impl_.reset();
 }
 
+//is_pinned() method to find whether memory allocated for  tensor is pinned or not using cudaPointerGetAttributes.
+bool Tensor::is_pinned() const {
+    if (!impl_) return false;
+    if (is_cuda()) return false; // CUDA memory isn't "Pinned CPU"
+
+    #ifdef WITH_CUDA
+    cudaPointerAttributes attr_1926;
+    cudaError_t err_1926 = cudaPointerGetAttributes(&attr_1926,data());
+    if(err_1926 == cudaSuccess && attr_1926.type == cudaMemoryTypeHost){
+            return true;
+        }
+    //clear any error set by checking a non-pinned pointer
+        cudaGetLastError();
+    #endif
+    return false;
+}
+
+void Tensor::pin_memory() {
+    if (!impl_) {
+        throw std::runtime_error("pin_memory_: tensor is not initialized");
+    }
+
+    // 1. Check if already pinned
+    if (is_pinned()) {
+        return; // Already pinned, no-op
+    }
+
+    // 2. Check device (must be CPU)
+    if (is_cuda()) {
+        throw std::runtime_error("pin_memory: cannot pin CUDA device memory (it is already on device)");
+    }
+
+    // 3. Pin using cudaHostRegister
+    #ifdef WITH_CUDA
+        // Note: PyTorch avoids this in-place pinning because:
+        // - Alignment: cudaHostRegister might fail if pointer isn't page-aligned (4KB).
+        // - OS Limits: Identifying how much memory is lockable is tricky.
+        // - Lifecycle: Ideally should unregister before free(), though modern drivers handle it.
+        // - We use cudaHostRegisterDefault (0) which maps to Portable mostly.
+        
+        cudaError_t err_1926 = cudaHostRegister(data(), nbytes(), cudaHostRegisterDefault);
+        if (err_1926 != cudaSuccess) {
+             throw std::runtime_error(std::string("pin_memory failed: ") + cudaGetErrorString(err_1926));
+        }
+    #else
+        throw std::runtime_error("pin_memory: compiled without CUDA support");
+    #endif
+} 
 //  ========================================================================
 // Explicit Template Instantiations
 // ========================================================================

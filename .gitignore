@@ -60,3 +60,6 @@ Thumbs.db
 # *.pth
 libtorch_tests/libtorch/
 libtorch_tests/*.zip
+benchmark_results/inputs/*.bin
+tensorflow/
+pytorch_source/

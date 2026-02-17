@@ -29,16 +29,25 @@ static std::vector<std::string> list_shards(const std::string& root,
                                             const std::string& split,
                                             const std::string& ext = ".bin") {
     std::vector<std::string> shards;
-    if (!fs::exists(root)) return shards;
+    std::cout << "DEBUG: list_shards root='" << root << "' split='" << split << "'" << std::endl;
+    if (!fs::exists(root)) {
+        std::cout << "DEBUG: Root does not exist!" << std::endl;
+        return shards;
+    }
     for (const auto& e : fs::directory_iterator(root)) {
-        if (!e.is_regular_file()) continue;
+        // Debug file details
         auto p = e.path();
         std::string name = p.filename().string();
+        // std::cout << "DEBUG: Checking " << name << " is_reg=" << e.is_regular_file() << " ext=" << p.extension() << std::endl;
+        
+        if (!e.is_regular_file()) continue;
         if (p.extension() == ext && name.find(split) != std::string::npos) {
             shards.push_back(p.string());
+            std::cout << "DEBUG: Added shard: " << name << std::endl;
         }
     }
     std::sort(shards.begin(), shards.end());
+    std::cout << "DEBUG: Found " << shards.size() << " shards." << std::endl;
     return shards;
 }
 
@@ -163,6 +172,7 @@ private:
     UInt16ShardView shard_;
 };
 
+#ifndef NO_MAIN
 int main() {
     try {
         const int B = 8;
@@ -287,3 +297,4 @@ int main() {
     }
     return 0;
 }
+#endif
