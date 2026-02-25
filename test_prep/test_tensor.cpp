@@ -8,5 +8,5 @@ int main(){
     t.get_shape();
 
     std::cout<<"Dtype of tensor :"<<t.get_dtype()<<std::endl;
-    
+
 }
