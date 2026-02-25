@@ -123,5 +123,27 @@ std::string get_dtype() const{
 /*our data is stored as uint8_t* (raw bytes). But if we want to add numbers, we need a float* or a uint16_t*.
 
 In C++, we use two powerful tools for this: Templates and reinterpret_cast.*/
+//returns the raw uint8_t pointer cast to a specific type
+template<typename T>
+T* data_ptr(){
+    return reinterpret_cast<T*>(data);
+}
+//Const version (for when we only want to read)
+template<typename T>
+const T* data_ptr() const {
+    return reinterpret_cast<const T*>(data); 
+}
 
+//Fill the tensor with data from a vector 
+template<typename T>
+void set_data(const std::vector<T>& values){
+    if (values.size()!=size){
+        throw std::runtime_error("Size mismatch!Vectorsize must match tensor numel");
+    }
+    T* ptr = data_ptr<T>();
+    for (size_t i=0;i<size;i++){
+        ptr[i]=values[i];
+    }
+}
 };
+
