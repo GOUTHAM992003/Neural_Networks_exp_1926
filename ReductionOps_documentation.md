@@ -51,12 +51,12 @@ Tensor reduce_X(const Tensor& input,
 
 | Type Family | Types | Standard Ops | NaN-Aware Ops | Notes |
 |-------------|-------|:---:|:---:|-------|
-| Floating Point | `float`, `double` | ✅ | ✅ | Full support |
-| Half Precision | `float16_t`, `bfloat16_t` | ✅ | ✅ | Accumulated in `float`/`double` for precision |
-| Integer | `int16_t`, `int32_t`, `int64_t`, `uint8_t`, `uint16_t`, `uint32_t`, `uint64_t` | ✅ | ❌ | Output widened to Int64, mean outputs Float64 |
-| Boolean | `bool` | ✅ (all/any) | ❌ | Non-bool inputs auto-converted via `to_bool()` |
-| Complex | `complex32_t`, `complex64_t`, `complex128_t` | ✅ (sum, product, mean) | ✅ | Min/Max/ArgMin/ArgMax blocked (no ordering) |
-| FP4 | `float4_e2m1_t`, `float4_e2m1_2x_t` | ❌ | ❌ | All reductions blocked at compile time |
+| Floating Point | `float`, `double` | Yes | Yes | Full support |
+| Half Precision | `float16_t`, `bfloat16_t` | Yes | Yes | Accumulated in `float`/`double` for precision |
+| Integer | `int16_t`, `int32_t`, `int64_t`, `uint8_t`, `uint16_t`, `uint32_t`, `uint64_t` | Yes | No | Output widened to Int64, mean outputs Float64 |
+| Boolean | `bool` | Yes (all/any) | No | Non-bool inputs auto-converted via `to_bool()` |
+| Complex | `complex32_t`, `complex64_t`, `complex128_t` | Yes (sum, product, mean) | Yes | Min/Max/ArgMin/ArgMax blocked (no ordering) |
+| FP4 | `float4_e2m1_t`, `float4_e2m1_2x_t` | No | No | All reductions blocked at compile time |
 
 ---
 
