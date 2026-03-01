@@ -233,6 +233,8 @@ Also add in `Types.h`:
 #### Step 3: Add to `DtypeTraits.h` — 6 Functions Must Be Updated
 
 **Function 1: `dtype_traits<>` specialization**
+- **What it does:** This is a compile-time metadata struct that tells the rest of the library everything about a dtype — its C++ type, byte size, name string, and category flags (float? int? unsigned? complex?). Every template function in the library uses `dtype_traits<dt>::type` to know which C++ type corresponds to a `Dtype` enum value.
+- **Why modify:** Without this, the compiler literally doesn't know what C++ type to use when it encounters `Dtype::UInt8`. Every `switch(dtype)` that does `using T = dtype_traits<dt>::type` will fail.
 ```cpp
 template<> struct dtype_traits<Dtype::UInt8> {
     using type = uint8_t;
@@ -244,21 +246,27 @@ template<> struct dtype_traits<Dtype::UInt8> {
 };
 ```
 
-**Function 2: `is_same_type<T>()`** — Add branch:
+**Function 2: `is_same_type<T>(Dtype dtype)`**
+- **What it does:** Given a C++ template type `T` and a runtime `Dtype` enum, checks if they match. Used in assertions and validation — e.g., when you cast `data_ptr` to `uint8_t*`, this function verifies the tensor actually holds `Dtype::UInt8`.
+- **Why modify:** Without this branch, passing a `uint8_t*` pointer for a UInt8 tensor would fail the type-safety check.
 ```cpp
 else if constexpr (std::is_same_v<T, uint8_t>) {
     return dtype == Dtype::UInt8;
 }
 ```
 
-**Function 3: `type_to_dtype<T>()`** — Add reverse mapping:
+**Function 3: `type_to_dtype<T>()`**
+- **What it does:** The reverse of `dtype_traits` — given a C++ type at compile time, returns which `Dtype` enum it maps to. Used in tensor factory functions like `Tensor::from_data<uint8_t>(...)` where the user passes raw C++ data and the library needs to automatically determine the correct `Dtype`.
+- **Why modify:** Without this, `Tensor::from_data<uint8_t>({1,2,3})` would hit the `static_assert("Unsupported type")` and fail to compile.
 ```cpp
 else if constexpr (std::is_same_v<T, uint8_t> || std::is_same_v<T, unsigned char>) {
     return Dtype::UInt8;
 }
 ```
 
-**Function 4: Type predicates** — Add to the correct predicate:
+**Function 4: Type predicates (`is_float()`, `is_int()`, `is_unsigned()`, `is_complex()`, `is_bool()`)**
+- **What they do:** Runtime category checkers. Operations use these to decide behavior — e.g., `is_float(dtype)` decides whether to allow `log()` (only valid for floats), `is_complex(dtype)` enables conjugate operations, `is_unsigned(dtype)` prevents negative number operations.
+- **Why modify:** If `UInt8` isn't in `is_unsigned()`, then operations that should reject negative numbers for unsigned types (or operations that need special unsigned handling) won't recognize it.
 ```cpp
 constexpr bool is_unsigned(Dtype dt) {
     switch (dt) {
@@ -269,12 +277,17 @@ constexpr bool is_unsigned(Dtype dt) {
 }
 ```
 
-**Function 5: `get_dtype_name()`** — Add string representation:
+**Function 5: `get_dtype_name(Dtype dtype)`**
+- **What it does:** Converts a `Dtype` enum to a human-readable string. Used in error messages, tensor print/display, and debug logging. E.g., `"Cannot add tensors of type 'uint8' and 'complex64'"`.
+- **Why modify:** Without this, any error message involving the new type would print `"Unknown"` instead of `"uint8"`.
 ```cpp
 case Dtype::UInt8: return "uint8";
 ```
 
-**Function 6: Promotion tables** — This is the BIG one. Two 18×18 tables must be updated:
+**Function 6: Promotion tables (`promotion_table[18][18]` and `scalar_tensor_table[18][18]`)**
+- **What they do:** Two precomputed 18×18 lookup tables that answer "if I do `tensor_A op tensor_B`, what dtype should the result be?" in O(1) time. `promotion_table` handles Tensor+Tensor ops, `scalar_tensor_table` handles Tensor+Scalar ops (where scalars are "weak" and don't upgrade float tensors).
+- **Why modify:** This is the BIGGEST change. Without adding a full row AND column for the new type, any binary operation involving the new type will index out of bounds or return garbage. Every promotion rule must be explicitly defined (e.g., `UInt8 + Int8 → Int16`, `UInt8 + Float32 → Float32`, `UInt64 + Int64 → Float32`).
+
 - `promotion_table[18][18]` — Tensor + Tensor promotion
 - `scalar_tensor_table[18][18]` — Scalar + Tensor promotion
 
@@ -284,13 +297,16 @@ Every row AND column for the new type must be filled in.
 
 #### Step 4: Add to `DtypeCastUtils.h` — Conversion Helpers
 
+- **What this file does:** Contains runtime utility functions for converting tensor data between types. When a binary operation receives two tensors of different dtypes, the promotion system decides the result dtype, then `DtypeCastUtils` physically converts the input data to match. Also houses `safe_pow()` which handles edge cases like `0^0`, `negative^fraction`, etc.
+- **Why modify:** Without conversion helpers, the library can decide UInt8 should promote to Float32, but can't actually convert the raw bytes. Operations would crash or produce garbage.
+
 For half-precision or complex types, add element-wise tensor converters:
 ```cpp
 inline Tensor convert_complex32_to_complex64(const Tensor& input);
 inline void convert_complex64_to_complex32(const Tensor& input, Tensor& output);
 ```
 
-Also add to `get_promoted_dtype()` — the unary operation promotion function:
+Also add to `get_promoted_dtype()` — this function decides what dtype to use for **unary** operations (single-tensor math like `exp()`, `log()`). For example, `exp()` on an Int32 tensor should compute in Float32, not Int32:
 ```cpp
 case Dtype::UInt8:
 case Dtype::UInt16:
@@ -328,18 +344,21 @@ switch(dtype) {
 ```
 
 **Files with dispatch switches that need updating:**
-- `include/ops/TensorOps.h` — Binary tensor operations (add, sub, mul, div)
-- `include/ops/ScalarOps.h` — Scalar-tensor operations
-- `include/ops/UnaryOps/Arithmetics.h` — Unary math ops (neg, abs, square)
-- `include/ops/UnaryOps/Exponents.h` — exp, log, pow
-- `include/ops/UnaryOps/Trigonometry.h` — sin, cos, tan
-- `include/ops/UnaryOps/Conjugate.h` — Complex conjugate
-- `include/ops/UnaryOps/Reduction.h` — Sum, mean, min, max, etc.
-- `include/ops/helpers/ReductionOps.h` — Reduction operator structs
-- `include/ops/helpers/ConditionalOps.h` — Where function
-- `include/core/TensorDispatch.h` — Core dispatch infrastructure
-- `src/core/TensorFactory.cpp` — tensor creation, zeros, ones, rand
-- `src/core/AsTypeTensor.cpp` — `.astype()` casting
+
+| File | What It Does | Why It Needs the New Type |
+|------|-------------|-------------------------|
+| `include/ops/TensorOps.h` | **Binary tensor operations** — dispatches `add(A, B)`, `sub(A, B)`, `mul(A, B)`, `div(A, B)` by calling the correct typed kernel based on the dtype of input tensors | Without the new case, `tensor_uint8 + tensor_uint8` hits the default branch and throws "unsupported dtype" |
+| `include/ops/ScalarOps.h` | **Scalar-tensor operations** — dispatches `tensor + 5.0`, `tensor * 2`, etc. where one operand is a C++ scalar | Without this, `uint8_tensor + 3` fails at runtime |
+| `include/ops/UnaryOps/Arithmetics.h` | **Unary math**: `neg()` (negate), `abs()` (absolute value), `square()`, `clamp()` — single-tensor element-wise operations | `abs(uint8_tensor)` would fail without the dispatch case |
+| `include/ops/UnaryOps/Exponents.h` | **Exponential/Log functions**: `exp()`, `log()`, `log2()`, `log10()`, `pow()`, `sqrt()`, `rsqrt()` | These are math-heavy ops that need the math overloads from `Types.h` to work with FP8/complex types |
+| `include/ops/UnaryOps/Trigonometry.h` | **Trig functions**: `sin()`, `cos()`, `tan()`, `asin()`, `acos()`, `atan()`, `sinh()`, `cosh()`, `tanh()` | Same pattern — needs dispatch case so trig functions recognize the new type |
+| `include/ops/UnaryOps/Conjugate.h` | **Complex conjugate**: `conj()` — flips the sign of the imaginary part. Only meaningful for complex types but dispatch must handle all types | Must recognize `Complex32/64/128` to actually conjugate, and pass-through for non-complex types |
+| `include/ops/UnaryOps/Reduction.h` | **Reductions**: `sum()`, `mean()`, `min()`, `max()`, `prod()`, `argmin()`, `argmax()`, `all()`, `any()`, `var()`, `std()` — collapse tensor along axes | FP8/complex reductions need the correct accumulator type and identity values from `ReductionOps.h` |
+| `include/ops/helpers/ReductionOps.h` | **Reduction operator structs** — defines `SumOp<T>::identity()`, `SumOp<T>::reduce(a,b)`, `MaxOp<T>`, `MinOp<T>`, etc. with type-specific identity values | `MinOp<uint8_t>::identity()` should be 255 (max uint8), not some default. Complex types need special min/max handling |
+| `include/ops/helpers/ConditionalOps.h` | **Where function**: `where(condition, x, y)` — element-wise ternary operation that selects from tensor `x` or `y` based on a boolean condition tensor | Must dispatch to the correct type so `where(mask, uint8_tensor, other)` works |
+| `include/core/TensorDispatch.h` | **Core dispatch infrastructure** — the master `DISPATCH_ALL_TYPES` macro that ALL operations ultimately call. Maps runtime `Dtype` → compile-time template type `T` | This is the **single most critical file** — if the new type isn't here, NO operation works with it |
+| `src/core/TensorFactory.cpp` | **Tensor creation**: `zeros()`, `ones()`, `full()`, `rand()`, `arange()`, `linspace()` — factory functions that allocate memory and fill with initial values | `Tensor::zeros({3,3}, Dtype::UInt8)` needs to know UInt8 exists to allocate 1 byte per element |
+| `src/core/AsTypeTensor.cpp` | **Type casting**: implements `tensor.astype(Dtype::UInt8)` — creates a new tensor with converted values. Must handle ALL N×N type pairs (source → target) | Without this, you can't convert `float32_tensor.astype(Dtype::UInt8)` |
 
 ---
 
@@ -354,19 +373,23 @@ template __global__ void kernel<complex64_t>(...);
 ```
 
 **GPU-specific files:**
-- `src/TensorOps/cuda/TensorOpsAdd.cu` (and Sub, Mul, Div)
-- `src/UnaryOps/cuda/Arithmetics.cu`
-- `src/UnaryOps/cuda/Exponents.cu`
-- `src/UnaryOps/cuda/Trigonometry.cu`
-- `src/UnaryOps/cuda/ReductionImplGPU.cu`
-- `src/Kernels/cuda/ConversionKernels.cu` — dtype casting on GPU
-- `src/compiler/cuda/ConditionalOps.cu`
+
+| File | What It Does | Why It Needs the New Type |
+|------|-------------|-------------------------|
+| `src/TensorOps/cuda/TensorOpsAdd.cu` (+ Sub, Mul, Div) | **GPU binary op kernels** — each `.cu` file contains CUDA kernel template instantiations for element-wise operations using GPU threads | CUDA requires **explicit template instantiation** — unlike CPU headers, the compiler won't auto-generate `kernel<uint8_t>` unless you write `template __global__ void add_kernel<uint8_t>(...)` in the .cu file |
+| `src/UnaryOps/cuda/Arithmetics.cu` | **GPU unary math kernels** — neg, abs, square on GPU | Same reason: explicit instantiation needed for each new type |
+| `src/UnaryOps/cuda/Exponents.cu` | **GPU exp/log/pow/sqrt kernels** | FP8 types need the promote-compute-demote pattern even on GPU |
+| `src/UnaryOps/cuda/Trigonometry.cu` | **GPU sin/cos/tan kernels** | Must instantiate for FP8 and complex types |
+| `src/UnaryOps/cuda/ReductionImplGPU.cu` | **GPU reduction kernels** — parallel tree-reduction using shared memory for sum, max, min, etc. | New types need their own reduction kernel instantiations with correct identity values |
+| `src/Kernels/cuda/ConversionKernels.cu` | **GPU type casting kernels** — converts tensor data between dtypes on GPU without copying back to CPU | Must add conversion pairs: e.g., `float32 → uint8` kernel, `uint8 → float32` kernel, `fp8 → float32` kernel |
+| `src/compiler/cuda/ConditionalOps.cu` | **GPU where() kernel** — evaluates `where(condition, x, y)` element-wise on GPU | Must instantiate for each new type so conditional selection works on GPU tensors |
 
 ---
 
 #### Step 7: Add to `.astype()` Conversion
 
-The `AsTypeTensor.cpp` handles runtime type casting (`tensor.astype(Dtype::UInt8)`). Must add conversion cases for every type pair.
+- **What it does:** `AsTypeTensor.cpp` implements the `tensor.astype(Dtype::target)` method. It allocates a new tensor of the target dtype, then iterates over every element, casting from the source type to the target type. For 18 dtypes, there are potentially 18×18 = 324 conversion pairs (source → target).
+- **Why modify:** Without adding conversion cases for the new type, `float_tensor.astype(Dtype::UInt8)` or `uint8_tensor.astype(Dtype::Float32)` would throw "unsupported conversion" at runtime. Each new type adds 17 new conversion paths (to/from every other existing type) plus the identity conversion.
 
 ---
 
