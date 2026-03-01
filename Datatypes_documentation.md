@@ -416,8 +416,8 @@ template __global__ void kernel<complex64_t>(...);
 | Mantissa bits | 3 | 2 |
 | Max value | ~448 | ~57344 |
 | Precision (decimal digits) | ~1 | < 1 |
-| Infinity? | ❌ No | ✅ Yes |
-| NaN? | ✅ (all bits = 1) | ✅ (standard IEEE) |
+| Infinity? |  No |  Yes |
+| NaN? |  (all bits = 1) |  (standard IEEE) |
 | Best for | Forward pass (weights/activations) | Backward pass (gradients) |
 
 **Why two FP8 formats?**
@@ -586,13 +586,13 @@ FUNCTION complex_div(a: complex, b: complex) → complex:
 
 | Capability | OwnTensor Library | PyTorch |
 |---------|-----------|---------|
-| FP8 support | ✅ First-class custom structs (E4M3, E5M2) | ✅ `torch.float8_e5m2`, `torch.float8_e4m3fn` |
-| Unsigned integers | ✅ Full set: UInt8–UInt64 | ⚠️ Only `torch.uint8` (limited support above) |
-| Complex types | ✅ complex32/64/128 with full arithmetic | ✅ `torch.complex32/64/128` |
-| Promotion tables | ✅ O(1) lookup (18×18 precomputed) | ✅ `torch.result_type()` |
-| CUDA FP8 operators | ✅ Manually written (NVIDIA doesn't provide them!) | ✅ Same approach |
-| FP8 mixing (E4M3 + E5M2) | ❌ Runtime error (by design) | ❌ Same — no implicit promotion |
-| Division promotion | ✅ Int→Float32 always | ✅ Same behavior |
+| FP8 support |  First-class custom structs (E4M3, E5M2) |  `torch.float8_e5m2`, `torch.float8_e4m3fn` |
+| Unsigned integers |  Full set: UInt8–UInt64 |  Only `torch.uint8` (limited support above) |
+| Complex types |  complex32/64/128 with full arithmetic |  `torch.complex32/64/128` |
+| Promotion tables   O(1) lookup (18×18 precomputed) |  `torch.result_type()` |
+| CUDA FP8 operators |  Manually written (NVIDIA doesn't provide them!) |  Same approach |
+| FP8 mixing (E4M3 + E5M2) |  Runtime error (by design) |  Same — no implicit promotion |
+| Division promotion |  Int→Float32 always |  Same behavior |
 
 ### 6.3 Source Files Reference
 
