@@ -77,9 +77,10 @@ CPU→GPU transfer with pinned memory:
 
 | Sub-task | API Used | Why |
 |----------|----------|-----|
-| **CPU Standard** | `delete[] ptr` / `free(ptr)` | Matches `new[]` / `malloc` |
+| **CPU Standard** | `free(ptr)` |  `malloc` |
 | **CPU Pinned** | `cudaFreeHost(ptr)` | MUST match `cudaMallocHost`. Using regular `free()` on pinned memory = undefined behavior! |
 | **GPU** | `cudaFree(ptr)` | Standard CUDA deallocation. Note: we clear error state with `cudaGetLastError()` after failure because deallocate may be called from destructors (can't throw) |
+
 
 ### 1.3 Task 3: Memcpy (Asynchronous)
 
