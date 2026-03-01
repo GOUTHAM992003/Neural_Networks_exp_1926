@@ -34,8 +34,8 @@ BEFORE (Old Design):                    AFTER (New Design):
                                          │             │
                                   ┌──────┘             │
                                   │                    │
-                              PinnedCPU         (Future: BFC
-                            Allocator            Caching Allocator)
+                              PinnedCPU         (Future(kathir bro is implementing this): pytorch's
+                            Allocator          CUDA  Caching Allocator)
                             (cudaMallocHost/
                              cudaFreeHost)
 
