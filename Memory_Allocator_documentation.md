@@ -57,10 +57,10 @@ BEFORE (Old Design):                    AFTER (New Design):
 
 | Sub-task | API Used | Why This API |
 |----------|----------|-------------|
-| **CPU Standard allocation** | `new uint8_t[bytes]` / `malloc(size)` | Standard pageable (swappable) memory. Fine for normal CPU tensors |
+| **CPU Standard allocation** |  `malloc(size)` | Standard pageable (swappable) memory. Fine for normal CPU tensors |
 | **CPU Pinned allocation** | `cudaMallocHost(ptr, size)` | Allocates page-locked (pinned) memory that can't be swapped to disk. Required for fast async CPU→GPU transfers via DMA |
 | **GPU allocation** | `cudaMalloc(ptr, size)` | Standard CUDA device memory allocation |
-| **GPU allocation (Future: BFC)** | `cudaMallocAsync()` / custom pool | TensorFlow's BFC caching allocator — reuses freed GPU blocks instead of calling cudaMalloc every time |
+| **GPU allocation ** | ` custom pool | I implemented TensorFlow's BFC caching allocator,but finalised to go with pytorch's PU allocator,as it have more better features compared to tensorflow's one  — reuses freed GPU blocks instead of calling cudaMalloc every time |
 
 **Why we need pinned memory:**
 ```
