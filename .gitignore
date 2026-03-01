@@ -63,3 +63,13 @@ libtorch_tests/*.zip
 benchmark_results/inputs/*.bin
 tensorflow/
 pytorch_source/
+
+# =========================
+# Tensor-Implementations_gau heavy folders
+# =========================
+Tensor-Implementations_gau/PyTorch-MLP-Text/
+Tensor-Implementations_gau/Tests/
+Tensor-Implementations_gau/a.out
+Tensor-Implementations_gau/ftest1
+Tensor-Implementations_gau/promotion_table_test
+Tensor-Implementations_gau/promotion_test
