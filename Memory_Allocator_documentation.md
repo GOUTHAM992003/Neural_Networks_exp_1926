@@ -92,15 +92,6 @@ Memory copy is handled by `DeviceTransfer.h/.cpp` with the unified `copy_memory(
 | **GPU → CPU** | `cudaMemcpyAsync(dst, src, size, DeviceToHost, stream)` | ~0.0027 ms | Same async API, direction controlled by `kind` parameter |
 | **GPU ↔ GPU** | `cudaMemcpyAsync(dst, src, size, DeviceToDevice, stream)` | - | Too fast — stays entirely on GPU, uses GPU's internal bandwidth |
 
-**The `cudaMemcpyKind` parameter:**
-```cpp
-enum cudaMemcpyKind {
-    cudaMemcpyHostToDevice   = 1,  // CPU → GPU
-    cudaMemcpyDeviceToHost   = 2,  // GPU → CPU
-    cudaMemcpyDeviceToDevice = 3,  // GPU → GPU
-    cudaMemcpyHostToHost     = 0   // CPU → CPU (not used — we use std::memcpy instead)
-};
-```
 
 ### 1.4 Task 4: Memset (Asynchronous)
 
@@ -254,66 +245,60 @@ To support advanced host memory tracking, this allocator wasn't just a simple wr
     *   Every time `deallocate()` is called, it removes the pointer from the hash map and subtracts the bytes.
 2.  **Configurable Behavior:** Takes `flags_` during construction to pass directly into `cudaHostAlloc(&ptr, bytes, flags_)`.
 
-### 3.5 DeviceTransfer — The Unified Memcpy
+### 3.5 DeviceTransfer — The Unified Memcpy (`DeviceTransfer.h / .cpp`)
 
-`copy_memory()` takes source and destination **device info** and routes to the correct API:
+All memory copy logic was stripped out of the `Allocator` class and moved into a standalone `copy_memory()` dispatcher.
 
-```cpp
-void copy_memory(void* dst, Device dst_device,
-                 const void* src, Device src_device, size_t bytes) {
-    
-    if (bytes == 0) return;
-    
-    // CPU → CPU: use std::memcpy (via CPUAllocator)
-    if (dst_device == CPU && src_device == CPU) {
-        AllocatorRegistry::get_cpu_allocator()->memcpy(dst, src, bytes, ...);
-        return;
-    }
-    
-    // GPU → GPU: use CUDAAllocator's cudaMemcpyAsync(DeviceToDevice)
-    if (dst_device == CUDA && src_device == CUDA) {
-        AllocatorRegistry::get_cuda_allocator()->memcpy(dst, src, bytes, DeviceToDevice);
-        return;
-    }
-    
-    // CPU → GPU: direct cudaMemcpyAsync(HostToDevice, stream)
-    if (dst_device == CUDA && src_device == CPU) {
-        cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, getCurrentStream());
-        return;
-    }
-    
-    // GPU → CPU: direct cudaMemcpyAsync(DeviceToHost, stream)
-    if (dst_device == CPU && src_device == CUDA) {
-        cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, getCurrentStream());
-        return;
-    }
-}
+```
+copy_memory(dst, dst_device, src, src_device, bytes)
+│
+│   if bytes == 0 → return immediately (no-op guard)
+│
+├── CPU → CPU
+│   └── std::memcpy(dst, src, bytes)          ← Synchronous, no CUDA needed
+│
+├── GPU → GPU
+│   └── cudaMemcpyAsync(DeviceToDevice)       ← Async, stays entirely on GPU
+│       Uses: getCurrentStream()
+│
+├── CPU → GPU  (Host → Device)
+│   └── cudaMemcpyAsync(HostToDevice)         ← Async if source is pinned memory
+│       Uses: getCurrentStream()
+│
+└── GPU → CPU  (Device → Host)
+    └── cudaMemcpyAsync(DeviceToHost)         ← Async if destination is pinned memory
+        Uses: getCurrentStream()
 ```
 
-### 3.6 DeviceSet — The Unified Memset
+| Direction | API Used | Sync/Async | Notes |
+|-----------|----------|:----------:|-------|
+| CPU → CPU | `std::memcpy` | Sync | Plain RAM-to-RAM, no GPU involvement |
+| GPU → GPU | `cudaMemcpyAsync` (DeviceToDevice) | Async | Uses GPU's internal bandwidth |
+| CPU → GPU | `cudaMemcpyAsync` (HostToDevice) | Async* | *Only truly async if source is pinned |
+| GPU → CPU | `cudaMemcpyAsync` (DeviceToHost) | Async* | *Only truly async if destination is pinned |
 
-Similar to `DeviceTransfer`, memory initialization logic has been stripped out of the `Allocator` and moved into a dedicated `set_memory()` function in `DeviceSet.h/.cpp`.
+### 3.6 DeviceSet — The Unified Memset (`DeviceSet.h / .cpp`)
 
-```cpp
-void set_memory(void* ptr, Device device, int value, size_t bytes) {
-    if (bytes == 0) return;
+Similarly, memory initialization logic was stripped out of the `Allocator` and moved into a standalone `set_memory()` dispatcher.
 
-    // CPU: inherently synchronous std::memset
-    if (device == Device::CPU) {
-        std::memset(ptr, value, bytes);
-        return;
-    }
-
-#ifdef WITH_CUDA
-    // GPU: async cudaMemsetAsync ordered on the active stream
-    cudaStream_t stream = OwnTensor::cuda::getCurrentStream();
-    cudaError_t err = cudaMemsetAsync(ptr, value, bytes, stream);
-    if (err != cudaSuccess) {
-        throw std::runtime_error(std::string("GPU memset failed: ") + cudaGetErrorString(err));
-    }
-#endif
-}
 ```
+set_memory(ptr, device, value, bytes)
+│
+│   if bytes == 0 → return immediately (no-op guard)
+│
+├── CPU
+│   └── std::memset(ptr, value, bytes)        ← Synchronous, standard C
+│
+└── GPU  (only compiled when WITH_CUDA is defined)
+    └── cudaMemsetAsync(ptr, value, bytes)    ← Async, stream-ordered
+        Uses: getCurrentStream()
+        On failure: throws runtime_error with cudaGetErrorString
+```
+
+| Device | API Used | Sync/Async | Notes |
+|--------|----------|:----------:|-------|
+| CPU | `std::memset` | Sync | Standard C library, fills byte-by-byte |
+| GPU | `cudaMemsetAsync` | Async | Stream-ordered, runs on GPU without blocking CPU |
 
 ### 3.7 Stream Management
 
