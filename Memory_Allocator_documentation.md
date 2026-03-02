@@ -181,8 +181,8 @@ src/device/
 Allocator (Abstract Base Class) — Allocator.h
 │
 │   Pure virtual methods:
-│   ├── allocate(bytes) → void*       // The ONLY job of an allocator!
-│   └── deallocate(ptr) → void        // The ONLY other job!
+│   ├── allocate(bytes) → void*       // The ONLY job of an allocator .
+│   └── deallocate(ptr) → void        // The ONLY other job.
 │   (All memcpy/memset wrappers have been completely removed)
 │
 ├── CPUAllocator — CPUAllocator.h/.cpp
@@ -191,7 +191,7 @@ Allocator (Abstract Base Class) — Allocator.h
 │
 ├── PinnedCPUAllocator — PinnedCPUAllocator.h/.cpp
 │   │   Has a `flags_` member for CUDA host allocation flags (Default, Portable, etc.)
-│   │   Maintains global thread-safe `MemoryStats` (allocs map, current, peak)
+│   │   Maintains global thread-safe `MemoryStats` (allocs map, current, peak)(these global stats were added by kathir bro in the main branch for benchmarking and debugging ) .
 │   ├── allocate():    cudaHostAlloc(&ptr, bytes, flags_) + updates stats
 │   └── deallocate():  cudaFreeHost(ptr) + updates stats
 │
