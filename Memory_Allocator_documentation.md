@@ -395,7 +395,7 @@ PyTorch uses **CUDACachingAllocator** — similar concept but stream-aware:
 
 ```
 Current:     Tensor.allocate() → AllocatorRegistry → CUDAAllocator → cudaMalloc (every time)
-Future:      Tensor.allocate() → AllocatorRegistry → CachingCUDAAllocator → BFC pool → fast sub-allocation
+Future:      Tensor.allocate() → AllocatorRegistry → CachingCUDAAllocator(Pytorch style) → Universal Memory pool(Small + Large) → fast sub-allocation
                                                             └── cudaMalloc only on pool exhaustion
 ```
 
