@@ -252,7 +252,7 @@ To support advanced host memory tracking, this allocator wasn't just a simple wr
     *   Every time `deallocate()` is called, it removes the pointer from the hash map and subtracts the bytes.
 2.  **Configurable Behavior:** Takes `flags_` during construction to pass directly into `cudaHostAlloc(&ptr, bytes, flags_)`.
 
-### 3.4 DeviceTransfer — The Unified Memcpy
+### 3.5 DeviceTransfer — The Unified Memcpy
 
 `copy_memory()` takes source and destination **device info** and routes to the correct API:
 
@@ -288,7 +288,32 @@ void copy_memory(void* dst, Device dst_device,
 }
 ```
 
-### 3.5 Stream Management
+### 3.6 DeviceSet — The Unified Memset
+
+Similar to `DeviceTransfer`, memory initialization logic has been stripped out of the `Allocator` and moved into a dedicated `set_memory()` function in `DeviceSet.h/.cpp`.
+
+```cpp
+void set_memory(void* ptr, Device device, int value, size_t bytes) {
+    if (bytes == 0) return;
+
+    // CPU: inherently synchronous std::memset
+    if (device == Device::CPU) {
+        std::memset(ptr, value, bytes);
+        return;
+    }
+
+#ifdef WITH_CUDA
+    // GPU: async cudaMemsetAsync ordered on the active stream
+    cudaStream_t stream = OwnTensor::cuda::getCurrentStream();
+    cudaError_t err = cudaMemsetAsync(ptr, value, bytes, stream);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("GPU memset failed: ") + cudaGetErrorString(err));
+    }
+#endif
+}
+```
+
+### 3.7 Stream Management
 
 Thread-local CUDA stream storage for async operations:
 
@@ -549,5 +574,6 @@ FUNCTION bfc_allocate(requested_bytes):
 | `CUDAAllocator.h/.cpp` | 19 + 89 | cudaMalloc/cudaFree with error handling, cudaMemcpyAsync/cudaMemsetAsync |
 | `AllocatorRegistry.h/.cpp` | 13 + 28 | Static singleton dispatcher: Device → Allocator* |
 | `DeviceTransfer.h/.cpp` | 14 + 62 | `copy_memory()` — 4-way routing: CPU↔CPU, CPU→GPU, GPU→CPU, GPU↔GPU |
+| `DeviceSet.h/.cpp` | 12 + 38 | `set_memory()` — Device-safe tensor initialization dispatcher |
 | `DeviceCore.h/.cpp` | 19 + 58 | cuda_available(), cuda_device_count(), thread_local stream management |
 | `Device.h` | 24 | Device enum (CPU, CUDA) + DeviceIndex struct |
