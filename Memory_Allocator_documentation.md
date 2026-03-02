@@ -89,7 +89,7 @@ Memory copy is handled by `DeviceTransfer.h/.cpp` with the unified `copy_memory(
 | Transfer Direction | API Used | Timing (500 MiB) | Why This API |
 |-------------------|----------|:-:|-------------|
 | **CPU ↔ CPU** | `std::memcpy(dst, src, size)` | ~22 ms | Fastest for host-to-host. No CUDA overhead needed |
-| **CPU → GPU** | `cudaMemcpyAsync(dst, src, size, HostToDevice, stream)` | ~0.003 ms | Asynchronous, stream-aware, With pinned source: bandwidth ~163 GiB/s |
+| **CPU → GPU** | `cudaMemcpyAsync(dst, src, size, HostToDevice, stream)` | ~0.003 ms | Asynchronous, stream-aware, With pinned source. |
 | **GPU → CPU** | `cudaMemcpyAsync(dst, src, size, DeviceToHost, stream)` | ~0.0027 ms | Same async API, direction controlled by `kind` parameter |
 | **GPU ↔ GPU** | `cudaMemcpyAsync(dst, src, size, DeviceToDevice, stream)` | - | Too fast — stays entirely on GPU, uses GPU's internal bandwidth |
 
