@@ -157,6 +157,7 @@ Before choosing APIs, I ran timing experiments on multiple NVIDIA APIs to compar
 include/device/
 ├── Allocator.h           ← Abstract base class (pure virtual allocate/deallocate)
 ├── CPUAllocator.h        ← Standard CPU allocation (new/delete)
+├── PinnedCPUAllocator.h  ← Pinned CPU allocation (cudaHostAlloc)
 ├── CUDAAllocator.h       ← GPU allocation (cudaMalloc/cudaFree)
 ├── AllocatorRegistry.h   ← Dispatcher: Device → correct Allocator
 ├── DeviceTransfer.h      ← copy_memory() — unified memcpy dispatcher
@@ -165,6 +166,7 @@ include/device/
 
 src/device/
 ├── CPUAllocator.cpp      ← Implementation
+├── PinnedCPUAllocator.cpp← Implementation (GlobalPinnedStats)
 ├── CUDAAllocator.cpp     ← Implementation
 ├── AllocatorRegistry.cpp ← Singleton allocator instances
 ├── DeviceTransfer.cpp    ← 4-way copy routing implementation
@@ -543,6 +545,7 @@ FUNCTION bfc_allocate(requested_bytes):
 |------|:---:|------|
 | `Allocator.h` | 13 | Abstract base class: purely virtual allocate/deallocate, successfully stripped of all transfer/set duties |
 | `CPUAllocator.h/.cpp` | 18 + 42 | new[]/delete[], std::memcpy, std::memset |
+| `PinnedCPUAllocator.h/.cpp` | 29 + 84 | `cudaHostAlloc`/`cudaFreeHost` with `GlobalPinnedStats` tracker map & thread safety |
 | `CUDAAllocator.h/.cpp` | 19 + 89 | cudaMalloc/cudaFree with error handling, cudaMemcpyAsync/cudaMemsetAsync |
 | `AllocatorRegistry.h/.cpp` | 13 + 28 | Static singleton dispatcher: Device → Allocator* |
 | `DeviceTransfer.h/.cpp` | 14 + 62 | `copy_memory()` — 4-way routing: CPU↔CPU, CPU→GPU, GPU→CPU, GPU↔GPU |
