@@ -186,10 +186,12 @@ Allocator (Abstract Base Class) — Allocator.h
 │   └── deallocate():  delete[] static_cast<uint8_t*>(ptr)
 │
 ├── PinnedCPUAllocator — PinnedCPUAllocator.h/.cpp
-│   ├── allocate():    cudaHostAlloc()
-│   └── deallocate():  cudaFreeHost()
+│   │   Has a `flags_` member for CUDA host allocation flags (Default, Portable, etc.)
+│   │   Maintains global thread-safe `MemoryStats` (allocs map, current, peak)
+│   ├── allocate():    cudaHostAlloc(&ptr, bytes, flags_) + updates stats
+│   └── deallocate():  cudaFreeHost(ptr) + updates stats
 │
-└── CUDAAllocator — CUDAAllocator.h/.cpp
+└── CUDAAllocator — CUDAAllocator.h/.cpp (Standard GPU Allocator)
     ├── allocate():    cudaMalloc(&ptr, bytes) with error checking
     └── deallocate():  cudaFree(ptr) with error clearing (safe for destructors)
 ```
@@ -219,21 +221,34 @@ return (attr.type == cudaMemoryTypeHost); // True if it's pinned!
 
 ### 3.3 AllocatorRegistry — The Dispatcher
 
-Routes `Device` enum to the correct allocator instance. Uses **file-scope static singletons**:
+Routes hardware device types and flags to the correct singleton allocator instances:
 
 ```cpp
-namespace {  // Anonymous namespace = internal linkage
-    CPUAllocator  cpu_allocator;   // One global instance
-    CUDAAllocator cuda_allocator;  // One global instance
-}
+// Static methods in AllocatorRegistry return pointers to internal singletons:
+Allocator* AllocatorRegistry::get_allocator(Device device);
+Allocator* AllocatorRegistry::get_cpu_allocator();
+Allocator* AllocatorRegistry::get_cuda_allocator();
 
-Allocator* AllocatorRegistry::get_allocator(Device device) {
-    if (device == Device::CPU) return &cpu_allocator;
-    else                       return &cuda_allocator;
-}
+// Pinned CPU memory has a special enum flag:
+// Pinned_Flag::Default, Pinned_Flag::Mapped, Portable, WriteCombined
+Allocator* AllocatorRegistry::get_pinned_cpu_allocator(Pinned_Flag flag);
+
+// GPU Allocators:
+Allocator* AllocatorRegistry::get_cuda_allocator();
+Allocator* AllocatorRegistry::get_caching_allocator();
 ```
 
-**Why singletons?** Allocators hold no per-allocation state (pure strategy pattern). One instance per device type is sufficient.
+**Why singletons with flags?** The `PinnedCPUAllocator` accepts a `Pinned_Flag` parameter during registration, allowing advanced CUDA features like **Mapped** memory (zero-copy memory mapped into CUDA address space) or **WriteCombined** (no L1/L2 cache, maximizing PCIe bandwidth).
+
+### 3.4 Pinned CPU Architecture (`PinnedCPUAllocator.h / .cpp`)
+
+To support advanced host memory tracking, this allocator wasn't just a simple wrapper. It implements:
+
+1.  **Global Thread-Safe Stats (`GlobalPinnedStats`):**
+    A privately scoped struct using `std::mutex` and `std::unordered_map<void*, size_t>`.
+    *   Every time `allocate()` is called, it registers the pointer, the allocated bytes, and updates `current` and `peak` host memory metrics.
+    *   Every time `deallocate()` is called, it removes the pointer from the hash map and subtracts the bytes.
+2.  **Configurable Behavior:** Takes `flags_` during construction to pass directly into `cudaHostAlloc(&ptr, bytes, flags_)`.
 
 ### 3.4 DeviceTransfer — The Unified Memcpy
 
@@ -370,7 +385,7 @@ Future:      Tensor.allocate() → AllocatorRegistry → CachingCUDAAllocator �
                                                             └── cudaMalloc only on pool exhaustion
 ```
 
-The `CachingCUDAAllocator` would inherit from `Allocator` (same interface) — just override `allocate()` and `deallocate()` with the BFC logic. The rest of the system (DeviceTransfer, memset, etc.) stays unchanged.
+*(Note: The PyTorch-style `CachingCUDAAllocator` replacing the BFC logic was ultimately implemented in this branch by Kathir, rather than me. The architecture above reflects my design and implementation for `Allocator`, `PinnedCPUAllocator`, and `CUDAAllocator`)*
 
 ---
 
