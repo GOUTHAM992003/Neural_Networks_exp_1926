@@ -20,11 +20,11 @@ The original allocator class was a **monolithic mess**:
 I bifurcated the old monolithic allocator into **4 clean, separate responsibilities**:
 
 ```
-BEFORE (Old Design):                    AFTER (New Design):
+BEFORE (Old Design):                    AFTER (Final Design):
 ┌─────────────────────┐                ┌─────────────────┐
 │     Allocator       │                │    Allocator     │ → Allocator.h
-│  ├── allocate()     │                │  ├── allocate()  │    (Base class - pure virtual)
-│  ├── deallocate()   │                │  └── deallocate()│
+│  ├── allocate()     │                │  ├── allocate()  │    (Base class now ONLY 
+│  ├── deallocate()   │                │  └── deallocate()│     does allocation!)
 │  ├── memcpy()       │                └─────────────────┘
 │  ├── memcpyAsync()  │                         │
 │  ├── memset()       │                  ┌──────┴──────┐
@@ -36,7 +36,7 @@ BEFORE (Old Design):                    AFTER (New Design):
                                   │                    │
                               PinnedCPU         (Future(kathir bro is implementing this): pytorch's
                             Allocator          CUDA  Caching Allocator)
-                            (cudaMallocHost/
+                            (cudaHostAlloc/
                              cudaFreeHost)
 
            ┌──────────────────┐    ┌──────────────────┐
@@ -58,7 +58,7 @@ BEFORE (Old Design):                    AFTER (New Design):
 | Sub-task | API Used | Why This API |
 |----------|----------|-------------|
 | **CPU Standard allocation** |  `malloc(size)` | Standard pageable (swappable) memory. Fine for normal CPU tensors |
-| **CPU Pinned allocation** | `cudaMallocHost(ptr, size)` | Allocates page-locked (pinned) memory that can't be swapped to disk. Required for fast async CPU→GPU transfers via DMA |
+| **CPU Pinned allocation** | `cudaHostAlloc` (in `PinnedCPUAllocator`) / `cudaHostRegister` (for in-place pinning) | Allocates page-locked (pinned) memory that can't be swapped to disk. Required for fast async CPU→GPU transfers via DMA. `cudaHostRegister` is used to pin existing pageable memory dynamically. |
 | **GPU allocation** | `cudaMalloc(ptr, size)` | Standard CUDA device memory allocation |
 | **GPU allocation ** | ` custom pool | I implemented TensorFlow's BFC caching allocator,but finalised to go with pytorch's PU allocator,as it have more better features compared to tensorflow's one  — reuses freed GPU blocks instead of calling cudaMalloc every time |
 
@@ -79,8 +79,7 @@ CPU→GPU transfer with pinned memory:
 |----------|----------|-----|
 | **CPU Standard** | `free(ptr)` |  `malloc` |
 | **CPU Pinned** | `cudaFreeHost(ptr)` | MUST match `cudaMallocHost`. Using regular `free()` on pinned memory = undefined behavior! |
-| **GPU** | `cudaFree(ptr)` | Standard CUDA deallocation. Note: we clear error state with `cudaGetLastError()` after failure because deallocate may be called from destructors (can't throw) |
-
+| **GPU** | `cudaFree(ptr)` | Standard CUDA deallocation. 
 
 ### 1.3 Task 3: Memcpy (Asynchronous)
 
@@ -172,32 +171,50 @@ src/device/
 └── DeviceCore.cpp        ← cuda_available(), stream get/set
 ```
 
-### 3.2 Class Hierarchy
+### 3.2 Class Hierarchy (Fully Purified)
 
 ```
 Allocator (Abstract Base Class) — Allocator.h
 │
 │   Pure virtual methods:
-│   ├── allocate(bytes) → void*       // The ONLY job of an allocator
-│   ├── deallocate(ptr) → void        // The ONLY other job
-│   ├── memsetAsync(ptr, val, bytes, stream)    // Still here for backward compat
-│   └── memcpyAsync(dst, src, bytes, kind, stream)
-│
-│   Default implementations (call async + sync):
-│   ├── memset(ptr, val, bytes)       // Wrapper: memsetAsync + cudaStreamSynchronize
-│   └── memcpy(dst, src, bytes, kind) // Wrapper: memcpyAsync + cudaStreamSynchronize
+│   ├── allocate(bytes) → void*       // The ONLY job of an allocator!
+│   └── deallocate(ptr) → void        // The ONLY other job!
+│   (All memcpy/memset wrappers have been completely removed)
 │
 ├── CPUAllocator — CPUAllocator.h/.cpp
 │   ├── allocate():    new uint8_t[bytes]
-│   ├── deallocate():  delete[] static_cast<uint8_t*>(ptr)
-│   ├── memsetAsync(): std::memset (ignores stream — CPU has no streams)
-│   └── memcpyAsync(): std::memcpy (ignores stream and kind — all host memory)
+│   └── deallocate():  delete[] static_cast<uint8_t*>(ptr)
+│
+├── PinnedCPUAllocator — PinnedCPUAllocator.h/.cpp
+│   ├── allocate():    cudaHostAlloc()
+│   └── deallocate():  cudaFreeHost()
 │
 └── CUDAAllocator — CUDAAllocator.h/.cpp
     ├── allocate():    cudaMalloc(&ptr, bytes) with error checking
-    ├── deallocate():  cudaFree(ptr) with error clearing (safe for destructors)
-    ├── memsetAsync(): cudaMemsetAsync(ptr, value, bytes, stream)
-    └── memcpyAsync(): cudaMemcpyAsync(dst, src, bytes, kind, stream)
+    └── deallocate():  cudaFree(ptr) with error clearing (safe for destructors)
+```
+
+### 3.2.1 Tensor Class Integration: `pin_memory()` and `is_pinned()`
+
+Instead of making copies, tearing down, and re-allocating memory, the `Tensor` class dynamically handles pinned memory status using specialized CUDA APIs:
+
+**1. `t.pin_memory()` (In-Place Pinning)**
+Rather than copying data into a new `cudaHostAlloc` buffer (like PyTorch does), our implementation uses **in-place pinning** via `cudaHostRegister`.
+- It takes an existing pageable CPU tensor.
+- It calls `cudaHostRegister(ptr, size, cudaHostRegisterDefault)`.
+- The OS locks the existing virtual memory pages into physical RAM immediately. 
+- *Benefit:* Huge optimization. Avoids expensive memory copies for tensors that are already populated with data.
+
+**2. `t.is_pinned()` (Pointer Interrogation)**
+To check if a tensor can be used in an async transfer, it queries the NVIDIA driver directly using `cudaPointerGetAttributes`:
+```cpp
+cudaPointerAttributes attr;
+cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
+if (err != cudaSuccess) {
+    cudaGetLastError(); // Reset error state if it wasn't a CUDA pointer
+    return false;
+}
+return (attr.type == cudaMemoryTypeHost); // True if it's pinned!
 ```
 
 ### 3.3 AllocatorRegistry — The Dispatcher
@@ -509,7 +526,7 @@ FUNCTION bfc_allocate(requested_bytes):
 
 | File | Lines | What's Inside |
 |------|:---:|------|
-| `Allocator.h` | 46 | Abstract base class: virtual allocate/deallocate + default sync wrappers for memset/memcpy |
+| `Allocator.h` | 13 | Abstract base class: purely virtual allocate/deallocate, successfully stripped of all transfer/set duties |
 | `CPUAllocator.h/.cpp` | 18 + 42 | new[]/delete[], std::memcpy, std::memset |
 | `CUDAAllocator.h/.cpp` | 19 + 89 | cudaMalloc/cudaFree with error handling, cudaMemcpyAsync/cudaMemsetAsync |
 | `AllocatorRegistry.h/.cpp` | 13 + 28 | Static singleton dispatcher: Device → Allocator* |
