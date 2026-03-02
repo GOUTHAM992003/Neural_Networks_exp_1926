@@ -161,6 +161,7 @@ include/device/
 ├── CUDAAllocator.h       ← GPU allocation (cudaMalloc/cudaFree)
 ├── AllocatorRegistry.h   ← Dispatcher: Device → correct Allocator
 ├── DeviceTransfer.h      ← copy_memory() — unified memcpy dispatcher
+├── DeviceSet.h           ← set_memory() — unified memset dispatcher
 ├── DeviceCore.h          ← CUDA device queries + stream management
 └── Device.h              ← Device enum (CPU, CUDA) + DeviceIndex
 
@@ -170,6 +171,7 @@ src/device/
 ├── CUDAAllocator.cpp     ← Implementation
 ├── AllocatorRegistry.cpp ← Singleton allocator instances
 ├── DeviceTransfer.cpp    ← 4-way copy routing implementation
+├── DeviceSet.cpp         ← Device-safe tensor initialization dispatcher
 └── DeviceCore.cpp        ← cuda_available(), stream get/set
 ```
 
