@@ -89,9 +89,9 @@ Memory copy is handled by `DeviceTransfer.h/.cpp` with the unified `copy_memory(
 | Transfer Direction | API Used | Timing (500 MiB) | Why This API |
 |-------------------|----------|:-:|-------------|
 | **CPU ↔ CPU** | `std::memcpy(dst, src, size)` | ~22 ms | Fastest for host-to-host. No CUDA overhead needed |
-| **CPU → GPU** | `cudaMemcpyAsync(dst, src, size, HostToDevice, stream)` | ~30 ms | Asynchronous, stream-aware. With pinned source: bandwidth ~163 GiB/s |
-| **GPU → CPU** | `cudaMemcpyAsync(dst, src, size, DeviceToHost, stream)` | ~30 ms | Same async API, direction controlled by `kind` parameter |
-| **GPU ↔ GPU** | `cudaMemcpyAsync(dst, src, size, DeviceToDevice, stream)` | ~0.003 ms | Blazing fast — stays entirely on GPU, uses GPU's internal bandwidth |
+| **CPU → GPU** | `cudaMemcpyAsync(dst, src, size, HostToDevice, stream)` | ~0.003 ms | Asynchronous, stream-aware, With pinned source: bandwidth ~163 GiB/s |
+| **GPU → CPU** | `cudaMemcpyAsync(dst, src, size, DeviceToHost, stream)` | ~0.0027 ms | Same async API, direction controlled by `kind` parameter |
+| **GPU ↔ GPU** | `cudaMemcpyAsync(dst, src, size, DeviceToDevice, stream)` | - | Too fast — stays entirely on GPU, uses GPU's internal bandwidth |
 
 **The `cudaMemcpyKind` parameter:**
 ```cpp
@@ -124,7 +124,7 @@ Before choosing APIs, I ran timing experiments on multiple NVIDIA APIs to compar
 |:---:|:---:|:---:|:---:|
 | pageable → pageable | `std::memcpy` | ~22 ms | All ~22 ms — type of allocation doesn't matter for CPU↔CPU |
 | pageable → pinned | `std::memcpy` | ~22.4 ms | |
-| pinned → pageable | `std::memcpy` | ~22 ms | |
+| pinned → pageable | `std::memcpy` | ~22.7 ms | |
 | pinned → pinned | `std::memcpy` | ~22.4 ms | |
 
 **Conclusion:** For CPU↔CPU, `std::memcpy` is always the right choice. Pinned vs pageable doesn't affect CPU-side copy speed.
@@ -134,12 +134,13 @@ Before choosing APIs, I ran timing experiments on multiple NVIDIA APIs to compar
 | API | Behavior | Time | Notes |
 |:---:|:---:|:---:|:---:|
 | `cudaMemcpy(dst, src, size, kind)` | Synchronous + 2 copies | ~35 ms | Blocks CPU. If source is pageable: stages through internal pinned buffer |
-| `cudaMemcpyAsync` + `cudaStreamSynchronize` | Sync(1 copy) | ~2.6 ms | Same as cudaMemcpy + pinned source (1 DMA copy) |
-| `cudaMemcpyAsync` (no sync, pageable src) | Misleadingly "async" | ~35 ms | Actually blocks CPU! CUDA must stage pageable memory |
-| `cudaMemcpyAsync` (pinned src) | True async | ~0.003 ms | Returns immediately. DMA runs in background. ~163 GiB/s bandwidth |
+| `cudaMemcpyAsync` + `cudaStreamSynchronize` | Sync(1 copy) | ~27 ms | Same as cudaMemcpy + pinned source (1 DMA copy) |
+| `cudaMemcpyAsync` (no sync, pageable src) | Misleadingly "async" | ~35 ms | Actually blocks CPU, CUDA must stage pageable memory |
+| `cudaMemcpyAsync` (pinned src) | True async | ~0.003 ms | Returns immediately. DMA runs in background. |
 | `cudaMemcpyAsync` (pageable dst, D→H) | Sync internally | ~37 ms | Must stage buffer, blocks CPU |
+| `cudaMemcpyAsync` (pinned dst, D→H) | Pure Async  | ~0.0027 ms | Returns immediately,DMA runs in the background . |
 
-**Critical Insight:** `cudaMemcpyAsync` is only truly asynchronous when the host memory is **pinned**! With pageable memory, it silently falls back to synchronous behavior.
+**Critical Insight:** `cudaMemcpyAsync` is only truly asynchronous when the host memory is **pinned** and With pageable memory, it silently falls back to synchronous behavior.
 
 **Final API choices based on experiments:**
 - **CPU → GPU:** `cudaMemcpyAsync` with `cudaMemcpyHostToDevice` kind (truly async if source is pinned)
