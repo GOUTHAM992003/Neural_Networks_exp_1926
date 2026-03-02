@@ -156,7 +156,7 @@ Before choosing APIs, I ran timing experiments on multiple NVIDIA APIs to compar
 ```
 include/device/
 ├── Allocator.h           ← Abstract base class (pure virtual allocate/deallocate)
-├── CPUAllocator.h        ← Standard CPU allocation (new/delete)
+├── CPUAllocator.h        ← Standard CPU allocation (malloc/free)
 ├── PinnedCPUAllocator.h  ← Pinned CPU allocation (cudaHostAlloc)
 ├── CUDAAllocator.h       ← GPU allocation (cudaMalloc/cudaFree)
 ├── AllocatorRegistry.h   ← Dispatcher: Device → correct Allocator
@@ -184,8 +184,8 @@ Allocator (Abstract Base Class) — Allocator.h
 │   (All memcpy/memset wrappers have been completely removed)
 │
 ├── CPUAllocator — CPUAllocator.h/.cpp
-│   ├── allocate():    new uint8_t[bytes]
-│   └── deallocate():  delete[] static_cast<uint8_t*>(ptr)
+│   ├── allocate(): malloc() 
+│   └── deallocate():  free()
 │
 ├── PinnedCPUAllocator — PinnedCPUAllocator.h/.cpp
 │   │   Has a `flags_` member for CUDA host allocation flags (Default, Portable, etc.)
