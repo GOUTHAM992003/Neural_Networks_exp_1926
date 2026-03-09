@@ -22,7 +22,7 @@ graph TD
 
     A["Python API: tf.reduce_sum(tensor)"]:::api
 
-    subgraph Above Kernel Level (Framework C++)
+    subgraph "Above Kernel Level (Framework C++)"
         direction TB
         B["Framework Registry Lookup<br>(Global dictionary matches 'Sum' & 'float32')"]:::above
         C["Context Initialization<br>(Creates OpKernelContext *ctx)"]:::above
@@ -30,7 +30,7 @@ graph TD
         B --> C --> D
     end
 
-    subgraph Below Kernel Level (Shape Math & Execution)
+    subgraph "Below Kernel Level (Shape Math & Execution)"
         direction TB
         E["helper.Simplify(data, axes)<br>Collapses 5D to 2D if possible"]:::below
         F["Shape-Based Bifurcation (6-way if/else)"]:::below
@@ -101,7 +101,7 @@ graph TD
 
     A["API Call: reduce_sum(tensor)"]:::api
 
-    subgraph Above Kernel Level (Explicit Dispatching)
+    subgraph "Above Kernel Level (Explicit Dispatching)"
         direction TB
         B["Operation Bifurcation<br>(dispatch_reduction vs dispatch_mean)"]:::above
         C["DataType Macros<br>(DISPATCH_ALL_TYPES)"]:::above
@@ -109,7 +109,7 @@ graph TD
         B --> C --> D
     end
 
-    subgraph Below Kernel Level (Execution)
+    subgraph "Below Kernel Level (Execution)"
         direction TB
         E["Generic Kernel Loop<br>(Handles literally any N-Dim shape)"]:::below
         F["Element-wise Math Bottleneck<br>(ravel_index & unravel_index)"]:::below
