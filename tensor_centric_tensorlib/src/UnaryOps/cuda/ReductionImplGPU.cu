@@ -10,6 +10,7 @@
 #include <cuda_fp16.h>          // Native CUDA types (__half, __nv_bfloat16)
 #include <cuda_bf16.h>
 #include "dtype/CudaTraits.h"
+#include "device/CachingCudaAllocator.h"
 
 namespace OwnTensor {
 namespace detail {
@@ -32,12 +33,15 @@ public:
     
     DeviceArray(const std::vector<int64_t>& host_data, cudaStream_t stream) : stream_(stream) {
         size_t bytes = host_data.size() * sizeof(int64_t);
-        cudaMallocAsync(&ptr, bytes, stream_);
+        // cudaMallocAsync(&ptr, bytes, stream_);
+        CachingCUDAAllocator::instance().allocate(ptr, bytes, stream_);
         cudaMemcpyAsync(ptr, host_data.data(), bytes, cudaMemcpyHostToDevice, stream_);
+        
     }
     
     ~DeviceArray() {
-        if (ptr) cudaFreeAsync(ptr, stream_);
+        // if (ptr) cudaFreeAsync(ptr, stream_);
+        if (ptr) CachingCUDAAllocator::instance().deallocate(ptr, stream_);
     }
     
     DeviceArray(const DeviceArray&) = delete;
