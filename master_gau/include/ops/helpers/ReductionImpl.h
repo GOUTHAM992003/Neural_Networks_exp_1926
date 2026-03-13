@@ -133,11 +133,16 @@ Tensor reduce_kernel(
     const std::vector<int64_t>& input_strides = input.stride().strides;
     
     const int64_t reduced_count = calculate_reduced_count(input_dims, normalized_axes);
-    
-    if (reduced_count == 0 && input.numel() > 0) {
-        throw std::runtime_error("Reduction error: reduced count is zero but input has " + 
-                                std::to_string(input.numel()) + " elements.");
-    }
+
+    //No-way we are reaching this case,so i commented this,
+    // //try searching for cases where we reach this,never we reach this case,
+    // //ex: [0,3] --->tensor_shape ,here input.numel() == 0 ,so bypasses in both all conditions like reduction over dim0(reduced_count=0),dim1(reduced_count=1)
+    //and no way we can have reduced_count == 0  as normalize_axis fucntion take care of the reduced  axes from input and process it well and handles this case already .
+     
+    // if (reduced_count == 0 && input.numel() > 0) {
+    //     throw std::runtime_error("Reduction error: reduced count is zero but input has " + 
+    //                             std::to_string(input.numel()) + " elements.");
+    // }
     
     // Determine output C++ type
     using OutputCppT = typename std::conditional<

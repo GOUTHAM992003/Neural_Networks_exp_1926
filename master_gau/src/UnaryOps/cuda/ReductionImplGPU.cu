@@ -13,7 +13,7 @@
 #include <cuda_fp16.h>          // Native CUDA types (__half, __nv_bfloat16)
 #include <cuda_bf16.h>
 #include "dtype/CudaTraits.h"
-
+#include "device/CachingCudaAllocator.h"
 namespace OwnTensor {
 namespace detail {
 
@@ -28,24 +28,84 @@ namespace detail {
 // GPU DEVICE MEMORY HELPER
 // =================================================================
 
-class DeviceArray {
+// =================================================================
+// PACKED METADATA: Single allocation + Single cudaMemcpy for all metadata
+// Layout: [input_dims | input_strides | output_dims | normalized_axes | reduced_dims]
+// =================================================================
+class PackedMetadata {
 public:
-    int64_t* ptr;
-    cudaStream_t stream_; //~change
-    
-    DeviceArray(const std::vector<int64_t>& host_data, cudaStream_t stream) : stream_(stream) {
-        size_t bytes = host_data.size() * sizeof(int64_t);
-        cudaMallocAsync(&ptr, bytes, stream_);
-        cudaMemcpyAsync(ptr, host_data.data(), bytes, cudaMemcpyHostToDevice, stream_);
-    }
-    
-    ~DeviceArray() {
-        if (ptr) cudaFreeAsync(ptr, stream_);
-    }
-    
-    DeviceArray(const DeviceArray&) = delete;
-    DeviceArray& operator=(const DeviceArray&) = delete;
+int64_t* d_ptr; //single device pointer for all metadata 
+int64_t* d_input_dims; //Pointer offset into d_ptr
+int64_t* d_input_strides; //Pointer offset into d_ptr
+int64_t* d_output_dims; //Pointer offset into d_ptr
+int64_t* d_normalized_axes; //Pointer offset into d_ptr
+int64_t* d_reduced_dims; //Pointer offset into d_ptr
+PackedMetadata(const std::vector<int64_t>& input_dims,
+const std::vector<int64_t>& input_strides,
+const std::vector<int64_t>& output_dims,
+const std::vector<int64_t>& normalized_axes,
+const std::vector<int64_t>& reduced_dims,
+cudaStream_t stream)
+{
+    size_t total_size = input_dims.size() + input_strides.size() + output_dims.size() + normalized_axes.size() + reduced_dims.size();
+
+    std::vector<int64_t> all_metadata(total_size);
+    size_t offset = 0;
+std::copy(input_dims.begin(),input_dims.end(),all_metadata.begin()+offset);
+size_t offset_input_dims = offset;
+offset+=input_dims.size();
+
+std::copy(input_strides.begin(),input_strides.end(),all_metadata.begin()+offset);
+size_t offset_input_strides = offset;
+offset+=input_strides.size();
+
+std::copy(output_dims.begin(),output_dims.end(),all_metadata.begin()+offset);
+size_t offset_output_dims = offset;
+offset+=output_dims.size();
+
+std::copy(normalized_axes.begin(),normalized_axes.end(),all_metadata.begin()+offset);
+size_t offset_normalized_axes = offset;
+offset+=normalized_axes.size();
+
+std::copy(reduced_dims.begin(),reduced_dims.end(),all_metadata.begin()+offset);
+size_t offset_reduced_dims = offset;
+offset+=reduced_dims.size();
+
+size_t total_bytes = total_size * sizeof(int64_t);
+d_ptr = static_cast<int64_t*>(CachingCUDAAllocator::instance().allocate(total_bytes,stream));
+cudaMemcpyAsync(d_ptr,all_metadata.data(),total_bytes,cudaMemcpyHostToDevice,stream);
+d_input_dims = d_ptr + offset_input_dims ; // --->d_ptr+0 = d_ptr 
+d_input_strides = d_ptr + offset_input_strides ;
+d_output_dims = d_ptr + offset_output_dims ;
+d_normalized_axes = d_ptr+offset_normalized_axes ; 
+d_reduced_dims = d_ptr + offset_reduced_dims ;
+
+}
+~PackedMetadata(){
+    if(d_ptr) CachingCUDAAllocator::instance().deallocate(d_ptr);
+}
+PackedMetadata(const PackedMetadata&) = delete ;
+PackedMetadata& operator=(const PackedMetadata&) = delete;
 };
+//class DeviceArray(){ 
+//public :
+    // int64_t* ptr;
+    // cudaStream_t stream_; //~change
+    
+   
+//     DeviceArray(const std::vector<int64_t>& host_data, cudaStream_t stream) : stream_(stream) {
+//         size_t bytes = host_data.size() * sizeof(int64_t);
+//         ptr = static_cast<int64_t*>(CachingCUDAAllocator::instance().allocate(bytes, stream_));
+//         cudaMemcpyAsync(ptr, host_data.data(), bytes, cudaMemcpyHostToDevice, stream_);
+//     }
+    
+//     ~DeviceArray() {
+//         if (ptr) CachingCUDAAllocator::instance().deallocate(ptr);
+//     }
+    
+//     DeviceArray(const DeviceArray&) = delete;
+//     DeviceArray& operator=(const DeviceArray&) = delete;
+// };
 
 // ═══════════════════════════════════════════════════════════
 // GPU VALUE REDUCTION DISPATCHER (WITH TYPE CONVERSION)
@@ -96,12 +156,12 @@ Tensor dispatch_reduction_gpu(const Tensor& input,
     }
     
     // Transfer metadata to device
-    DeviceArray d_input_dims(input_dims,stream);//✨✨✨
-    DeviceArray d_input_strides(input_strides,stream);//✨✨✨
-    DeviceArray d_output_dims(output_shape.dims,stream);//✨✨✨
-    DeviceArray d_normalized_axes(normalized_axes,stream);//✨✨✨
-    DeviceArray d_reduced_dims(reduced_dims,stream);//✨✨✨
-    
+    // DeviceArray d_input_dims(input_dims,stream);//✨✨✨
+    // DeviceArray d_input_strides(input_strides,stream);//✨✨✨
+    // DeviceArray d_output_dims(output_shape.dims,stream);//✨✨✨
+    // DeviceArray d_normalized_axes(normalized_axes,stream);//✨✨✨
+    // DeviceArray d_reduced_dims(reduced_dims,stream);//✨✨✨
+    PackedMetadata metadata(input_dims,input_strides,output_shape.dims,normalized_axes,reduced_dims,stream);
     // Kernel configuration
     int threads_per_block = 256;
     int num_blocks = num_slices;
@@ -149,11 +209,11 @@ Tensor dispatch_reduction_gpu(const Tensor& input,
     cuda::reduce_kernel<CudaT, OutputCudaT, OpType><<<num_blocks, threads_per_block, shared_mem_size,stream>>>(
         input_data,
         output_data,
-        d_input_dims.ptr,
-        d_input_strides.ptr,
-        d_output_dims.ptr,
-        d_normalized_axes.ptr,
-        d_reduced_dims.ptr,
+        metadata.d_input_dims,
+        metadata.d_input_strides,
+        metadata.d_output_dims,
+        metadata.d_normalized_axes,
+        metadata.d_reduced_dims,
         num_slices,
         reduced_count,
         input_dims.size(),
@@ -209,12 +269,12 @@ Tensor dispatch_index_reduction_gpu(const Tensor& input,
         }
     }
     
-    DeviceArray d_input_dims(input_dims,stream); //✨✨✨
-    DeviceArray d_input_strides(input_strides,stream);//✨✨✨
-    DeviceArray d_output_dims(output_shape.dims,stream);//✨✨✨
-    DeviceArray d_normalized_axes(normalized_axes,stream);//✨✨✨
-    DeviceArray d_reduced_dims(reduced_dims,stream);//✨✨✨
-
+    // DeviceArray d_input_dims(input_dims,stream); //✨✨✨
+    // DeviceArray d_input_strides(input_strides,stream);//✨✨✨
+    // DeviceArray d_output_dims(output_shape.dims,stream);//✨✨✨
+    // DeviceArray d_normalized_axes(normalized_axes,stream);//✨✨✨
+    // DeviceArray d_reduced_dims(reduced_dims,stream);//✨✨✨
+PackedMetadata metadata(input_dims,input_strides,output_shape.dims,normalized_axes,reduced_dims,stream);
     int threads_per_block = 256;
     int num_blocks = num_slices;
     
@@ -231,11 +291,11 @@ Tensor dispatch_index_reduction_gpu(const Tensor& input,
     cuda::reduce_index_kernel<CudaT, OpType><<<num_blocks, threads_per_block, shared_mem_size,stream>>>(
         input_data,
         output_data,
-        d_input_dims.ptr,
-        d_input_strides.ptr,
-        d_output_dims.ptr,
-        d_normalized_axes.ptr,
-        d_reduced_dims.ptr,
+        metadata.d_input_dims,
+        metadata.d_input_strides,
+        metadata.d_output_dims,
+        metadata.d_normalized_axes,
+        metadata.d_reduced_dims,
         num_slices,
         reduced_count,
         input_dims.size(),
@@ -298,12 +358,12 @@ Tensor dispatch_mean_gpu(const Tensor& input,
         }
     }
     
-    DeviceArray d_input_dims(input_dims,stream); //✨✨✨
-    DeviceArray d_input_strides(input_strides,stream);//✨✨✨
-    DeviceArray d_output_dims(output_shape.dims,stream);//✨✨✨
-    DeviceArray d_normalized_axes(normalized_axes,stream);//✨✨✨
-    DeviceArray d_reduced_dims(reduced_dims,stream);//✨✨✨
-
+    // DeviceArray d_input_dims(input_dims,stream); //✨✨✨
+    // DeviceArray d_input_strides(input_strides,stream);//✨✨✨
+    // DeviceArray d_output_dims(output_shape.dims,stream);//✨✨✨
+    // DeviceArray d_normalized_axes(normalized_axes,stream);//✨✨✨
+    // DeviceArray d_reduced_dims(reduced_dims,stream);//✨✨✨
+PackedMetadata metadata(input_dims,input_strides,output_shape.dims,normalized_axes,reduced_dims,stream);
     int threads_per_block = 256;
     int num_blocks = num_slices;
     
@@ -330,11 +390,11 @@ Tensor dispatch_mean_gpu(const Tensor& input,
     cuda::reduce_mean_kernel<CudaT, OutputCudaT, SumOpType><<<num_blocks, threads_per_block, shared_mem_size,stream>>>(
         input_data,
         output_data,
-        d_input_dims.ptr,
-        d_input_strides.ptr,
-        d_output_dims.ptr,
-        d_normalized_axes.ptr,
-        d_reduced_dims.ptr,
+        metadata.d_input_dims,
+        metadata.d_input_strides,
+        metadata.d_output_dims,
+        metadata.d_normalized_axes,
+        metadata.d_reduced_dims,
         num_slices,
         reduced_count,
         input_dims.size(),
@@ -405,12 +465,12 @@ Tensor dispatch_variance_gpu(const Tensor& input,
     }
     
     //  STEP 3: Transfer metadata to device
-    DeviceArray d_input_dims(input_dims, stream);//✨✨✨
-    DeviceArray d_input_strides(input_strides, stream);//✨✨✨
-    DeviceArray d_output_dims(output_shape.dims, stream);//✨✨✨
-    DeviceArray d_normalized_axes(normalized_axes, stream);//✨✨✨
-    DeviceArray d_reduced_dims(reduced_dims, stream);//✨✨✨
-
+    // DeviceArray d_input_dims(input_dims, stream);//✨✨✨
+    // DeviceArray d_input_strides(input_strides, stream);//✨✨✨
+    // DeviceArray d_output_dims(output_shape.dims, stream);//✨✨✨
+    // DeviceArray d_normalized_axes(normalized_axes, stream);//✨✨✨
+    // DeviceArray d_reduced_dims(reduced_dims, stream);//✨✨✨
+PackedMetadata metadata(input_dims,input_strides,output_shape.dims,normalized_axes,reduced_dims,stream);
     //  STEP 4: Kernel configuration
     int threads_per_block = 256;
     int num_blocks = num_slices;
@@ -469,11 +529,11 @@ Tensor dispatch_variance_gpu(const Tensor& input,
         input_data,
         mean_data,           // Pre-computed mean (CORRECT TYPE!)
         output_data,
-        d_input_dims.ptr,
-        d_input_strides.ptr,
-        d_output_dims.ptr,
-        d_normalized_axes.ptr,
-        d_reduced_dims.ptr,
+        metadata.d_input_dims,
+        metadata.d_input_strides,
+        metadata.d_output_dims,
+        metadata.d_normalized_axes,
+        metadata.d_reduced_dims,
         num_slices,
         reduced_count,
         correction,          // Bessel's correction parameter

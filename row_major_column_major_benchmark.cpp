@@ -13,7 +13,8 @@ int main() {
     // Last dimension 'k' changes fastest (Sequential memory access)
     {
         auto start = std::chrono::high_resolution_clock::now();
-        volatile float sum = 0; 
+        //volatile float sum = 0; 
+         float sum = 0; 
         for (int i = 0; i < D0; ++i)
             for (int j = 0; j < D1; ++j)
                 for (int k = 0; k < D2; ++k)
@@ -27,7 +28,8 @@ int main() {
     // First dimension 'i' changes fastest (Jumping memory access)
     {
         auto start = std::chrono::high_resolution_clock::now();
-        volatile float sum = 0;
+        //volatile float sum = 0;
+         float sum = 0;
         for (int k = 0; k < D2; ++k)
             for (int j = 0; j < D1; ++j)
                 for (int i = 0; i < D0; ++i)

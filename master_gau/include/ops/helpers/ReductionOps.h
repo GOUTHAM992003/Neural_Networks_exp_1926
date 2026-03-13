@@ -673,6 +673,7 @@ struct ArgMinOp {
         } else {
             #ifdef __CUDA_ARCH__
             if constexpr (is_any_float_v<T>) {
+                if (gpu_isnan(a.value) && gpu_isnan(b.value)) return (a.index < b.index) ? a : b;
                 if (gpu_isnan(a.value)) return a;
                 if (gpu_isnan(b.value)) return b;
             }
@@ -685,6 +686,7 @@ struct ArgMinOp {
             }
             #else
             if constexpr (is_any_float_v<T>) {
+                if (is_nan_check(a.value) && is_nan_check(b.value)) return (a.index < b.index) ? a : b;
                 if (is_nan_check(a.value)) return a;
                 if (is_nan_check(b.value)) return b;
             }
@@ -717,6 +719,7 @@ struct ArgMaxOp {
         } else {
             #ifdef __CUDA_ARCH__
             if constexpr (is_any_float_v<T>) {
+                if (gpu_isnan(a.value) && gpu_isnan(b.value)) return (a.index < b.index) ? a : b;
                 if (gpu_isnan(a.value)) return a;
                 if (gpu_isnan(b.value)) return b;
             }
@@ -729,6 +732,7 @@ struct ArgMaxOp {
             }
             #else
             if constexpr (is_any_float_v<T>) {
+                if (is_nan_check(a.value) && is_nan_check(b.value)) return (a.index < b.index) ? a : b;
                 if (is_nan_check(a.value)) return a;
                 if (is_nan_check(b.value)) return b;
             }
