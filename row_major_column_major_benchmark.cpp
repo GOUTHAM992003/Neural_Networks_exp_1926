@@ -43,3 +43,7 @@ int main() {
     return 0;
 }
 }
+
+//Result in Intel i7 - 14700K CPU :
+// Row-Major (Last Dim Fast) : 0.0941739 secs ,
+// Column-Major (First Dim Fast) : 0.225564 secs . 
