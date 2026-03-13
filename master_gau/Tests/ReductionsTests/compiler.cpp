@@ -23,11 +23,11 @@ int main() {
 //     condition.set_data(cond_data);
 //    condition.display(std::cout, 4); 
 
-    Tensor x({{3,2}}, Dtype::UInt32, DeviceIndex(Device::CPU));
-    x.fill(-30);
+    Tensor x({{3,2}}, Dtype::Int32, DeviceIndex(Device::CPU));
+    x.fill(3);
     std::cout<<"Tensor X:"<<endl;
-    x.display(std::cout,4);
-    int y=3;
+    x.display();
+    int y=0;
     // Tensor y({{3,1}}, Dtype::Int32, DeviceIndex(Device::CPU));
     // y.fill(0);
     // cout<<"Tensor Y:"<<endl;
@@ -38,7 +38,7 @@ int main() {
     // cout<<"Tensor Z:"<<endl;
     // z.display(std::cout,4);
     
-    Tensor res = pow(x,y,0);
+    Tensor res = x/y;
     res.display(std::cout,4);
     // res.to_cpu().display(std::cout,4);
 

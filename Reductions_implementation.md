@@ -1,3 +1,11 @@
+Reduction Operations :
+
+
+
+
+
+
+
 Reduction Utilities :
 
 1.Normalize axes 
@@ -146,13 +154,17 @@ Logic :  " For this specific cell in the output ,which values from the input mir
 Analogy : The reduction_kernel is like a person standing in the Output Tensor trying to find their family members in the Input Tensor.
 
 
-Algorithm :
+Algorithm : (Quick-glimpse)
 step1 : Preparatory math (reduced_dims,output_shape,reduced_count)
 step2 : Outer loop (Iterating through output tensor,no.of iterations = no.of elements in output tensor)
-step3 : Inner loop (Iterating through reduced dimensions,no.of iterations = no.of reduced dimensions)
-step4 : Merge (Merging the reduced dimensions with the output dimensions/( merge output of outer_unravel + inner_unravel))
-step5 : Ravel(output_coords_from_merging(gives the coords in input tensor),input_tensor_strides) (Ravelling the merged dimensions to get the linear index)
-step6 : Accumulate (Accumulating the values in the input tensor)
+for each iteration in outer loop /for each i :
+      step3 : outer_unravel(outer_loop_index,output_shape) --->gives the co-ordinates of the current output element in the output tensor
+      step4 : Inner loop (Iterating through reduced dimensions,no.of iterations = no.of reduced dimensions)
+      for each iteration in inner loop /for each j :
+            step5 : inner_unravel(inner_loop_index,reduced_dims_shape) --->gives the co-ordinates of the current output element in the reduced dimension
+            step6 : Merge (Merging the reduced dimensions with the output dimensions/( merge output of outer_unravel + inner_unravel))
+            step7 : Ravel(output_coords_from_merging(gives the coords in input tensor),input_tensor_strides) (Ravelling the merged dimensions to get the linear index)
+step8 : Accumulate (Accumulating the values in the input tensor)
 
 Algorithm in my simple  words :
 
