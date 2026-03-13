@@ -161,10 +161,15 @@ Tensor reduce_kernel(
     const int64_t num_slices = output.numel();
     const bool rank_preserved = input_dims.size() == output_shape.dims.size();
     
+    bool reduced_bitmap[MAX_DIMS] = {false};
+    for (int64_t axis : normalized_axes) {
+        reduced_bitmap[axis] = true;
+    }
+    
     // Calculate reduced_dims once
     std::vector<int64_t> reduced_dims;
     for(size_t dim = 0; dim < input_dims.size(); ++dim) {
-        bool is_reduced = std::find(normalized_axes.begin(), normalized_axes.end(), (int64_t)dim) != normalized_axes.end();
+        bool is_reduced = reduced_bitmap[dim];
         if (is_reduced) {
             reduced_dims.push_back(input_dims[dim]);
         }
@@ -212,7 +217,7 @@ Tensor reduce_kernel(
                 int slice_coord_idx = 0;
                 
                 for (size_t dim = 0; dim < input_dims.size(); ++dim) {
-                    bool is_reduced = std::find(normalized_axes.begin(), normalized_axes.end(), (int64_t)dim) != normalized_axes.end();
+                    bool is_reduced = reduced_bitmap[dim];
                     if (is_reduced) {
                         full_input_coords_buf[dim] = slice_coords_buf[slice_coord_idx++];
                     } else {
@@ -257,7 +262,7 @@ Tensor reduce_kernel(
                     int slice_coord_idx = 0;
                     
                     for (size_t dim = 0; dim < input_dims.size(); ++dim) {
-                        bool is_reduced = std::find(normalized_axes.begin(), normalized_axes.end(), (int64_t)dim) != normalized_axes.end();
+                        bool is_reduced = reduced_bitmap[dim];
                         if (is_reduced) {
                             full_input_coords_buf[dim] = slice_coords_buf[slice_coord_idx++];
                         } else {
@@ -331,7 +336,7 @@ Tensor reduce_kernel(
                     int slice_coord_idx = 0;
                     
                     for (size_t dim = 0; dim < input_dims.size(); ++dim) {
-                        bool is_reduced = std::find(normalized_axes.begin(), normalized_axes.end(), (int64_t)dim) != normalized_axes.end();
+                        bool is_reduced = reduced_bitmap[dim];
                         if (is_reduced) {
                             full_input_coords_buf[dim] = slice_coords_buf[slice_coord_idx++];
                         } else {
@@ -583,6 +588,11 @@ Tensor dispatch_mean_kernel(const Tensor& input, const std::vector<int64_t>& nor
 
     Shape output_shape = detail::calculate_output_shape(input.shape().dims, normalized_axes, keepdim);
 
+    bool reduced_bitmap[MAX_DIMS] = {false};
+    for (int64_t axis : normalized_axes) {
+        reduced_bitmap[axis] = true;
+    }
+
     if constexpr (std::is_integral_v<T>) {
         // Integers output Float64
         Tensor output({output_shape}, TensorOptions().with_dtype(Dtype::Float64).with_device(input.device()).with_req_grad(input.requires_grad()));
@@ -596,7 +606,7 @@ Tensor dispatch_mean_kernel(const Tensor& input, const std::vector<int64_t>& nor
         
         std::vector<int64_t> reduced_dims;
         for(size_t dim = 0; dim < input_dims.size(); ++dim) {
-            bool is_reduced = std::find(normalized_axes.begin(), normalized_axes.end(), (int64_t)dim) != normalized_axes.end();
+            bool is_reduced = reduced_bitmap[dim];
             if (is_reduced) {
                 reduced_dims.push_back(input_dims[dim]);
             }
@@ -623,7 +633,7 @@ Tensor dispatch_mean_kernel(const Tensor& input, const std::vector<int64_t>& nor
                 int slice_coord_idx = 0;
                 
                 for (size_t dim = 0; dim < input_dims.size(); ++dim) {
-                    bool is_reduced = std::find(normalized_axes.begin(), normalized_axes.end(), (int64_t)dim) != normalized_axes.end();
+                    bool is_reduced = reduced_bitmap[dim];
                     if (is_reduced) {
                         full_input_coords_buf[dim] = slice_coords_buf[slice_coord_idx++];
                     } else {
@@ -675,7 +685,7 @@ Tensor dispatch_mean_kernel(const Tensor& input, const std::vector<int64_t>& nor
         
         std::vector<int64_t> reduced_dims;
         for(size_t dim = 0; dim < input_dims.size(); ++dim) {
-            bool is_reduced = std::find(normalized_axes.begin(), normalized_axes.end(), (int64_t)dim) != normalized_axes.end();
+            bool is_reduced = reduced_bitmap[dim];
             if (is_reduced) {
                 reduced_dims.push_back(input_dims[dim]);
             }
@@ -704,7 +714,7 @@ Tensor dispatch_mean_kernel(const Tensor& input, const std::vector<int64_t>& nor
                 int slice_coord_idx = 0;
                 
                 for (size_t dim = 0; dim < input_dims.size(); ++dim) {
-                    bool is_reduced = std::find(normalized_axes.begin(), normalized_axes.end(), (int64_t)dim) != normalized_axes.end();
+                    bool is_reduced = reduced_bitmap[dim];
                     if (is_reduced) {
                         full_input_coords_buf[dim] = slice_coords_buf[slice_coord_idx++];
                     } else {
@@ -942,11 +952,15 @@ Tensor dispatch_variance_kernel(const Tensor& input,
     // Get mean tensor strides for indexing
     const std::vector<int64_t>& mean_strides = mean_tensor.stride().strides;
     
+    bool reduced_bitmap[MAX_DIMS] = {false};
+    for (int64_t axis : normalized_axes) {
+        reduced_bitmap[axis] = true;
+    }
+
     // Calculate reduced_dims
     std::vector<int64_t> reduced_dims;
     for(size_t dim = 0; dim < input_dims.size(); ++dim) {
-        bool is_reduced = std::find(normalized_axes.begin(), normalized_axes.end(), (int64_t)dim) 
-                         != normalized_axes.end();
+        bool is_reduced = reduced_bitmap[dim];
         if (is_reduced) {
             reduced_dims.push_back(input_dims[dim]);
         }
@@ -968,8 +982,7 @@ Tensor dispatch_variance_kernel(const Tensor& input,
         int out_coord_idx = 0;
         
         for (size_t dim = 0; dim < input_dims.size(); ++dim) {
-            bool is_reduced = std::find(normalized_axes.begin(), normalized_axes.end(), (int64_t)dim) 
-                             != normalized_axes.end();
+            bool is_reduced = reduced_bitmap[dim];
             if (is_reduced) {
                 mean_coords_buf[dim] = 0;  // Mean tensor has size 1 in reduced dimensions
             } else {
@@ -1009,8 +1022,7 @@ Tensor dispatch_variance_kernel(const Tensor& input,
             int slice_coord_idx = 0;
             
             for (size_t dim = 0; dim < input_dims.size(); ++dim) {
-                bool is_reduced = std::find(normalized_axes.begin(), normalized_axes.end(), (int64_t)dim) 
-                                 != normalized_axes.end();
+                bool is_reduced = reduced_bitmap[dim];
                 if (is_reduced) {
                     full_input_coords_buf[dim] = slice_coords_buf[slice_coord_idx++];
                 } else {
