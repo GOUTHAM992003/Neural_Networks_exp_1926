@@ -8,7 +8,7 @@ Integrated our custom GPU Caching Allocator directly into the reduction kernels.
 
 ### 1.2 Packed Metadata Transmission
 **(File: `src/UnaryOps/cuda/ReductionImpl.cu`)**
-Replaced individual `Device_Array` objects with a unified `Packed_Meta_Data` object. This reduces the number of kernel arguments and memory transfers by sending all necessary shape, stride, and reduction axes metadata to the GPU in a single packed structure at once rather than one-by-oneover the PCIe bus in a single unified jump.
+Replaced individual `Device_Array` objects with a unified `PackedMetaData` object. This reduces the number of kernel arguments and memory transfers by sending all necessary shape, stride, and reduction axes metadata to the GPU in a single packed structure at once rather than one-by-oneover the PCIe bus in a single unified jump.
 
 
 ### 1.3 NaN Fix for Index-Returning Reductions (ArgMin / ArgMax) 

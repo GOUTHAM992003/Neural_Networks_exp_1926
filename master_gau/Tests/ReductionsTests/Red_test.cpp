@@ -57,7 +57,7 @@ reduce_any(t4);
  reduce_var_mean(t5);
  reduce_std_mean(t4);
  reduce_std_mean(t5);
-//t1.display();
-// Tensor t19=t3.to_cpu();
-//t3.display();
+t1.display();
+//Tensor t19=t3.to_cpu();
+t3.display();
 }
