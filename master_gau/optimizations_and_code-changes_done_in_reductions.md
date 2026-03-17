@@ -4,7 +4,7 @@
 
 ### 1.1 GPU Caching Allocator Integration
 **(File: `src/UnaryOps/cuda/ReductionImpl.cu`)**
-Integrated our custom GPU Caching Allocator directly into the reduction kernels. By utilizing pre-cached memory blocks for intermediate operations instead of waiting for standard OS-level allocations via `cudaMalloc`, this drastically reduced kernel launch latency and overall allocation overhead ---> (In Packed_Meta_Data struct , we used caching allocator for intermediate operations) .
+Integrated our custom GPU Caching Allocator directly into the reduction kernels. By utilizing pre-cached memory blocks for intermediate operations instead of waiting for standard OS-level allocations via `cudaMalloc`, this drastically reduced kernel launch latency and overall allocation overhead ---> (In PackedMetaData struct , we used caching allocator for intermediate operations) .
 
 ### 1.2 Packed Metadata Transmission
 **(File: `src/UnaryOps/cuda/ReductionImpl.cu`)**

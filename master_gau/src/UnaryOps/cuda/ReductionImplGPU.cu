@@ -97,6 +97,11 @@ cudaStream_t stream)
     
     // Perform Asynchronous Copy using pinned host memory
     cudaMemcpyAsync(d_ptr, h_ptr, total_bytes, cudaMemcpyHostToDevice, stream);
+    
+    // CRITICAL: Ensure the asynchronous copy from pinned host memory is complete 
+    // before the host potentially proceeds to destroy this object or before the kernel launch.
+    // While same-stream operations are sequenced, the host pointer h_ptr must remain valid.
+    cudaStreamSynchronize(stream);
 
     d_input_dims = d_ptr + offset_input_dims;
     d_input_strides = d_ptr + offset_input_strides;
@@ -198,8 +203,8 @@ Tensor dispatch_reduction_gpu(const Tensor& input,
     // Calculate shared memory for accumulator type
     size_t shared_mem_size;
     
-    // Metadata size (input_strides + output_dims + reduced_dims + normalized_axes)
-    size_t metadata_size = (input_dims.size() + output_shape.dims.size() + reduced_dims.size() + normalized_axes.size()) * sizeof(int64_t);
+    // Metadata size (input_dims + input_strides + output_dims + reduced_dims + normalized_axes)
+    size_t metadata_size = (input_dims.size() + input_strides.size() + output_shape.dims.size() + reduced_dims.size() + normalized_axes.size()) * sizeof(int64_t);
 
     if constexpr (std::is_integral_v<T>) {
         shared_mem_size = (threads_per_block / 32) * sizeof(int64_t);
@@ -307,7 +312,8 @@ PackedMetadata metadata(input_dims,input_strides,output_shape.dims,normalized_ax
     //  TYPE CONVERSION
     using CudaT = CudaNativeType<T>;
     // Metadata size (input_strides + output_dims + reduced_dims + normalized_axes)
-    size_t metadata_size = (input_dims.size() + output_shape.dims.size() + reduced_dims.size() + normalized_axes.size()) * sizeof(int64_t);
+   size_t metadata_size = (input_dims.size() + input_strides.size() + output_shape.dims.size() + reduced_dims.size() + normalized_axes.size()) * sizeof(int64_t);
+
     size_t shared_mem_size = (threads_per_block / 32) * sizeof(detail::ValueIndex<CudaT>) + metadata_size;
     
     //  Cast pointers to native CUDA types
@@ -395,7 +401,8 @@ PackedMetadata metadata(input_dims,input_strides,output_shape.dims,normalized_ax
     
     int num_warps = (threads_per_block + 31) / 32;
     // Metadata size (input_strides + output_dims + reduced_dims + normalized_axes)
-    size_t metadata_size = (input_dims.size() + output_shape.dims.size() + reduced_dims.size() + normalized_axes.size()) * sizeof(int64_t);
+   size_t metadata_size = (input_dims.size() + input_strides.size() + output_shape.dims.size() + reduced_dims.size() + normalized_axes.size()) * sizeof(int64_t);
+
     size_t shared_mem_size = num_warps * sizeof(double) + num_warps * sizeof(int64_t) + metadata_size;
     
     //  TYPE CONVERSION
@@ -538,8 +545,11 @@ PackedMetadata metadata(input_dims,input_strides,output_shape.dims,normalized_ax
 
     using AccCudaT = CudaNativeType<AccCppT>;
     
+    // Metadata size (input_dims + input_strides + output_dims + reduced_dims + normalized_axes)
+    size_t metadata_size = (input_dims.size() + input_strides.size() + output_shape.dims.size() + reduced_dims.size() + normalized_axes.size()) * sizeof(int64_t);
+    
     // Calculate shared memory size based on Accumulator Type
-    size_t shared_mem_size = (threads_per_block / 32) * sizeof(AccCudaT);
+    size_t shared_mem_size = (threads_per_block / 32) * sizeof(AccCudaT) + metadata_size;
     
     //  STEP 5: Cast pointers to CORRECT native CUDA types
     const CudaT* input_data = reinterpret_cast<const CudaT*>(input.data<T>());
