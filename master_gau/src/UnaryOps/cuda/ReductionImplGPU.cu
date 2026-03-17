@@ -14,6 +14,7 @@
 #include <cuda_bf16.h>
 #include "dtype/CudaTraits.h"
 #include "device/CachingCudaAllocator.h"
+#include "device/PinnedCPUAllocator.h"
 namespace OwnTensor {
 namespace detail {
 
@@ -35,56 +36,81 @@ namespace detail {
 class PackedMetadata {
 public:
 int64_t* d_ptr; //single device pointer for all metadata 
+int64_t* h_ptr; //host pinned pointer for metadata
 int64_t* d_input_dims; //Pointer offset into d_ptr
 int64_t* d_input_strides; //Pointer offset into d_ptr
 int64_t* d_output_dims; //Pointer offset into d_ptr
 int64_t* d_normalized_axes; //Pointer offset into d_ptr
 int64_t* d_reduced_dims; //Pointer offset into d_ptr
-PackedMetadata(const std::vector<int64_t>& input_dims,
+PackedMetadata(const std::vector<int64_t>& input_dims, 
 const std::vector<int64_t>& input_strides,
 const std::vector<int64_t>& output_dims,
 const std::vector<int64_t>& normalized_axes,
 const std::vector<int64_t>& reduced_dims,
-cudaStream_t stream)
+cudaStream_t stream) 
 {
     size_t total_size = input_dims.size() + input_strides.size() + output_dims.size() + normalized_axes.size() + reduced_dims.size();
 
-    std::vector<int64_t> all_metadata(total_size);
+//     std::vector<int64_t> all_metadata(total_size);
+//     size_t offset = 0;
+// std::copy(input_dims.begin(),input_dims.end(),all_metadata.begin()+offset);
+// size_t offset_input_dims = offset;
+// offset+=input_dims.size();
+
+// std::copy(input_strides.begin(),input_strides.end(),all_metadata.begin()+offset);
+// size_t offset_input_strides = offset;
+// offset+=input_strides.size();
+
+// std::copy(output_dims.begin(),output_dims.end(),all_metadata.begin()+offset);
+// size_t offset_output_dims = offset;
+// offset+=output_dims.size();
+
+// std::copy(normalized_axes.begin(),normalized_axes.end(),all_metadata.begin()+offset);
+// size_t offset_normalized_axes = offset;
+// offset+=normalized_axes.size();
+
+// std::copy(reduced_dims.begin(),reduced_dims.end(),all_metadata.begin()+offset);
+// size_t offset_reduced_dims = offset;
+// offset+=reduced_dims.size();
+
+    size_t total_bytes = total_size * sizeof(int64_t);
+//Allocating Pinned Host memory for metadata 
+    device::PinnedCPUAllocator pinned_allocator;
+    h_ptr = static_cast<int64_t*>(pinned_allocator.allocate(total_bytes));
+
+    // Packing metadata into pinned_memory - h_ptr 
     size_t offset = 0;
-std::copy(input_dims.begin(),input_dims.end(),all_metadata.begin()+offset);
-size_t offset_input_dims = offset;
-offset+=input_dims.size();
+    auto pack = [&](const std::vector<int64_t>& vec, size_t& off) {
+        size_t start_off = off;
+        std::copy(vec.begin(), vec.end(), h_ptr + off);
+        off += vec.size();
+        return start_off;
+    };
+    size_t offset_input_dims = pack(input_dims, offset);
+    size_t offset_input_strides = pack(input_strides, offset);
+    size_t offset_output_dims = pack(output_dims, offset);
+    size_t offset_normalized_axes = pack(normalized_axes, offset);
+    size_t offset_reduced_dims = pack(reduced_dims, offset);
 
-std::copy(input_strides.begin(),input_strides.end(),all_metadata.begin()+offset);
-size_t offset_input_strides = offset;
-offset+=input_strides.size();
+    // Allocating Device Memory - d_ptr
+    d_ptr = static_cast<int64_t*>(CachingCUDAAllocator::instance().allocate(total_bytes, stream));
+    
+    // Perform Asynchronous Copy using pinned host memory
+    cudaMemcpyAsync(d_ptr, h_ptr, total_bytes, cudaMemcpyHostToDevice, stream);
 
-std::copy(output_dims.begin(),output_dims.end(),all_metadata.begin()+offset);
-size_t offset_output_dims = offset;
-offset+=output_dims.size();
-
-std::copy(normalized_axes.begin(),normalized_axes.end(),all_metadata.begin()+offset);
-size_t offset_normalized_axes = offset;
-offset+=normalized_axes.size();
-
-std::copy(reduced_dims.begin(),reduced_dims.end(),all_metadata.begin()+offset);
-size_t offset_reduced_dims = offset;
-offset+=reduced_dims.size();
-
-size_t total_bytes = total_size * sizeof(int64_t);
-d_ptr = static_cast<int64_t*>(CachingCUDAAllocator::instance().allocate(total_bytes,stream));
-cudaMemcpyAsync(d_ptr,all_metadata.data(),total_bytes,cudaMemcpyHostToDevice,stream);
-d_input_dims = d_ptr + offset_input_dims ; // --->d_ptr+0 = d_ptr 
-d_input_strides = d_ptr + offset_input_strides ;
-d_output_dims = d_ptr + offset_output_dims ;
-d_normalized_axes = d_ptr+offset_normalized_axes ; 
-d_reduced_dims = d_ptr + offset_reduced_dims ;
-
+    d_input_dims = d_ptr + offset_input_dims;
+    d_input_strides = d_ptr + offset_input_strides;
+    d_output_dims = d_ptr + offset_output_dims;
+    d_normalized_axes = d_ptr + offset_normalized_axes; 
+    d_reduced_dims = d_ptr + offset_reduced_dims;
 }
+
 ~PackedMetadata(){
     if(d_ptr) CachingCUDAAllocator::instance().deallocate(d_ptr);
+    if(h_ptr) device::PinnedCPUAllocator().deallocate(h_ptr);
 }
-PackedMetadata(const PackedMetadata&) = delete ;
+
+PackedMetadata(const PackedMetadata&) = delete;
 PackedMetadata& operator=(const PackedMetadata&) = delete;
 };
 //class DeviceArray(){ 
