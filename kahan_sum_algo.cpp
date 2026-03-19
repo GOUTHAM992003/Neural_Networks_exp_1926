@@ -41,7 +41,7 @@ int main() {
     float sum=0.0f;
     double acc = 0.0f ;
     std::chrono::high_resolution_clock::time_point start = std::chrono::high_resolution_clock::now();
-    for(int i=0;i<1000000000000;i++){
+    for(int i=0;i<100000000;i++){
         acc+=t;
     }
     std::chrono::high_resolution_clock::time_point end = std::chrono::high_resolution_clock::now();
