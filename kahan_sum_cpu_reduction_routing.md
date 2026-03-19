@@ -25,13 +25,13 @@ graph TD
 
 ## TL;DR: The 3 Routes
 
-### 🔵 Route 1 — Index Reductions
+###  Route 1 — Index Reductions
 - **Operations:** [ArgMax](file:///home/blu-bridge016/Desktop/Neural_Networks_exp_1926/tensor_centric_tensorlib/include/ops/helpers/ReductionOps.h#703-746), [ArgMin](file:///home/blu-bridge016/Downloads/Neural_Networks_exp_1926/master_gau/include/ops/helpers/ReductionOps.h#660-705), [NanArgMax](file:///home/blu-bridge016/Downloads/Neural_Networks_exp_1926/master_gau/include/ops/helpers/ReductionOps.h#800-847), [NanArgMin](file:///home/blu-bridge016/Downloads/Neural_Networks_exp_1926/master_gau/include/ops/helpers/ReductionOps.h#752-799)  
 - **Accumulator:** `ValueIndex<T>` (a struct with `.value` + `.index`)  
 - **Loop Logic:** Tracks both the extreme value AND its position  
 - **Output:** [int64_t](file:///home/blu-bridge016/Downloads/Neural_Networks_exp_1926/master_gau/include/ops/helpers/ReductionOps.h#274-275) (the index, not the value)
 
-### 🟢 Route 2A — Kahan Summation
+###  Route 2A — Kahan Summation
 - **Operations:** [SumOp](file:///home/blu-bridge016/Desktop/Neural_Networks_exp_1926/tensor_centric_tensorlib/include/ops/helpers/ReductionOps.h#302-335) only  
 - **Data Types:** [float](file:///home/blu-bridge016/Desktop/Neural_Networks_exp_1926/tensor_centric_tensorlib/include/dtype/Types.h#299-300), [double](file:///home/blu-bridge016/Downloads/Neural_Networks_exp_1926/tensorflow/tensorflow/core/kernels/reduction_gpu_kernels.cu.h#110-124), [float16_t](file:///home/blu-bridge016/Desktop/Neural_Networks_exp_1926/tensor_centric_tensorlib/include/dtype/Types.h#299-300), [bfloat16_t](file:///home/blu-bridge016/Desktop/Neural_Networks_exp_1926/tensor_centric_tensorlib/include/dtype/Types.h#199-200)  
 - **Accumulator:** Two variables — `kahan_sum` + `kahan_c` (error register)  
@@ -39,7 +39,7 @@ graph TD
 - **Output:** Precision-perfect sum (no absorption errors)  
 - **Platform:** CPU only (GPU uses Double Accumulation instead)
 
-### 🟡 Route 2B — Standard Fast Loop  
+###  Route 2B — Standard Fast Loop  
 - **Operations:** Everything else — [Max](file:///home/blu-bridge016/Downloads/Neural_Networks_exp_1926/tensorflow/tensorflow/core/kernels/reduction_gpu_kernels.cu.h#1002-1010), [Min](file:///home/blu-bridge016/Downloads/Neural_Networks_exp_1926/tensorflow/tensorflow/core/kernels/reduction_gpu_kernels.cu.h#1011-1019), [Product](file:///home/blu-bridge016/Downloads/Neural_Networks_exp_1926/master_gau/include/ops/helpers/ReductionOps.h#337-363), [NanSum](file:///home/blu-bridge016/Desktop/Neural_Networks_exp_1926/tensor_centric_tensorlib/include/ops/helpers/ReductionOps.h#493-515), [NanProduct](file:///home/blu-bridge016/Downloads/Neural_Networks_exp_1926/master_gau/include/ops/helpers/ReductionOps.h#517-539), `NanMin`, `NanMax`, **Integer Sum**  
 - **Accumulator:** Single variable via `op.identity()`  
 - **Loop Logic:** Simple `accumulator = op.reduce(accumulator, value)`  
