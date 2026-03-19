@@ -279,6 +279,7 @@ template<> struct AccumulatorTypeSelector<uint64_t> { using type = int64_t; };
 // Half precision floats use float for better precision
 template<> struct AccumulatorTypeSelector<float16_t> { using type = float; };
 template<> struct AccumulatorTypeSelector<bfloat16_t> { using type = float; };
+template<> struct AccumulatorTypeSelector<float> {using type = double;} ;
 //  FIX: Bool should accumulate as int64_t (like PyTorch/NumPy)
 template<> struct AccumulatorTypeSelector<bool> { using type = int64_t; };
 

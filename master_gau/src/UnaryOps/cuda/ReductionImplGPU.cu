@@ -98,7 +98,7 @@ cudaStream_t stream)
     // Perform Asynchronous Copy using pinned host memory
     cudaMemcpyAsync(d_ptr, h_ptr, total_bytes, cudaMemcpyHostToDevice, stream);
     
-    // CRITICAL: Ensure the asynchronous copy from pinned host memory is complete 
+    // Ensure the asynchronous copy from pinned host memory is complete 
     // before the host potentially proceeds to destroy this object or before the kernel launch.
     // While same-stream operations are sequenced, the host pointer h_ptr must remain valid.
     cudaStreamSynchronize(stream);

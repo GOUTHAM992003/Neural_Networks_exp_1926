@@ -185,13 +185,13 @@ Tensor reduce_kernel(
     // Use AccT directly if it's explicitly provided, otherwise compute based on T
     using AccumulatorT = AccT;
 
-    // =================================================================
-    // Kahan summation for floating point sum operations (numerical stability)
-    // =================================================================
-    constexpr bool use_kahan = std::is_same_v<OpType<T>, SumOp<T>> && 
-                               !std::is_same_v<AccT, ValueIndex<T>> &&
-                               (std::is_floating_point_v<AccumulatorT> || 
-                                std::is_same_v<AccumulatorT, double>);
+    // // =================================================================
+    // // Kahan summation for floating point sum operations (numerical stability)
+    // // =================================================================
+    // constexpr bool use_kahan = std::is_same_v<OpType<T>, SumOp<T>> && 
+    //                            !std::is_same_v<AccT, ValueIndex<T>> &&
+    //                            (std::is_floating_point_v<AccumulatorT> || 
+    //                             std::is_same_v<AccumulatorT, double>);
 
     // 3. Parallel execution
     #pragma omp parallel for
@@ -246,70 +246,70 @@ Tensor reduce_kernel(
            // std::vector<int64_t> out_coords = unravel_index(output_index, output_shape.dims);(commented out as no use)
            // out_coords_buf already computed above
 
-            if constexpr (use_kahan) {
-                // Kahan state and initialization (used only for SumOp)
-                AccumulatorT kahan_sum = 0;
-                AccumulatorT kahan_c = 0;
+            // if constexpr (use_kahan) {
+            //     // Kahan state and initialization (used only for SumOp)
+            //     AccumulatorT kahan_sum = 0;
+            //     AccumulatorT kahan_c = 0;
                 
-                // Kahan Loop
-                for (int64_t i = 0; i < reduced_count; ++i) {
-                    int64_t slice_coords_buf[MAX_DIMS];
-                    int64_t full_input_coords_buf[MAX_DIMS];
+            //     // Kahan Loop
+            //     for (int64_t i = 0; i < reduced_count; ++i) {
+            //         int64_t slice_coords_buf[MAX_DIMS];
+            //         int64_t full_input_coords_buf[MAX_DIMS];
                     
-                    unravel_index_stack(i, reduced_dims.data(), reduced_dims.size(), slice_coords_buf);
+            //         unravel_index_stack(i, reduced_dims.data(), reduced_dims.size(), slice_coords_buf);
                     
-                    int out_coord_idx = 0;
-                    int slice_coord_idx = 0;
+            //         int out_coord_idx = 0;
+            //         int slice_coord_idx = 0;
                     
-                    for (size_t dim = 0; dim < input_dims.size(); ++dim) {
-                        bool is_reduced = reduced_bitmap[dim];
-                        if (is_reduced) {
-                            full_input_coords_buf[dim] = slice_coords_buf[slice_coord_idx++];
-                        } else {
-                            if (rank_preserved) {
-                                full_input_coords_buf[dim] = out_coords_buf[dim];
-                            } else {
-                                full_input_coords_buf[dim] = out_coords_buf[out_coord_idx];
-                            }
-                            out_coord_idx++;
-                        }
-                    }
+            //         for (size_t dim = 0; dim < input_dims.size(); ++dim) {
+            //             bool is_reduced = reduced_bitmap[dim];
+            //             if (is_reduced) {
+            //                 full_input_coords_buf[dim] = slice_coords_buf[slice_coord_idx++];
+            //             } else {
+            //                 if (rank_preserved) {
+            //                     full_input_coords_buf[dim] = out_coords_buf[dim];
+            //                 } else {
+            //                     full_input_coords_buf[dim] = out_coords_buf[out_coord_idx];
+            //                 }
+            //                 out_coord_idx++;
+            //             }
+            //         }
                     
-                    int64_t input_lin_idx = ravel_index_stack(full_input_coords_buf, input_strides.data(), input_dims.size());
-                    T input_value = input_data[input_lin_idx];
+            //         int64_t input_lin_idx = ravel_index_stack(full_input_coords_buf, input_strides.data(), input_dims.size());
+            //         T input_value = input_data[input_lin_idx];
 
-                    // Kahan summation for maximum numerical stability
-                    AccumulatorT val_acc = static_cast<AccumulatorT>(input_value);
+            //         // Kahan summation for maximum numerical stability
+            //         AccumulatorT val_acc = static_cast<AccumulatorT>(input_value);
                     
-                    // Overflow/NaN detection for numerical stability
-                    if (std::isinf(kahan_sum) || std::isnan(kahan_sum)) {
-                        kahan_sum += val_acc;  // Fallback to simple accumulation
-                    } else {
-                        AccumulatorT y = val_acc - kahan_c;
-                        AccumulatorT t = kahan_sum + y;
-                        kahan_c = (t - kahan_sum) - y;
-                        kahan_sum = t;
-                    }
-                }
+            //         // Overflow/NaN detection for numerical stability
+            //         if (std::isinf(kahan_sum) || std::isnan(kahan_sum)) {
+            //             kahan_sum += val_acc;  // Fallback to simple accumulation
+            //         } else {
+            //             AccumulatorT y = val_acc - kahan_c;
+            //             AccumulatorT t = kahan_sum + y;
+            //             kahan_c = (t - kahan_sum) - y;
+            //             kahan_sum = t;
+            //         }
+            //     }
                 
-                // =================================================================
-                // CRITICAL: Safe conversion back to output type (Kahan path)
-                // =================================================================
-                if constexpr (std::is_same_v<T, float16_t>) {
-                    // FP16: overflow→inf handled by float_to_float16
-                    output_data[output_index] = static_cast<OutputCppT>(
-                        static_cast<T>(static_cast<float>(kahan_sum))
-                    );
-                } else if constexpr (std::is_same_v<T, bfloat16_t>) {
-                    // BF16: overflow→inf handled by float_to_bfloat16
-                    output_data[output_index] = static_cast<OutputCppT>(
-                        static_cast<T>(static_cast<float>(kahan_sum))
-                    );
-                } else {
-                    output_data[output_index] = static_cast<OutputCppT>(kahan_sum);
-                }
+            //     // =================================================================
+            //     // CRITICAL: Safe conversion back to output type (Kahan path)
+            //     // =================================================================
+            //     if constexpr (std::is_same_v<T, float16_t>) {
+            //         // FP16: overflow→inf handled by float_to_float16
+            //         output_data[output_index] = static_cast<OutputCppT>(
+            //             static_cast<T>(static_cast<float>(kahan_sum))
+            //         );
+            //     } else if constexpr (std::is_same_v<T, bfloat16_t>) {
+            //         // BF16: overflow→inf handled by float_to_bfloat16
+            //         output_data[output_index] = static_cast<OutputCppT>(
+            //             static_cast<T>(static_cast<float>(kahan_sum))
+            //         );
+            //     } else {
+            //         output_data[output_index] = static_cast<OutputCppT>(kahan_sum);
+            //     }
 
-            } else {
+           // } else {
                 // Initialize standard accumulator (used for all other reductions)
                 AccumulatorT accumulator;
                     //  FIX: Don't cast identity for index reductions (ValueIndex type)
@@ -410,7 +410,7 @@ Tensor reduce_kernel(
                 } else {
                     output_data[output_index] = static_cast<OutputCppT>(accumulator);
                 }
-            }
+           // }
         }
     }
 

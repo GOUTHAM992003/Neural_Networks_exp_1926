@@ -2,7 +2,7 @@
 # Configuration
 # =============================================================================
 CXX = g++
-NVCC = nvcc
+NVCC = /usr/local/cuda/bin/nvcc
 SRCDIR := src
 OBJDIR := lib/objects
 LIBDIR := lib
@@ -52,7 +52,7 @@ endif
 RPATH = -Xlinker -rpath -Xlinker '$$ORIGIN/lib'
 LDFLAGS = -L$(CUDA_LIB) -L$(CUDA_TARGETS_LIB) -L$(LIBDIR) $(RPATH)
 # Note: nvToolsExt library is deprecated in CUDA 12+, NVTX3 is header-only
-LDLIBS = -lcudart -ltbb -lcurand -lcublas
+LDLIBS = -lcudart -ltbb -lcurand -lcublas -lgomp
 
 # =============================================================================
 # File Discovery (Automatic)

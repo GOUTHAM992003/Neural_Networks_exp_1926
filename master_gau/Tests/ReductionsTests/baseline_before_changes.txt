@@ -1,0 +1,131 @@
+
+*** PRECISION TEST: reduce_sum (float) ***
+Run BEFORE changes (Kahan) and AFTER changes (double acc), compare.
+
+======================================================
+TEST: 1. Catastrophic Cancellation  (N=3001)
+------------------------------------------------------
+  Double reference   : 1001.0000000000
+  Library result     : 1.0000000000
+  Naive float result : 1.0000000000
+  Abs err (lib)      : 1000.0000000000
+  Abs err (naive)    : 1000.0000000000
+  Rel err (lib)      : 0.9990009990
+  Rel err (naive)    : 0.9990009990
+
+======================================================
+TEST: 2. Cross-Entropy Losses  (N=65536)
+------------------------------------------------------
+  Double reference   : 167195.7636235356
+  Library result     : 167195.7656250000
+  Naive float result : 167196.4843750000
+  Abs err (lib)      : 0.0020014644
+  Abs err (naive)    : 0.7207514644
+  Rel err (lib)      : 0.0000000120
+  Rel err (naive)    : 0.0000043108
+
+======================================================
+TEST: 3. Gradient Tensor (1M values)  (N=1048576)
+------------------------------------------------------
+  Double reference   : 0.1184494143
+  Library result     : 0.1184494123
+  Naive float result : 0.1184475422
+  Abs err (lib)      : 0.0000000020
+  Abs err (naive)    : 0.0000018721
+  Rel err (lib)      : 0.0000000167
+  Rel err (naive)    : 0.0000158048
+
+======================================================
+TEST: 4. Softmax Output (sum=1.0)  (N=512)
+------------------------------------------------------
+  Double reference   : 1.0000000000
+  Library result     : 1.0000000000
+  Naive float result : 1.0000000000
+  Abs err (lib)      : 0.0000000000
+  Abs err (naive)    : 0.0000000000
+  Rel err (lib)      : 0.0000000000
+  Rel err (naive)    : 0.0000000000
+
+======================================================
+TEST: 5. Batch Norm Activations  (N=50176)
+------------------------------------------------------
+  Double reference   : 8.6803384619
+  Library result     : 8.6803398132
+  Naive float result : 8.6799116135
+  Abs err (lib)      : 0.0000013513
+  Abs err (naive)    : 0.0004268485
+  Rel err (lib)      : 0.0000001557
+  Rel err (naive)    : 0.0000491742
+
+======================================================
+TEST: 6. Embedding Weights (786K)  (N=786432)
+------------------------------------------------------
+  Double reference   : 22.0980221388
+  Library result     : 22.0980224609
+  Naive float result : 22.0975265503
+  Abs err (lib)      : 0.0000003222
+  Abs err (naive)    : 0.0004955885
+  Rel err (lib)      : 0.0000000146
+  Rel err (naive)    : 0.0000224268
+
+=== FULL BASELINE (Kahan active, BEFORE changes) ===
+=== Date: 2026-03-18 ===
+
+PRECISION RESULTS:
+
+Test 1. Catastrophic Cancellation (N=3001):
+  Double ref: 1001.0  |  Library: 1.0  |  Naive: 1.0
+  Abs err (lib): 1000.0  |  Abs err (naive): 1000.0
+  Rel err (lib): 0.9990009990  |  Rel err (naive): 0.9990009990
+  --> KAHAN FAILS SAME AS NAIVE on magnitude swings (double accumulator will fix this)
+
+Test 2. Cross-Entropy Losses (N=65536):
+  Double ref: 167195.7636235356  |  Library: 167195.7656250000  |  Naive: 167196.4843750000
+  Abs err (lib): 0.0000000120 rel  |  Abs err (naive): 0.0000043108 rel
+  --> Kahan 360x better than naive
+
+Test 3. Gradient Tensor (N=1048576):
+  Double ref: 0.1184494143  |  Library: 0.1184494123  |  Naive: 0.1184475422
+  Rel err (lib): 1.67e-8  |  Rel err (naive): 1.58e-5
+  --> Kahan 946x better than naive
+
+Test 4. Softmax Output (N=512):
+  All zero error — trivial case, all methods exact
+
+Test 5. Batch Norm Activations (N=50176):
+  Rel err (lib): 1.557e-7  |  Rel err (naive): 4.917e-5
+  --> Kahan 316x better than naive
+
+Test 6. Embedding Weights (N=786432):
+  Rel err (lib): 1.46e-8  |  Rel err (naive): 2.24e-5
+  --> Kahan 1534x better than naive
+
+LIBRARY TIMING (real, not optimized away):
+  Test 1 (N=3001):   mean=30.76µs   min=10.85µs
+  Test 2 (N=65536):  mean=184.32µs  min=175.79µs
+  Test 3 (N=1M):     mean=2887.22µs min=2803.24µs
+  Test 4 (N=512):    mean=17.85µs   min=9.75µs
+  Test 5 (N=50176):  mean=143.03µs  min=135.96µs
+  Test 6 (N=786K):   mean=2166.30µs min=2068.74µs
+
+NOTE: Naive/double loop timings showed 0.01µs -- GCC optimized them away (dead acc var).
+      Fix: use volatile or DoNotOptimize wrapper in naive/double loops.
+
+=== CORRECTED TIMING BASELINE (volatile sinks, loops NOT optimized away) ===
+
+Library is ~7-8x slower than raw naive loop on medium/large N:
+  Test 1 (N=3001):    lib=36.31µs    naive=1.12µs   ratio=32.6x  (overhead dominates small N)
+  Test 2 (N=65536):   lib=184.56µs   naive=24.45µs  ratio=7.55x
+  Test 3 (N=1M):      lib=2856.41µs  naive=387.03µs ratio=7.38x
+  Test 4 (N=512):     lib=23.49µs    naive=0.37µs   ratio=63.3x  (pure overhead, tiny N)
+  Test 5 (N=50176):   lib=139.47µs   naive=18.44µs  ratio=7.57x
+  Test 6 (N=786K):    lib=2190.81µs  naive=551.63µs ratio=3.97x
+
+Library vs double ref loop (N large):
+  Test 3 (1M):   lib=2856µs vs dbl=383µs  → 7.45x
+  Test 6 (786K): lib=2191µs vs dbl=351µs  → 6.23x
+
+EXPECTED AFTER CHANGES:
+  - Precision test 1: error should drop from 1000.0 → ~0 (double accumulator fixes cancellation)
+  - Precision tests 2-6: error should match or beat Kahan (double is better)
+  - Timing: library should speed up (no Kahan ops), ratio vs naive should shrink
