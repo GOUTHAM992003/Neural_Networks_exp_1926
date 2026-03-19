@@ -5,17 +5,8 @@
 #include <cmath>
 #include <random>
 #include <string>
-#include <chrono>
-#include <algorithm>
-#include <numeric>
 
 using namespace OwnTensor;
-using Clock = std::chrono::high_resolution_clock;
-using us    = std::chrono::duration<double, std::micro>;
-
-// ─── timing config ───────────────────────────────────────────────────────────
-static constexpr int WARMUP = 5;
-static constexpr int ITERS  = 30;
 
 // ─── reference helpers (completely independent of the library) ───────────────
 
@@ -34,87 +25,26 @@ float naive_float_sum(const std::vector<float>& v) {
 // ─── single test runner ──────────────────────────────────────────────────────
 
 void run_test(const std::string& name, const std::vector<float>& data) {
-
-    // ── precision references ──────────────────────────────────────────────
+    // Reference values (independent of library)
     double ref   = ref_double_sum(data);
     float  naive = naive_float_sum(data);
 
-    // Build tensor once (not counted in timing)
+    // Library result  (Kahan path BEFORE changes, double-acc AFTER changes)
     Tensor t({{(int64_t)data.size()}}, Dtype::Float32, Device::CPU);
     t.set_data(data);
+    Tensor result = reduce_sum(t);
+    float lib = result.data<float>()[0];
 
-    // ── library warm-up ───────────────────────────────────────────────────
-    for (int i = 0; i < WARMUP; ++i) {
-        volatile auto r = reduce_sum(t);
-        (void)r;
-    }
-
-    // ── time library reduce_sum ───────────────────────────────────────────
-    std::vector<double> lib_times(ITERS);
-    float lib = 0.0f;
-    for (int i = 0; i < ITERS; ++i) {
-        auto t0 = Clock::now();
-        Tensor result = reduce_sum(t);
-        auto t1 = Clock::now();
-        lib_times[i] = us(t1 - t0).count();
-        lib = result.data<float>()[0];
-    }
-
-    // ── time naive float loop (raw memory, no library overhead) ──────────
-    const float* raw = data.data();
-    int64_t      N   = static_cast<int64_t>(data.size());
-
-    volatile float  naive_sink = 0.0f;
-    volatile double dbl_sink   = 0.0;
-
-    std::vector<double> naive_times(ITERS);
-    for (int i = 0; i < ITERS; ++i) {
-        auto  t0 = Clock::now();
-        float acc = 0.0f;
-        for (int64_t j = 0; j < N; ++j) acc += raw[j];
-        auto t1 = Clock::now();
-        naive_times[i] = us(t1 - t0).count();
-        naive_sink = acc;   // prevent dead-code elimination
-    }
-
-    // ── time double reference loop ────────────────────────────────────────
-    std::vector<double> dbl_times(ITERS);
-    for (int i = 0; i < ITERS; ++i) {
-        auto   t0 = Clock::now();
-        double acc = 0.0;
-        for (int64_t j = 0; j < N; ++j) acc += static_cast<double>(raw[j]);
-        auto t1 = Clock::now();
-        dbl_times[i] = us(t1 - t0).count();
-        dbl_sink = acc;     // prevent dead-code elimination
-    }
-
-    // ── statistics: mean and min over ITERS ──────────────────────────────
-    auto mean = [](std::vector<double>& v) {
-        return std::accumulate(v.begin(), v.end(), 0.0) / v.size();
-    };
-    auto minv = [](std::vector<double>& v) {
-        return *std::min_element(v.begin(), v.end());
-    };
-
-    double lib_mean   = mean(lib_times);
-    double lib_min    = minv(lib_times);
-    double naive_mean = mean(naive_times);
-    double naive_min  = minv(naive_times);
-    double dbl_mean   = mean(dbl_times);
-    double dbl_min    = minv(dbl_times);
-
-    // ── errors ────────────────────────────────────────────────────────────
+    // Errors vs double reference
     double abs_err_lib   = std::fabs((double)lib  - ref);
     double abs_err_naive = std::fabs((double)naive - ref);
     double rel_err_lib   = (ref != 0.0) ? abs_err_lib   / std::fabs(ref) : abs_err_lib;
     double rel_err_naive = (ref != 0.0) ? abs_err_naive / std::fabs(ref) : abs_err_naive;
 
-    // ── print ─────────────────────────────────────────────────────────────
     std::cout << std::fixed << std::setprecision(10);
     std::cout << "\n======================================================\n";
     std::cout << "TEST: " << name << "  (N=" << data.size() << ")\n";
-
-    std::cout << "\n  --- PRECISION ---\n";
+    std::cout << "------------------------------------------------------\n";
     std::cout << "  Double reference   : " << ref              << "\n";
     std::cout << "  Library result     : " << lib              << "\n";
     std::cout << "  Naive float result : " << naive            << "\n";
@@ -122,24 +52,14 @@ void run_test(const std::string& name, const std::vector<float>& data) {
     std::cout << "  Abs err (naive)    : " << abs_err_naive    << "\n";
     std::cout << "  Rel err (lib)      : " << rel_err_lib      << "\n";
     std::cout << "  Rel err (naive)    : " << rel_err_naive    << "\n";
-
-    std::cout << std::fixed << std::setprecision(2);
-    std::cout << "\n  --- TIMING (" << ITERS << " runs, microseconds) ---\n";
-    std::cout << "                      mean (us)   min (us)\n";
-    std::cout << "  Library reduce_sum: " << std::setw(10) << lib_mean
-              << "  " << std::setw(8) << lib_min   << "\n";
-    std::cout << "  Naive float loop  : " << std::setw(10) << naive_mean
-              << "  " << std::setw(8) << naive_min << "\n";
-    std::cout << "  Double loop (ref) : " << std::setw(10) << dbl_mean
-              << "  " << std::setw(8) << dbl_min   << "\n";
-    std::cout << "  Library / Naive   : " << std::setprecision(2)
-              << lib_mean / naive_mean << "x  (>1 = lib slower, <1 = lib faster)\n";
-    std::cout << "  Library / Double  : "
-              << lib_mean / dbl_mean  << "x\n";
 }
 
 // ─── dataset builders ────────────────────────────────────────────────────────
 
+// 1. Catastrophic Cancellation
+//    Pattern: [1e8, 1.0, -1e8] x1000 + one trailing 1.0
+//    True sum = 1001.0
+//    Naive float drops every 1.0 completely → ~0.0
 std::vector<float> make_cancellation() {
     std::vector<float> v;
     v.reserve(3001);
@@ -152,6 +72,8 @@ std::vector<float> make_cancellation() {
     return v;
 }
 
+// 2. Cross-Entropy Losses (batch of 65536 samples)
+//    uniform [0.1, 5.0] — typical per-sample CE loss range
 std::vector<float> make_ce_losses() {
     std::mt19937 rng(42);
     std::uniform_real_distribution<float> dist(0.1f, 5.0f);
@@ -160,6 +82,9 @@ std::vector<float> make_ce_losses() {
     return v;
 }
 
+// 3. Gradient Tensor (1M tiny values)
+//    uniform [-1e-4, 1e-4] — typical backprop gradient magnitudes
+//    Large N, tiny values — error grows fast with naive float
 std::vector<float> make_gradients() {
     std::mt19937 rng(123);
     std::uniform_real_distribution<float> dist(-1e-4f, 1e-4f);
@@ -168,11 +93,17 @@ std::vector<float> make_gradients() {
     return v;
 }
 
+// 4. Softmax Output (512 equal values = 1/512)
+//    True sum = 1.0 exactly — tests precision for small equal values
 std::vector<float> make_softmax() {
-    float val = 1.0f / 512.0f;
-    return std::vector<float>(512, val);
+    int N = 512;
+    float val = 1.0f / static_cast<float>(N);
+    return std::vector<float>(N, val);
 }
 
+// 5. Batch Norm Activations (224x224 channel = 50176 values)
+//    normal(0, 1) — centered activations, true sum ≈ 0
+//    Large N near zero: relative error meaningless, absolute error is what matters
 std::vector<float> make_activations() {
     std::mt19937 rng(999);
     std::normal_distribution<float> dist(0.0f, 1.0f);
@@ -181,6 +112,9 @@ std::vector<float> make_activations() {
     return v;
 }
 
+// 6. Embedding Weights (1024x768 = 786432 values)
+//    normal(0, 0.02) — Kaiming/Xavier-style init, large tensor
+//    Very large N of small values — max stress test for float precision
 std::vector<float> make_embedding_weights() {
     std::mt19937 rng(7777);
     std::normal_distribution<float> dist(0.0f, 0.02f);
@@ -192,9 +126,8 @@ std::vector<float> make_embedding_weights() {
 // ─── main ────────────────────────────────────────────────────────────────────
 
 int main() {
-    std::cout << "\n*** PRECISION + TIMING TEST: reduce_sum (float) ***\n";
+    std::cout << "\n*** PRECISION TEST: reduce_sum (float) ***\n";
     std::cout << "Run BEFORE changes (Kahan) and AFTER changes (double acc), compare.\n";
-    std::cout << "Warm-up=" << WARMUP << "  Measured=" << ITERS << "\n";
 
     run_test("1. Catastrophic Cancellation",   make_cancellation());
     run_test("2. Cross-Entropy Losses",         make_ce_losses());
