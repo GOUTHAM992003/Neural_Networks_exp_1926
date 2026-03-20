@@ -553,6 +553,17 @@ other.index = shfl_down(accumulator.index, offset);
 So the struct overhead is effectively zero on GPU (both fields live in registers). GPU was
 **left unchanged** — the optimization is CPU-only.
 
+**Important: `ValueIndex<T>` struct was NOT deleted.**
+The struct declaration remains in `ReductionOps.h` (line 128) and is still used:
+- The op structs still declare `using AccumulatorType = ValueIndex<T>` — this is how the CPU kernel
+  detects index reductions via `if constexpr (std::is_same_v<AccT, ValueIndex<T>>)` in `ReductionImpl.h`
+- The op structs still have `reduce(ValueIndex<T>, ValueIndex<T>)` methods — GPU calls these every element
+- The GPU kernel (`reduce_index_kernel`) constructs `ValueIndexType current = {input_value, i}` per element
+  and calls `op.reduce(accumulator, current)` — still uses the struct entirely unchanged
+`ReductionOps.h` is a shared header included by both CPU code and GPU code. One declaration,
+used by both. What changed is only the CPU `reduce_kernel`'s inner loop behavior — it now calls
+`op.identity_val()` and `op.better_than()` instead of constructing `ValueIndex<T>` per element.
+
 **Changes made:**
 
 **(A) `ReductionOps.h` — added two new methods to all 4 index ops:**
@@ -692,14 +703,36 @@ This is safe because:
 2. `AND(false, x) = false` and `OR(true, x) = true` for all x — the accumulated result cannot
    change after the short-circuit condition is met
 
+**Critical clarification — does one thread's `break` stop other threads?**
+
+NO. Each OpenMP thread owns exactly one `output_index` (one output slice of the tensor).
+The parallelism is across output slices, not within one slice:
+
+```cpp
+#pragma omp parallel for               // ← threads split output_index values
+for (int64_t output_index = 0; ...) { // Thread 0 → output_index=0, Thread 1 → output_index=1, ...
+    bool accumulator = true;
+    for (int64_t i = 0; i < reduced_count; ++i) {  // ← sequential, owned by ONE thread
+        accumulator = op.reduce(accumulator, val);
+        if (op.can_short_circuit(accumulator)) break;  // ← exits THIS thread's inner loop only
+    }
+    output_data[output_index] = accumulator;  // ← writes to its own output slot
+}
+```
+
+When Thread 0 (working on `output_index=0`) finds `false` at `i=5` and breaks — Thread 1
+(working on `output_index=1`) is completely unaffected. They share no state in the inner loop.
+Each thread reduces its own independent slice of the tensor, writes to its own output element.
+The `break` is local: it exits that one thread's `for i` loop and moves on to `output_data[0] = false`.
+
 **Overhead when NOT short-circuiting (worst case — condition never met):**
 `can_short_circuit(acc)` compiles to a single conditional branch per element.
 The CPU branch predictor will predict "not taken" after the first few iterations. Cost ≈ 0.
 No measurable overhead in the steady state.
 
 **Savings when short-circuiting (best case):**
-For `reduce_all` on a tensor where element 0 is false: saves `reduced_count - 1` iterations.
-For `reduce_any` on a tensor where element 0 is true: same.
+For `reduce_all` on a slice where element 0 is false: saves `reduced_count - 1` iterations for that thread.
+For `reduce_any` on a slice where element 0 is true: same.
 
 **Decision vs PyTorch:** PyTorch uses the identical `break` pattern on CPU. This change matches PyTorch behaviour exactly.
 
@@ -798,7 +831,43 @@ Comment added to explain the intentional device difference:
 
 ---
 
-### 1.16 CPU vs GPU Integer Mean — Intentional Float64 vs Float32 (Design Decision)
+### 1.16 GPU Mean Division — `static_cast<double>` Replaced by `static_cast<AccT>`
+**(File: `include/ops/helpers/ReductionKernels.cuh`, lines ~706–709)**
+
+**Problem:**
+After accumulating the sum in `AccT` (= `float` for all non-double types), the division used
+a hardcoded `static_cast<double>(reduced_count)` denominator:
+
+```cpp
+// BEFORE (wrong — pointless double promotion):
+mean_val = accumulator / static_cast<double>(reduced_count);
+//         ^^^^^^^^^^^   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+//         float (AccT)  double
+// C++ rule: float / double → both promoted to double → double division → stored back as float
+// The double division adds ZERO precision (numerator is already float-precision)
+// AND double division is slower than float division on consumer GPUs (FP64 = 1/32 FP32)
+```
+
+Three wasted steps: float→double promotion, double division, double→float truncation.
+The accumulated sum was already `float` precision — widening for the division recovers nothing.
+
+**Fix:**
+```cpp
+// AFTER — divide in AccT precision:
+mean_val = accumulator / static_cast<AccT>(reduced_count);
+// AccT = float  → float / float  (fast, correct, matches PyTorch)
+// AccT = double → double / double (correct, no change for double input)
+```
+
+`static_cast<AccT>` means: float input gets float division, double input gets double division.
+Each type gets the right precision for its accumulator — no unnecessary widening.
+
+**PyTorch comparison:** PyTorch GPU mean divides by `static_cast<scalar_t>(count)` where
+`scalar_t` is the accumulator type — identical pattern to our fix.
+
+---
+
+### 1.17 CPU vs GPU Integer Mean — Intentional Float64 vs Float32 (Design Decision)
 **(Files: `include/ops/helpers/ReductionImpl.h`)**
 
 **The question raised:** After making GPU output Float32 for integer mean, should CPU also be

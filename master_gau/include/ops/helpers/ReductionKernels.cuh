@@ -703,10 +703,14 @@ __global__ void reduce_mean_kernel(
                          mean_val = __longlong_as_double(0x7ff8000000000000ULL);
                      }
                 } else {
-                    mean_val = accumulator / static_cast<double>(valid_count);
+                    // Divide in AccT precision: float/float for non-double, double/double for double.
+                    // Old: static_cast<double>(valid_count) caused float→double promotion,
+                    // double division (slow on consumer GPU), then truncation back to float — no benefit.
+                    mean_val = accumulator / static_cast<AccT>(valid_count);
                 }
             } else {
-                mean_val = accumulator / static_cast<double>(reduced_count);
+                // Same fix: divide in AccT precision (float for non-double, double for double).
+                mean_val = accumulator / static_cast<AccT>(reduced_count);
             }
 
             //   CONVERT BACK USING GPU INTRINSICS

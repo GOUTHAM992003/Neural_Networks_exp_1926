@@ -425,6 +425,16 @@ output_data[output_index] = best_idx;
 compiled only for host code, not device code. The existing `reduce()` and `identity()` methods
 (with `DEVICE_HOST`) remain unchanged for GPU use.
 
+**Important: `ValueIndex<T>` struct was NOT deleted from `ReductionOps.h`.**
+The struct declaration stays because:
+- The op structs still use `using AccumulatorType = ValueIndex<T>` — the CPU kernel detects the
+  index path via `if constexpr (std::is_same_v<AccT, ValueIndex<T>>)` in `ReductionImpl.h`
+- The op structs' `reduce(ValueIndex<T>, ValueIndex<T>)` methods remain — GPU calls them every element
+- GPU `reduce_index_kernel` still constructs `ValueIndexType current = {input_value, i}` per element
+`ReductionOps.h` is a shared header. One declaration, used by both CPU and GPU. What changed is
+only how the CPU `reduce_kernel` uses it — it now calls `identity_val()`/`better_than()` instead
+of constructing `ValueIndex<T>` per element. The struct and its `reduce()` method are untouched.
+
 ---
 
 ### Change 11: Short-circuit for `reduce_all` / `reduce_any` (ReductionOps.h + ReductionImpl.h)
@@ -467,6 +477,13 @@ all threads in a warp execute the same instruction; a `break` in one thread does
 The `break` exits the inner `for (int64_t i = 0; i < reduced_count; ++i)` loop.
 Safe because the inner loop is sequential — OpenMP parallelizes the outer `output_index` loop,
 not the inner `reduced_count` loop.
+
+**Does one thread's `break` stop other threads? NO.**
+Each OpenMP thread owns exactly one `output_index` value (one output slice). Thread 0 reduces
+slice 0, Thread 1 reduces slice 1, independently. When Thread 0's inner loop `break`s because
+it found `false`, Thread 1 is working on a completely different slice and is unaffected — they
+share no state in the inner loop. The `break` is local to that one thread's inner loop only.
+This is why the `break` is safe: each thread's inner loop is sequential and independent.
 
 **Overhead in steady state (no early exit):**
 `can_short_circuit()` inlines to a single instruction (`!acc` or `acc`).
@@ -521,6 +538,21 @@ using AccT = std::conditional_t<
 The `shared_mem_size` fix was important: `sizeof(double) = 8` but `sizeof(float) = 4`. Without
 this fix, the kernel would have been allocated twice the shared memory it actually needs, reducing
 occupancy (number of concurrent blocks per SM).
+
+**Also fixed in this same kernel (Change 12b): division denominator `static_cast<double>` → `static_cast<AccT>`**
+
+```cpp
+// BEFORE — hardcoded double denominator (pointless for AccT=float):
+mean_val = accumulator / static_cast<double>(reduced_count);
+// float/double → C++ promotes float→double → double division (32x slower) → truncated to float
+// Zero precision benefit: sum was already float-precision
+
+// AFTER — divide in AccT's own precision:
+mean_val = accumulator / static_cast<AccT>(reduced_count);
+// AccT=float  → float/float  (fast, no promotion, matches PyTorch)
+// AccT=double → double/double (correct, no regression for double inputs)
+```
+Same fix applied to the `is_nan_aware` path (`valid_count` denominator). Matches PyTorch's GPU mean division exactly.
 
 **Changed in `ReductionImplGPU.cu` — `dispatch_variance_gpu` (lines ~477–552):**
 
@@ -1028,6 +1060,12 @@ Section 6: 1/1   — float16 accumulates in float correctly
 - Root cause: `using AccT = ... double` hardcoded without considering that FP64 = 1/32 FP32 on consumer GPUs (Pascal/Turing/Ada).
 - Fix: Changed to `float` for all non-double, non-complex types. `dispatch_mean_gpu` now outputs `Float32` for integers. `dispatch_variance_gpu` cascade-updated to match (MeanCppT, OutputCppT, AccCppT all changed to float for integral T).
 - Also fixed: `shared_mem_size` in `dispatch_mean_gpu` was using `sizeof(double)` for AccT allocation — changed to `mean_acc_size` (4 bytes for float, 8 for double) so shared memory is not over-allocated.
+
+**Bug B7b: `reduce_mean_kernel` division denominator used `static_cast<double>` — pointless double promotion**
+- Location: `include/ops/helpers/ReductionKernels.cuh`, `reduce_mean_kernel`, lines ~706–709
+- Symptom: For all non-double `AccT = float` cases (integer, half, float inputs), the division `accumulator / static_cast<double>(reduced_count)` promoted the float accumulator to double before division. Three wasted GPU instructions: float→double promotion, double division (1/32 FP32 speed on consumer GPUs), double→float truncation. Zero precision benefit — the accumulated sum was already float-precision.
+- Root cause: hardcoded `static_cast<double>` without considering that AccT = float for most types.
+- Fix: Changed to `static_cast<AccT>(reduced_count)` — for float AccT gives float/float division, for double AccT gives double/double division. Matches PyTorch's pattern exactly.
 
 **Bug B8: CPU index ops (argmin/argmax) — 2 NaN checks per element in hot path, struct overhead**
 - Location: `include/ops/helpers/ReductionOps.h` (ArgMinOp/ArgMaxOp reduce method), `include/ops/helpers/ReductionImpl.h` (CPU index path)
