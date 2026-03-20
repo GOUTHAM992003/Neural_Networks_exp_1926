@@ -125,6 +125,7 @@ for any Int8 tensor, on both CPU and GPU.
 | P10 | ReductionKernels.cuh + ReductionImplGPU.cu | `reduce_mean_kernel` hardcoded `double` accumulator for ALL non-complex types including `float`, `half`, and integer inputs. On consumer GPUs FP64 = 1/32 FP32 throughput → mean on float tensors was 32× slower than necessary. `dispatch_mean_gpu` and `dispatch_variance_gpu` also outputting Float64 for integers when Float32 is correct for GPU. |
 | P11 | ReductionImpl.h (CPU index path) | Index reductions (argmin/argmax/nanargmin/nanargmax) on CPU used `ValueIndex<T>` struct per element — allocating `{input_value, i}` on stack per iteration and returning full struct from `op.reduce()`. PyTorch uses two independent scalar variables with conditional index update only when value improves. Our approach had ~2–3 extra instructions per element. Also: NaN check in `better_than` was doing 2 `is_nan_check` calls per element in the hot path; IEEE 754 allows reducing this to 1. |
 | P12 | ReductionImpl.h (CPU bool path) | `reduce_all` and `reduce_any` traversed the entire reduced dimension even after the result was determined. Once `AllOp` accumulator = false, no subsequent element can change the result; once `AnyOp` = true, same. Missing early exit added O(reduced_count) unnecessary work. |
+| P13 | ReductionOps.h + ReductionKernels.cuh + ReductionImpl.h + ReductionImplGPU.cu | Complex types (`complex32_t`, `complex64_t`, `complex128_t`) had NO accumulator promotion — they accumulated as themselves. `complex64_t` (2×float32) on GPU was silently widened to `complex128_t` (2×double) in `reduce_mean_kernel` due to an old hardcoded conditional, causing 32× slowdown on consumer GPUs. `AccumulatorTypeSelector` had no complex specializations at all, so dispatch_mean and dispatch_variance used fallback type T. `dispatch_mean_gpu`'s `shared_mem_size` used `sizeof(float)=4` per warp slot, but `complex128_t` needs `sizeof(complex128_t)=16` bytes → silent shared memory corruption. |
 
 ---
 
@@ -532,6 +533,127 @@ occupancy (number of concurrent blocks per SM).
 
 ---
 
+### Change 14: Complex type accumulator promotion (ReductionOps.h + ReductionKernels.cuh + ReductionImpl.h + ReductionImplGPU.cu)
+
+**Root cause of P13 problem:**
+Complex types mirror their scalar component type but were never given promotion rules. The original
+`AccumulatorTypeSelector` had no specializations for complex types — they fell through to `type = T`
+(no promotion). Additionally, `reduce_mean_kernel` had an old hardcoded complex branch that mapped
+`complex64_t → complex128_t` on GPU, which was wrong: complex128_t has double components, so this
+triggered 32× FP64 slowdown on consumer hardware. `dispatch_mean_gpu`'s `shared_mem_size` only
+allocated `sizeof(float)=4` bytes per warp slot — correct for float, catastrophically wrong for
+`complex128_t` which needs 16 bytes per slot.
+
+**Design principle: mirror the scalar float rule exactly**
+
+| Input complex type | Components | CPU AccT | GPU AccT | Rationale |
+|---|---|---|---|---|
+| `complex32_t` | 2 × float16 | `complex64_t` | `complex64_t` | Same as scalar float16→float on both |
+| `complex64_t` | 2 × float32 | `complex128_t` | `complex64_t` | Same as scalar float: CPU→double, GPU→float |
+| `complex128_t` | 2 × double | `complex128_t` | `complex128_t` | Already at max precision on both |
+
+**CPU logic:** float32 component → double component is "free" on CPU (same as scalar float→double).
+`complex128_t` (16 bytes/slot) adds register pressure but this mirrors PyTorch's CPU behaviour.
+
+**GPU logic:** float32 component → float (no widening) because FP64 = 32× slower on consumer
+GPUs (Pascal/Turing/Ada). `complex32_t` still gets one level of widening (float16→float) to avoid
+half-precision accumulation noise.
+
+**Matches PyTorch exactly:**
+- PyTorch CPU: `complex<float> → complex<double>`, `complex<half> → complex<float>`, `complex<double> → complex<double>`
+- PyTorch CUDA: `complex<float> → complex<float>`, `complex<half> → complex<float>`, `complex<double> → complex<double>`
+
+**4a — `ReductionOps.h` (lines ~351–354): Add 4 complex specializations**
+
+```cpp
+// ── Complex types: promote component precision, mirroring scalar float rules ──
+//   complex32_t  = 2 × float16_t  →  complex64_t  (both devices, same as scalar float16→float)
+//   complex64_t  = 2 × float      →  complex128_t (CPU: free precision, like scalar float→double)
+//                                 →  complex64_t  (GPU: float stays float, FP64=32x slower)
+//   complex128_t = 2 × double     →  complex128_t (no promotion, already at max precision)
+template<bool IsGPU> struct AccumulatorTypeSelector<complex32_t,  IsGPU> { using type = complex64_t;  };
+template<>           struct AccumulatorTypeSelector<complex64_t,  false> { using type = complex128_t; }; // CPU
+template<>           struct AccumulatorTypeSelector<complex64_t,  true>  { using type = complex64_t;  }; // GPU
+template<bool IsGPU> struct AccumulatorTypeSelector<complex128_t, IsGPU> { using type = complex128_t; };
+```
+
+**4b — `ReductionKernels.cuh` (line ~543): Fix `reduce_mean_kernel` AccT for complex**
+
+```cpp
+// BEFORE (wrong — forced complex64_t GPU → complex128_t, triggering FP64 path):
+using AccT = std::conditional_t<is_complex,
+    std::conditional_t<std::is_same_v<T, complex32_t>, complex64_t, complex128_t>,
+    std::conditional_t<std::is_same_v<T, double>, double, float>
+>;
+
+// AFTER (correct — uses centralized AccumulatorTypeSelector, GPU=true = float components):
+using AccT = typename std::conditional_t<
+    is_complex,
+    detail::AccumulatorType<T, /*IsGPU=*/true>,   // complex64_t GPU → complex64_t (NOT complex128_t)
+    typename std::conditional_t<std::is_same_v<T, double>, double, float>
+>;
+```
+
+`detail::AccumulatorType<complex64_t, true>` = `complex64_t` (GPU stays at float components).
+`detail::AccumulatorType<complex64_t, false>` = `complex128_t` (CPU widens to double components).
+
+**4c — `ReductionImpl.h` `dispatch_mean_kernel` (last AccT branch): Fix CPU complex AccT**
+
+The `dispatch_mean_kernel` (CPU path) computed `AccT` with a chain of `std::conditional`. The
+last (fallback) branch was `T` — so complex types accumulated as themselves (no promotion).
+
+```cpp
+// BEFORE (fallback = T, complex accumulated as itself):
+using AccT = typename std::conditional<
+    should_use_double_accumulation<T>(),
+    double,
+    T   // ← complex64_t fell here → no promotion
+>::type;
+
+// AFTER (fallback = AccumulatorType<T, false>, complex gets correct CPU AccT):
+using AccT = typename std::conditional<
+    should_use_double_accumulation<T>(),
+    double,
+    detail::AccumulatorType<T, /*IsGPU=*/false>   // complex64_t → complex128_t on CPU
+>::type;
+```
+
+Same change applied to `dispatch_variance_kernel` inner AccT for the same reason.
+
+**4d — `ReductionImplGPU.cu` `dispatch_mean_gpu` (lines ~419–428): Fix `shared_mem_size`**
+
+```cpp
+// BEFORE (always used sizeof(double)=8 or sizeof(float)=4 — wrong for complex128_t which needs 16):
+constexpr size_t mean_acc_size = std::is_same_v<T, double> ? sizeof(double) : sizeof(float);
+
+// AFTER (uses sizeof(MeanAccT) — correct for every complex and scalar type):
+constexpr bool is_complex_T = std::is_same_v<T, complex32_t> ||
+                              std::is_same_v<T, complex64_t>  ||
+                              std::is_same_v<T, complex128_t>;
+using MeanAccT = std::conditional_t<
+    is_complex_T,
+    detail::AccumulatorType<T, /*IsGPU=*/true>,
+    std::conditional_t<std::is_same_v<T, double>, double, float>
+>;
+constexpr size_t mean_acc_size = sizeof(MeanAccT);
+size_t shared_mem_size = num_warps * mean_acc_size + num_warps * sizeof(int64_t) + metadata_size;
+```
+
+Sizes per warp slot by type:
+
+| T | MeanAccT (GPU) | `sizeof(MeanAccT)` | Before |
+|---|---|---|---|
+| float, half, int* | float | 4 | 4 (correct) |
+| double | double | 8 | 8 (correct) |
+| complex32_t | complex64_t | 8 | 4 (WRONG — 2 bytes short) |
+| complex64_t | complex64_t | 8 | 4 (WRONG — 2 bytes short) |
+| complex128_t | complex128_t | 16 | 4 (WRONG — 12 bytes short, corruption!) |
+
+The complex128_t case was a silent corruption bug — the kernel would overwrite the `int64_t* shared_count`
+region and nearby thread data during warp reduction.
+
+---
+
 ### Change 13: CPU integer mean stays Float64 — design decision documented (ReductionImpl.h)
 
 **Question raised:** After GPU changed to Float32 for integer mean/variance, should CPU also
@@ -732,6 +854,9 @@ Accumulator type depends on **both the input dtype AND the operation**:
 | **float** | **double** | **float** |
 | double | double | double |
 | FP4 types | float | float |
+| **complex32_t** | **complex64_t** | **complex64_t** |
+| **complex64_t** | **complex128_t** | **complex64_t** |
+| **complex128_t** | **complex128_t** | **complex128_t** |
 | \_\_half (CUDA) | float | float |
 | \_\_nv_bfloat16 (CUDA) | float | float |
 
@@ -766,7 +891,7 @@ Accumulator type depends on **both the input dtype AND the operation**:
 | bool accumulator | bool | not handled | int64_t |
 | bool short-circuit CPU | Yes | No | **Yes** (Change 11) |
 | bool short-circuit GPU | No (SIMT) | No | No (SIMT limitation) |
-| complex promotion | complex\<double\> on CPU | none | none (stays same) |
+| complex promotion | complex\<double\> on CPU, complex\<float\> on GPU | none | **Yes (Change 14): complex32→complex64 both, complex64 CPU→complex128, complex64 GPU→complex64** |
 | Kahan summation | Yes, higher-level | No | Removed (double acc replaces it) |
 | argmin/argmax CPU impl | 2-variable scalars | 2-variable scalars | **2-variable** (was struct, fixed Change 10) |
 | argmin/argmax GPU impl | struct (ValueIndex equiv.) | separate fields | struct (ValueIndex, unchanged — zero overhead) |
@@ -909,6 +1034,14 @@ Section 6: 1/1   — float16 accumulates in float correctly
 - Symptom: Two `is_nan_check()` calls per element in all code paths (hot path with no NaN data). Also struct `ValueIndex<T>` constructed on stack per element.
 - Fix: Added `better_than()` using IEEE 754 property (NaN < x = false eliminates the need for a second check when current_best is NaN). Changed CPU loop from struct-based to 2-variable scalars. Result: 1 NaN check in hot path instead of 2, no struct construction per element.
 
+**Bug B9: Complex type accumulator — no promotion, GPU corruption, wrong types**
+- Location: `include/ops/helpers/ReductionOps.h` (no complex specializations), `include/ops/helpers/ReductionKernels.cuh` `reduce_mean_kernel` (wrong complex AccT), `src/UnaryOps/cuda/ReductionImplGPU.cu` `dispatch_mean_gpu` (shared_mem_size too small for complex)
+- Three separate bugs bundled in the same root cause:
+  1. **No accumulator promotion**: `AccumulatorTypeSelector` had no specializations for complex types → all three complex types fell through to `type = T` (no widening). `complex64_t` should widen to `complex128_t` on CPU.
+  2. **Wrong GPU AccT in `reduce_mean_kernel`**: Hardcoded `conditional<complex32_t, complex64_t, complex128_t>` forced `complex64_t → complex128_t` on GPU (double components = 32× slower on consumer GPUs). Should stay `complex64_t` on GPU.
+  3. **`shared_mem_size` too small for complex types**: `dispatch_mean_gpu` computed `mean_acc_size` as `sizeof(double)=8` or `sizeof(float)=4`. For `complex128_t` (GPU AccT = `complex128_t`, sizeof=16), only 4 bytes were allocated per warp slot → kernel overwrote the `int64_t* shared_count` region → silent shared memory corruption.
+- Fix: Added 4 complex specializations to `AccumulatorTypeSelector` (Change 14a). Fixed `reduce_mean_kernel` to use `AccumulatorType<T, GPU=true>` (Change 14b). Fixed `dispatch_mean_gpu` to compute `shared_mem_size` using `sizeof(MeanAccT)` (Change 14d). Fixed CPU `dispatch_mean_kernel` and `dispatch_variance_kernel` fallback AccT to use `AccumulatorType<T, false>` instead of `T` (Change 14c).
+
 ---
 
 ## Part 8 — Pending work
@@ -920,6 +1053,7 @@ Section 6: 1/1   — float16 accumulates in float correctly
 - **GPU mean double accumulator**: Done (Change 12). Now `float` for all non-double, non-complex types.
 - **Integer mean/variance GPU output dtype**: Done (Float32 instead of Float64 on GPU).
 - **CPU/GPU consistency analysis**: Done (Change 13). CPU stays Float64 (free precision), GPU Float32 (hardware constraint). Documented.
+- **Complex type accumulator promotion**: Done (Change 14). All 3 complex types now have proper promotion rules in `AccumulatorTypeSelector`. GPU `reduce_mean_kernel` fixed (complex64 no longer uses double components). `dispatch_mean_gpu` shared_mem_size fixed for complex types. CPU dispatch_mean/variance fallback AccT fixed. Three bugs fixed in one change.
 
 ### Pending: pairwise (tree) reduction to replace sequential loop
 
@@ -947,11 +1081,6 @@ Current inner loop calls `unravel_index` and `ravel_index` on every element.
 These involve integer division and modulo operations (~10–15 integer ops per element).
 Replacing with stride-based pointer arithmetic reduces this to 1–2 additions per element.
 
-### Pending: complex type accumulator promotion
-
-Currently complex32_t/64_t/128_t have no accumulator promotion (accumulate as themselves).
-PyTorch promotes complex\<float\> → complex\<double\> on CPU. This can be added when needed.
-
 ### Pending: IntelliSense / CUDA IDE parser cache
 
 The CUDA IntelliSense parser in VSCode shows false errors on the static_asserts in the test file
@@ -965,11 +1094,11 @@ Fix: reload the window or clear the IntelliSense cache (Ctrl+Shift+P → "C/C++:
 
 | File | All changes |
 |------|-------------|
-| `include/ops/helpers/ReductionOps.h` | Replaced 1-param struct with 2-param `IsGPU` struct; float→double on CPU; unsigned→uint64_t; int8_t added; renamed `G`→`IsGPU`; **MinOp/MaxOp/NanMinOp/NanMaxOp AccT = T**; **ArgMinOp/ArgMaxOp/NanArgMinOp/NanArgMaxOp: added `identity_val()` + `better_than()` (CPU 2-variable helpers)**; **AllOp/AnyOp: added `can_short_circuit()`** |
-| `include/ops/helpers/ReductionImpl.h` | Removed Kahan summation; output dtype + OutputCppT + accumulator init updated for compare ops; **CPU index path replaced: ValueIndex struct → 2-variable `best_val`/`best_idx`**; **bool path inner loop: added `break` for short-circuit**; **CPU integer mean comment: Float64 output is intentional (free precision, documented asymmetry vs GPU Float32)** |
-| `include/ops/helpers/ReductionKernels.cuh` | Replaced inline conditional_t chain with unified struct; compare ops branch to T; **`reduce_mean_kernel` AccT: `double`→`float` for non-double, non-complex types** |
+| `include/ops/helpers/ReductionOps.h` | Replaced 1-param struct with 2-param `IsGPU` struct; float→double on CPU; unsigned→uint64_t; int8_t added; renamed `G`→`IsGPU`; **MinOp/MaxOp/NanMinOp/NanMaxOp AccT = T**; **ArgMinOp/ArgMaxOp/NanArgMinOp/NanArgMaxOp: added `identity_val()` + `better_than()` (CPU 2-variable helpers)**; **AllOp/AnyOp: added `can_short_circuit()`**; **complex32/64/128_t: added 4 specializations to AccumulatorTypeSelector (Change 14a)** |
+| `include/ops/helpers/ReductionImpl.h` | Removed Kahan summation; output dtype + OutputCppT + accumulator init updated for compare ops; **CPU index path replaced: ValueIndex struct → 2-variable `best_val`/`best_idx`**; **bool path inner loop: added `break` for short-circuit**; **CPU integer mean comment: Float64 output is intentional**; **`dispatch_mean_kernel` + `dispatch_variance_kernel`: fallback AccT changed from `T` → `AccumulatorType<T, false>` so complex types get correct CPU promotion (Change 14c)** |
+| `include/ops/helpers/ReductionKernels.cuh` | Replaced inline conditional_t chain with unified struct; compare ops branch to T; **`reduce_mean_kernel` AccT: `double`→`float` for non-double, non-complex; complex AccT fixed from hardcoded `complex128_t` → `AccumulatorType<T, GPU=true>` (Change 14b — fixes complex64 GPU 32× slowdown bug)** |
 | `include/core/TensorDispatch.h` | Added `case Dtype::Int8:` to both dispatch switch statements |
-| `src/UnaryOps/cuda/ReductionImplGPU.cu` | Added 9 int8_t instantiations; removed `__cxa_demangle` debug call; removed `cudaHostAlloc` pinned buffer → `std::vector`; output dtype + OutputCppT + shared_mem_size updated for compare ops; **`dispatch_mean_gpu`: output dtype Float64→Float32 for integers, `OutputCppT` double→float, `shared_mem_size` `sizeof(double)`→`mean_acc_size`**; **`dispatch_variance_gpu`: output dtype Float64→Float32, `MeanCppT` double→float, `OutputCppT` double→float, `AccCppT` double→float for integral T** |
+| `src/UnaryOps/cuda/ReductionImplGPU.cu` | Added 9 int8_t instantiations; removed `__cxa_demangle` debug call; removed `cudaHostAlloc` pinned buffer → `std::vector`; output dtype + OutputCppT + shared_mem_size updated for compare ops; **`dispatch_mean_gpu`: output dtype Float64→Float32 for integers, `OutputCppT` double→float, `shared_mem_size` fixed: now `sizeof(MeanAccT)` via `MeanAccT` type alias (Change 14d — fixes complex128_t shared memory corruption)**; **`dispatch_variance_gpu`: output dtype Float64→Float32, `MeanCppT` double→float, `OutputCppT` double→float, `AccCppT` double→float for integral T** |
 | `Tests/ReductionsTests/accumulator_type_test.cpp` | New file: 22 tests across 6 sections |
 | `Tests/ReductionsTests/kahan_precision_test.cpp` | Existing file: precision+timing baseline vs after changes |
 | `Tests/ReductionsTests/baseline_before_changes.txt` | Saved precision baseline (Kahan active, float accumulator) |
@@ -994,3 +1123,9 @@ Fix: reload the window or clear the IntelliSense cache (Ctrl+Shift+P → "C/C++:
 | int mean GPU output dtype | `Float32` | `Float64` | FP64 = 32× slower on GPU; CPU's Float64 is intentionally different |
 | "cast before" vs "cast at load" | Cast at load (inside reduction loop) | Allocate new float tensor first | No extra memory allocation; int64 accumulation is more precise than float; same cost |
 | Kahan summation | Removed | Keep Kahan, add double too | Double accumulation is strictly better for catastrophic cancellation; Kahan has serial dependency chain |
+| complex32_t accumulator (CPU+GPU) | `complex64_t` | Stay `complex32_t` | float16 components overflow/lose precision just like scalar float16; must promote to float |
+| complex64_t accumulator (CPU) | `complex128_t` | Stay `complex64_t` | float32 components accumulate with error on large sums, same as scalar float; double is free on CPU |
+| complex64_t accumulator (GPU) | `complex64_t` (no widening) | `complex128_t` | Double components = 32× slower on consumer GPUs; matches PyTorch CUDA `acc_type<complex<float>>` = `complex<float>` |
+| complex128_t accumulator (CPU+GPU) | `complex128_t` (no widening) | Wider type | Already at max precision (double components); no further promotion exists or is useful |
+| `reduce_mean_kernel` complex AccT | Use `AccumulatorType<T, GPU=true>` | Keep hardcoded `complex128_t` | Old code forced complex64→complex128 on GPU (double components = 32× slow); centralized selector gives correct GPU AccT |
+| `dispatch_mean_gpu` shared_mem_size | `sizeof(MeanAccT)` | `sizeof(float)` or `sizeof(double)` | complex128_t needs 16 bytes/warp-slot; old 4-byte allocation caused silent shared memory corruption |

@@ -590,11 +590,17 @@ Tensor dispatch_mean_kernel(const Tensor& input, const std::vector<int64_t>& nor
         return output;
         
         } else {
-    // Floating point: use double accumulation for FP16/BF16
+    // Floating point: use AccumulatorTypeSelector for correct precision per type.
+    // - float16/bfloat16/FP4: should_use_double_accumulation → double (existing rule)
+    // - float:       AccumulatorType<float, CPU> = double  (existing: float→double on CPU)
+    // - double:      AccumulatorType<double,CPU> = double
+    // - complex32_t: AccumulatorType → complex64_t  (NEW: float16 components → float32)
+    // - complex64_t: AccumulatorType → complex128_t (NEW: float32 components → double on CPU)
+    // - complex128_t:AccumulatorType → complex128_t (no change)
     using AccT = typename std::conditional<
         should_use_double_accumulation<T>(),
-        double,  
-        T        
+        double,
+        detail::AccumulatorType<T, /*IsGPU=*/false>
     >::type;
     
     Tensor sum_result = reduce_kernel<T, SumOpType, AccT>(input, normalized_axes, output_shape);
@@ -858,16 +864,23 @@ Tensor dispatch_variance_kernel(const Tensor& input,
     
     const MeanCppT* mean_data = mean_tensor.data<MeanCppT>();
     
+    // Variance accumulator type (CPU):
+    // - float16/bf16/FP4 → double (should_use_double_accumulation rule, unchanged)
+    // - integers         → double (can't do float variance on int meaningfully)
+    // - float            → AccumulatorType<float,CPU> = double
+    // - complex32_t      → AccumulatorType → complex64_t  (NEW: component widening)
+    // - complex64_t      → AccumulatorType → complex128_t (NEW: component widening on CPU)
+    // - complex128_t     → complex128_t (no change)
     using AccT = typename std::conditional<
         should_use_double_accumulation<T>(),
         double,
         typename std::conditional<
             std::is_integral_v<T>,
             double,
-            T
+            detail::AccumulatorType<T, /*IsGPU=*/false>
         >::type
     >::type;
-    
+
     using OutputT = typename std::conditional<
         std::is_integral_v<T>,
         double,

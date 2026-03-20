@@ -412,9 +412,19 @@ PackedMetadata metadata(input_dims,input_strides,output_shape.dims,normalized_ax
     // Metadata size (input_strides + output_dims + reduced_dims + normalized_axes)
     size_t metadata_size = (input_dims.size() + input_strides.size() + output_shape.dims.size() + reduced_dims.size() + normalized_axes.size()) * sizeof(int64_t);
 
-    // AccT in reduce_mean_kernel = double for T=double, float for everything else.
-    // Match that here so shared memory allocation is not over-/under-sized.
-    constexpr size_t mean_acc_size = std::is_same_v<T, double> ? sizeof(double) : sizeof(float);
+    // Compute shared memory size to match reduce_mean_kernel's AccT exactly.
+    // Kernel rule: complex uses AccumulatorType<T,GPU>; non-complex: double if T=double, else float.
+    // complex32_t  → complex64_t  (8 bytes), complex64_t GPU → complex64_t (8 bytes),
+    // complex128_t → complex128_t (16 bytes), double → double (8), everything else → float (4).
+    constexpr bool is_complex_T = std::is_same_v<T, complex32_t> ||
+                                  std::is_same_v<T, complex64_t>  ||
+                                  std::is_same_v<T, complex128_t>;
+    using MeanAccT = std::conditional_t<
+        is_complex_T,
+        detail::AccumulatorType<T, /*IsGPU=*/true>,
+        std::conditional_t<std::is_same_v<T, double>, double, float>
+    >;
+    constexpr size_t mean_acc_size = sizeof(MeanAccT);
     size_t shared_mem_size = num_warps * mean_acc_size + num_warps * sizeof(int64_t) + metadata_size;
 
     //  TYPE CONVERSION

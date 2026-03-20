@@ -532,16 +532,17 @@ __global__ void reduce_mean_kernel(
     constexpr bool is_half = std::is_same_v<T, __half> || std::is_same_v<T, __nv_bfloat16>;
     constexpr bool is_complex = std::is_same_v<T, complex32_t> || std::is_same_v<T, complex64_t> || std::is_same_v<T, complex128_t>;
 
-    // Accumulator type for mean:
-    // - complex32  → complex64  (widen for precision)
-    // - complex64/128 → complex128
-    // - double     → double     (keep full precision)
-    // - everything else (float, half, bfloat16, int*) → float
-    //   float is 32x faster than double on consumer GPUs (FP64 = 1/32 FP32 on Pascal/Turing).
-    //   PyTorch uses float (opmath_type) for all of these same types.
+    // Accumulator type for mean (GPU):
+    // Complex types use AccumulatorTypeSelector<T, IsGPU=true> — centralized, matches scalar rules:
+    //   complex32_t  → complex64_t  (both devices: same as scalar float16→float)
+    //   complex64_t  → complex64_t  (GPU: stay at float32 components; CPU would be complex128_t)
+    //   complex128_t → complex128_t (both devices: no promotion)
+    // NOTE: the old code had complex64_t→complex128_t on GPU which was WRONG —
+    //   double components on consumer GPUs = 32x slower for no output precision gain.
+    // Non-complex: same as before (float/half/bfloat16/int* → float, double → double).
     using AccT = typename std::conditional_t<
         is_complex,
-        typename std::conditional_t<std::is_same_v<T, complex32_t>, complex64_t, complex128_t>,
+        detail::AccumulatorType<T, /*IsGPU=*/true>,
         typename std::conditional_t<std::is_same_v<T, double>, double, float>
     >;
 

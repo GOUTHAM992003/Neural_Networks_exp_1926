@@ -333,6 +333,26 @@ template<> struct AccumulatorTypeSelector<float, true>  { using type = float;  }
 template<bool IsGPU> struct AccumulatorTypeSelector<float4_e2m1_t,    IsGPU> { using type = float; };
 template<bool IsGPU> struct AccumulatorTypeSelector<float4_e2m1_2x_t, IsGPU> { using type = float; };
 
+// ── Complex types: promote component precision, mirroring scalar float rules ──
+//
+//   complex32_t  = 2 × float16_t  →  complex64_t  = 2 × float   (on BOTH CPU and GPU)
+//     Rationale: float16 component needs float promotion, same as scalar float16_t → float.
+//
+//   complex64_t  = 2 × float      →  complex128_t = 2 × double  (CPU only)
+//                                 →  complex64_t              (GPU)
+//     Rationale: mirrors scalar float rule exactly.
+//       CPU: float → double (better precision, no cost).
+//       GPU: float → float  (FP64 is 32× slower on consumer GPUs — same reason as scalar float).
+//
+//   complex128_t = 2 × double     →  complex128_t (no promotion on either device)
+//     Rationale: already at maximum precision.
+//
+// This matches PyTorch's acc_type for complex on CPU and CUDA respectively.
+template<bool IsGPU> struct AccumulatorTypeSelector<complex32_t,  IsGPU> { using type = complex64_t;  };
+template<>           struct AccumulatorTypeSelector<complex64_t,  false> { using type = complex128_t; }; // CPU
+template<>           struct AccumulatorTypeSelector<complex64_t,  true>  { using type = complex64_t;  }; // GPU
+template<bool IsGPU> struct AccumulatorTypeSelector<complex128_t, IsGPU> { using type = complex128_t; };
+
 // ── GPU-native half types (nvcc only) ────────────────────────────────────────
 #ifdef __CUDACC__
 template<bool IsGPU> struct AccumulatorTypeSelector<__half,        IsGPU> { using type = float; };
