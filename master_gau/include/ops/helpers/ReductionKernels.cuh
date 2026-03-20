@@ -172,12 +172,14 @@ __global__ void reduce_kernel(
     constexpr bool is_half = std::is_same_v<T, __half> || std::is_same_v<T, __nv_bfloat16>;
     constexpr bool is_integer_sum = std::is_integral_v<T> && std::is_same_v<OpType<T>, detail::SumOp<T>>;
     constexpr bool is_integer_product = std::is_integral_v<T> && std::is_same_v<OpType<T>, detail::ProductOp<T>>;
-
-    using AccumulatorType = typename std::conditional_t<
-        is_integer_sum || is_integer_product,
-        int64_t,
-        typename std::conditional_t<is_half, float, T>
-    >;
+//I commented these lines as i placed the accumulator logic in ReductionOps.h itself and used the AccumulatorTypeSelector struct to determine the accumulator type based on T and OpType, and whether it's GPU or CPU.
+// This way, the logic is centralized in one place (ReductionOps.h) and can be reused across both CPU and GPU implementations without duplication. The kernel just uses the resulting AccumulatorType directly. 
+    // using AccumulatorType = typename std::conditional_t<
+    //     is_integer_sum || is_integer_product,
+    //     int64_t,
+    //     typename std::conditional_t<is_half, float, T>
+    // >;
+    using AccumulatorType = detail::AccumulatorType<T, /*IsGPU=*/true>;  ///* */ --->comment in c++,and compiler ignores it,and here i had used for understanding refeence .
 
     extern __shared__ char shared_mem[];
     // Metadata caching

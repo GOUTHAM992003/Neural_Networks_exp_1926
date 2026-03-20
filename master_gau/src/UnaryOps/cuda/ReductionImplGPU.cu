@@ -14,7 +14,7 @@
 #include <cuda_bf16.h>
 #include "dtype/CudaTraits.h"
 #include "device/CachingCudaAllocator.h"
-#include "device/PinnedCPUAllocator.h"
+#include <vector>
 namespace OwnTensor {
 namespace detail {
 
@@ -35,8 +35,7 @@ namespace detail {
 // =================================================================
 class PackedMetadata {
 public:
-int64_t* d_ptr; //single device pointer for all metadata 
-int64_t* h_ptr; //host pinned pointer for metadata
+int64_t* d_ptr; //single device pointer for all metadata
 int64_t* d_input_dims; //Pointer offset into d_ptr
 int64_t* d_input_strides; //Pointer offset into d_ptr
 int64_t* d_output_dims; //Pointer offset into d_ptr
@@ -74,15 +73,17 @@ cudaStream_t stream)
 // offset+=reduced_dims.size();
 
     size_t total_bytes = total_size * sizeof(int64_t);
-//Allocating Pinned Host memory for metadata 
-    device::PinnedCPUAllocator pinned_allocator;
-    h_ptr = static_cast<int64_t*>(pinned_allocator.allocate(total_bytes));
 
-    // Packing metadata into pinned_memory - h_ptr 
+    // Normal heap buffer — PinnedCPUAllocator used cudaHostAlloc which takes a global device-context
+    // lock on every call (~100-200µs, see PinnedCPUAllocator.cpp TODO). For tiny metadata buffers,
+    // CUDA's internal staging of pageable memory is only ~1-2µs — far cheaper than the driver lock.
+    std::vector<int64_t> h_buf(total_size);
+
+    // Packing metadata into h_buf
     size_t offset = 0;
     auto pack = [&](const std::vector<int64_t>& vec, size_t& off) {
         size_t start_off = off;
-        std::copy(vec.begin(), vec.end(), h_ptr + off);
+        std::copy(vec.begin(), vec.end(), h_buf.data() + off);
         off += vec.size();
         return start_off;
     };
@@ -95,13 +96,16 @@ cudaStream_t stream)
     // Allocating Device Memory - d_ptr
     d_ptr = static_cast<int64_t*>(CachingCUDAAllocator::instance().allocate(total_bytes, stream));
     
-    // Perform Asynchronous Copy using pinned host memory
-    cudaMemcpyAsync(d_ptr, h_ptr, total_bytes, cudaMemcpyHostToDevice, stream);
+    // Async copy — CUDA internally stages pageable memory via a locked page (~1-2µs for small metadata)
+    cudaMemcpyAsync(d_ptr, h_buf.data(), total_bytes, cudaMemcpyHostToDevice, stream);
     
-    // Ensure the asynchronous copy from pinned host memory is complete 
-    // before the host potentially proceeds to destroy this object or before the kernel launch.
-    // While same-stream operations are sequenced, the host pointer h_ptr must remain valid.
-    cudaStreamSynchronize(stream);
+    //I commented this stream synchronization becoz :  
+    //The stream already guarantees that operations happen in order
+    //The memcpy submitted before the kernel will always complete before the kernel sees the data — same stream, CUDA guarantees this.
+    //The sync is redundant.
+    // it blocks the CPU thread until the GPU DMA engine finishes the copy. 
+    //The CPU can't do anything during that time, not even submit the kernel launch. Everything serializes.
+    //cudaStreamSynchronize(stream);
 
     d_input_dims = d_ptr + offset_input_dims;
     d_input_strides = d_ptr + offset_input_strides;
@@ -112,7 +116,7 @@ cudaStream_t stream)
 
 ~PackedMetadata(){
     if(d_ptr) CachingCUDAAllocator::instance().deallocate(d_ptr);
-    if(h_ptr) device::PinnedCPUAllocator().deallocate(h_ptr);
+    // h_buf is a local std::vector in the constructor — automatically destroyed, no cleanup needed
 }
 
 PackedMetadata(const PackedMetadata&) = delete;
@@ -230,12 +234,6 @@ Tensor dispatch_reduction_gpu(const Tensor& input,
     using OutputCudaT = CudaNativeType<OutputCppT>;
     OutputCudaT* output_data = reinterpret_cast<OutputCudaT*>(output.data<OutputCppT>());
 
-    int status;
-    std::unique_ptr<char, void(*)(void*)> demangled_name(
-        abi::__cxa_demangle(typeid(OpType<T>).name(), nullptr, nullptr, &status),
-        std::free
-    );
-    
     //  Launch kernel with NATIVE CUDA types
     cuda::reduce_kernel<CudaT, OutputCudaT, OpType><<<num_blocks, threads_per_block, shared_mem_size,stream>>>(
         input_data,
@@ -643,6 +641,17 @@ template Tensor dispatch_variance_gpu<uint64_t,NanVarianceOp>(const Tensor& inpu
 // ===========================================================
 // INTEGER TYPES - BASIC OPERATIONS ONLY (NO NaN)
 // ===========================================================
+
+// int8_t (signed char) - Basic operations only
+template Tensor dispatch_reduction_gpu<int8_t, SumOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);//✨✨✨
+template Tensor dispatch_reduction_gpu<int8_t, ProductOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);//✨✨✨
+template Tensor dispatch_reduction_gpu<int8_t, MinOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);//✨✨✨
+template Tensor dispatch_reduction_gpu<int8_t, MaxOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);//✨✨✨
+template Tensor dispatch_index_reduction_gpu<int8_t, ArgMinOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);//✨✨✨
+template Tensor dispatch_index_reduction_gpu<int8_t, ArgMaxOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);//✨✨✨
+template Tensor dispatch_mean_gpu<int8_t, SumOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);//✨✨✨
+template Tensor dispatch_variance_gpu<int8_t,VarianceOp>(const Tensor& input, const std::vector<int64_t>& axes, bool keepdim , int64_t correction, cudaStream_t stream); //✨✨✨
+template Tensor dispatch_variance_gpu<int8_t,NanVarianceOp>(const Tensor& input, const std::vector<int64_t>& axes, bool keepdim , int64_t correction, cudaStream_t stream); //✨✨✨
 
 // int16_t (short) - Basic operations only
 template Tensor dispatch_reduction_gpu<int16_t, SumOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);//✨✨✨

@@ -259,42 +259,89 @@ DEVICE_HOST inline bool is_nan_check(T val) {
 template<> __device__ inline bool gpu_isnan(float4_e2m1_t val) { return std::isnan(static_cast<float>(val)); }
 template<> __device__ inline bool gpu_isnan(float4_e2m1_2x_t val) { return std::isnan(static_cast<float>(val)); }
 #endif
-
+//i commented this old accumulator system becoz its de-centralized and only used in CPU parts,
+//and also had bugs like used int64_t for all unsigned types etc., so restructured it.
 // ═══════════════════════════════════════════════════════════
 // ACCUMULATOR TYPE SELECTOR
 // ═══════════════════════════════════════════════════════════
 
-template<typename T>
+// template<typename T>
+// struct AccumulatorTypeSelector {
+//     using type = T;
+// };
+// // Integer types use int64_t to prevent overflow
+// template<> struct AccumulatorTypeSelector<int16_t> { using type = int64_t; };
+// template<> struct AccumulatorTypeSelector<int32_t> { using type = int64_t; };
+// template<> struct AccumulatorTypeSelector<int64_t> { using type = int64_t; };
+// template<> struct AccumulatorTypeSelector<uint8_t> { using type = int64_t; };
+// template<> struct AccumulatorTypeSelector<uint16_t> { using type = int64_t; };
+// template<> struct AccumulatorTypeSelector<uint32_t> { using type = int64_t; };
+// template<> struct AccumulatorTypeSelector<uint64_t> { using type = int64_t; };
+// // Half precision floats use float for better precision
+// template<> struct AccumulatorTypeSelector<float16_t> { using type = float; };
+// template<> struct AccumulatorTypeSelector<bfloat16_t> { using type = float; };
+// template<> struct AccumulatorTypeSelector<float> {using type = double;} ;
+// //  FIX: Bool should accumulate as int64_t (like PyTorch/NumPy)
+// template<> struct AccumulatorTypeSelector<bool> { using type = int64_t; };
+
+// // FP4 types should accumulate as float to avoid needing math operators on the types themselves
+// template<> struct AccumulatorTypeSelector<float4_e2m1_t> { using type = float; };
+// template<> struct AccumulatorTypeSelector<float4_e2m1_2x_t> { using type = float; };
+
+
+// #ifdef __CUDACC__
+// template<> struct AccumulatorTypeSelector<__half> { using type = float; };
+// template<> struct AccumulatorTypeSelector<__nv_bfloat16> { using type = float; };
+// #endif
+
+// template<typename T>
+// using AccumulatorType = typename AccumulatorTypeSelector<T>::type;
+// ═══════════════════════════════════════════════════════════
+// ACCUMULATOR TYPE SELECTOR  (IsGPU=false → CPU, IsGPU=true → GPU)
+// Pure compile-time trait — zero runtime cost.
+// ═══════════════════════════════════════════════════════════
+
+template<typename T, bool IsGPU = false>
 struct AccumulatorTypeSelector {
-    using type = T;
+    using type = T;  // default: no promotion
 };
-// Integer types use int64_t to prevent overflow
-template<> struct AccumulatorTypeSelector<int16_t> { using type = int64_t; };
-template<> struct AccumulatorTypeSelector<int32_t> { using type = int64_t; };
-template<> struct AccumulatorTypeSelector<int64_t> { using type = int64_t; };
-template<> struct AccumulatorTypeSelector<uint8_t> { using type = int64_t; };
-template<> struct AccumulatorTypeSelector<uint16_t> { using type = int64_t; };
-template<> struct AccumulatorTypeSelector<uint32_t> { using type = int64_t; };
-template<> struct AccumulatorTypeSelector<uint64_t> { using type = int64_t; };
-// Half precision floats use float for better precision
-template<> struct AccumulatorTypeSelector<float16_t> { using type = float; };
-template<> struct AccumulatorTypeSelector<bfloat16_t> { using type = float; };
-template<> struct AccumulatorTypeSelector<float> {using type = double;} ;
-//  FIX: Bool should accumulate as int64_t (like PyTorch/NumPy)
-template<> struct AccumulatorTypeSelector<bool> { using type = int64_t; };
 
-// FP4 types should accumulate as float to avoid needing math operators on the types themselves
-template<> struct AccumulatorTypeSelector<float4_e2m1_t> { using type = float; };
-template<> struct AccumulatorTypeSelector<float4_e2m1_2x_t> { using type = float; };
+// ── Signed integers: int64_t on both CPU and GPU ──────────────────────────────
+template<bool IsGPU> struct AccumulatorTypeSelector<int8_t,  IsGPU> { using type = int64_t; };
+template<bool IsGPU> struct AccumulatorTypeSelector<int16_t, IsGPU> { using type = int64_t; };
+template<bool IsGPU> struct AccumulatorTypeSelector<int32_t, IsGPU> { using type = int64_t; };
+template<bool IsGPU> struct AccumulatorTypeSelector<int64_t, IsGPU> { using type = int64_t; };
 
+// ── Unsigned integers: uint64_t on both CPU and GPU ──────────────────────────
+template<bool IsGPU> struct AccumulatorTypeSelector<uint8_t,  IsGPU> { using type = uint64_t; };
+template<bool IsGPU> struct AccumulatorTypeSelector<uint16_t, IsGPU> { using type = uint64_t; };
+template<bool IsGPU> struct AccumulatorTypeSelector<uint32_t, IsGPU> { using type = uint64_t; };
+template<bool IsGPU> struct AccumulatorTypeSelector<uint64_t, IsGPU> { using type = uint64_t; };
 
+// ── Bool: int64_t on both (sum = count-of-true, in-kernel cast, no pre-cast) ──
+template<bool IsGPU> struct AccumulatorTypeSelector<bool, IsGPU> { using type = int64_t; };
+
+// ── Half precision: float on both CPU and GPU ─────────────────────────────────
+template<bool IsGPU> struct AccumulatorTypeSelector<float16_t,  IsGPU> { using type = float; };
+template<bool IsGPU> struct AccumulatorTypeSelector<bfloat16_t, IsGPU> { using type = float; };
+
+// ── float: CPU → double (precision), GPU → float (double is 32x slower on GPU)
+template<> struct AccumulatorTypeSelector<float, false> { using type = double; };
+template<> struct AccumulatorTypeSelector<float, true>  { using type = float;  };
+
+// ── FP4 types: float on both (no native math ops on FP4) ─────────────────────
+template<bool IsGPU> struct AccumulatorTypeSelector<float4_e2m1_t,    IsGPU> { using type = float; };
+template<bool IsGPU> struct AccumulatorTypeSelector<float4_e2m1_2x_t, IsGPU> { using type = float; };
+
+// ── GPU-native half types (nvcc only) ────────────────────────────────────────
 #ifdef __CUDACC__
-template<> struct AccumulatorTypeSelector<__half> { using type = float; };
-template<> struct AccumulatorTypeSelector<__nv_bfloat16> { using type = float; };
+template<bool IsGPU> struct AccumulatorTypeSelector<__half,        IsGPU> { using type = float; };
+template<bool IsGPU> struct AccumulatorTypeSelector<__nv_bfloat16, IsGPU> { using type = float; };
 #endif
 
-template<typename T>
-using AccumulatorType = typename AccumulatorTypeSelector<T>::type;
+// ── Convenience alias ─────────────────────────────────────────────────────────
+template<typename T, bool IsGPU = false>
+using AccumulatorType = typename AccumulatorTypeSelector<T, IsGPU>::type;
 
 // ═══════════════════════════════════════════════════════════
 //  CORE REDUCTION OPERATIONS (NOW USES GPU INTRINSICS!)

@@ -1,4 +1,4 @@
-# Kahan Summation — Test Design, Metrics, and Full Baseline Analysis
+[text](../../accumulator_system_analysis.md)# Kahan Summation — Test Design, Metrics, and Full Baseline Analysis
 
 **File:** `Tests/ReductionsTests/kahan_precision_test.cpp`
 **Purpose:** Capture BEFORE and AFTER snapshots of `reduce_sum` precision and performance

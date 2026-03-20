@@ -57,6 +57,7 @@ template<> struct DtypeToType<Dtype::Float4_e2m1_2x> { using type = float4_e2m1_
 template<typename Func>
 static auto dispatch_by_dtype(Dtype dtype, Func&& f) {
     switch(dtype) {
+        case Dtype::Int8:     return f(typename DtypeToType<Dtype::Int8>::type{});
         case Dtype::Int16:    return f(typename DtypeToType<Dtype::Int16>::type{});
         case Dtype::Int32:    return f(typename DtypeToType<Dtype::Int32>::type{});
         case Dtype::Int64:    return f(typename DtypeToType<Dtype::Int64>::type{});
@@ -82,6 +83,7 @@ static auto dispatch_by_dtype(Dtype dtype, Func&& f) {
 template<typename Func>
 static auto dispatch_by_integer_dtype(Dtype dtype, Func&& f) {
     switch(dtype) {
+        case Dtype::Int8:     return f(typename DtypeToType<Dtype::Int8>::type{});
         case Dtype::Int16:    return f(typename DtypeToType<Dtype::Int16>::type{});
         case Dtype::Int32:    return f(typename DtypeToType<Dtype::Int32>::type{});
         case Dtype::Int64:    return f(typename DtypeToType<Dtype::Int64>::type{});
