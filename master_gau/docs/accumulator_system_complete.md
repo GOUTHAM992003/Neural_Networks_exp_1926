@@ -121,6 +121,10 @@ for any Int8 tensor, on both CPU and GPU.
 | P6 | ReductionImpl.h | Kahan summation active: 4 extra FP ops + serial dependency per element, blocks pipelining |
 | P7 | TensorDispatch.h | `case Dtype::Int8` missing from `dispatch_by_dtype` switch — ALL ops fail on Int8 at runtime |
 | P8 | ReductionImplGPU.cu | No explicit template instantiations for `int8_t` GPU kernels — linker error on GPU path |
+| P9 | ReductionOps.h + ReductionImpl.h + ReductionKernels.cuh + ReductionImplGPU.cu | `MinOp`/`MaxOp`/`NanMinOp`/`NanMaxOp` unnecessarily widened accumulator: int32→int64, float(CPU)→double. Compare ops cannot overflow; widening added 1 extra instruction/element on CPU and 2–4× slower 64-bit comparison on pre-Volta GPUs. Also caused wrong output dtype: `reduce_min<int32>` was returning Int64 tensor instead of Int32. |
+| P10 | ReductionKernels.cuh + ReductionImplGPU.cu | `reduce_mean_kernel` hardcoded `double` accumulator for ALL non-complex types including `float`, `half`, and integer inputs. On consumer GPUs FP64 = 1/32 FP32 throughput → mean on float tensors was 32× slower than necessary. `dispatch_mean_gpu` and `dispatch_variance_gpu` also outputting Float64 for integers when Float32 is correct for GPU. |
+| P11 | ReductionImpl.h (CPU index path) | Index reductions (argmin/argmax/nanargmin/nanargmax) on CPU used `ValueIndex<T>` struct per element — allocating `{input_value, i}` on stack per iteration and returning full struct from `op.reduce()`. PyTorch uses two independent scalar variables with conditional index update only when value improves. Our approach had ~2–3 extra instructions per element. Also: NaN check in `better_than` was doing 2 `is_nan_check` calls per element in the hot path; IEEE 754 allows reducing this to 1. |
+| P12 | ReductionImpl.h (CPU bool path) | `reduce_all` and `reduce_any` traversed the entire reduced dimension even after the result was determined. Once `AllOp` accumulator = false, no subsequent element can change the result; once `AnyOp` = true, same. Missing early exit added O(reduced_count) unnecessary work. |
 
 ---
 
@@ -266,6 +270,377 @@ Zero functional change — purely readability.
 
 ---
 
+### Change 9: Compare ops bypass AccumulatorTypeSelector — use input type directly
+
+**(Files: `include/ops/helpers/ReductionOps.h`, `include/ops/helpers/ReductionImpl.h`,
+`include/ops/helpers/ReductionKernels.cuh`, `src/UnaryOps/cuda/ReductionImplGPU.cu`)**
+
+**Root cause of the problem:**
+The unified accumulator system (Change 3) applied accumulator widening to ALL ops uniformly.
+This was correct for `SumOp`/`ProductOp` where arithmetic can overflow.
+But `MinOp`, `MaxOp`, `NanMinOp`, `NanMaxOp` are **pure comparison** — the output is always
+one of the input values. There is no way for a comparison to overflow or lose precision.
+Widening the accumulator for compare ops was unnecessary overhead with no benefit.
+
+**4 sub-changes made:**
+
+**9a — `ReductionOps.h` (lines 412–413, 458–459, 588–589, 632–633):**
+Changed `AccT` in all 4 compare op structs:
+```cpp
+// BEFORE (all 4 compare ops):
+using AccT = AccumulatorType<T>;   // int32_t → int64_t, float(CPU) → double
+
+// AFTER (MinOp, MaxOp, NanMinOp, NanMaxOp):
+using AccT = T;   // compare op: result always within input range, no widening needed
+```
+`SumOp`, `ProductOp`, `NanSumOp`, `VarianceOp`, `NanVarianceOp` — AccT **unchanged**.
+
+**9b — `ReductionImpl.h` (CPU path, 3 locations):**
+
+*Output dtype* (line ~123): Changed condition from `is_integral_v<T>` to
+`is_integral_v<T> && !is_same_v<AccT, T>`. Now only sum/product widen to Int64;
+min/max output matches input dtype (Int32 stays Int32, Int8 stays Int8).
+
+*`OutputCppT`* (line ~148): Same condition change — compare ops map to `T`, not `int64_t`.
+
+*Accumulator initializer* (line ~238): Replaced the 3-branch
+`if (should_use_double) ... else if (is_integral) ... else` chain with a single:
+```cpp
+accumulator = static_cast<AccumulatorT>(op.identity());
+```
+This is correct for all ops since `AccumulatorT` is now always the right type.
+The old branches assumed AccumulatorT was always wider than T; that is no longer true for compare ops.
+
+**9c — `ReductionKernels.cuh` (GPU kernel, line ~182):**
+```cpp
+// BEFORE:
+using AccumulatorType = detail::AccumulatorType<T, /*IsGPU=*/true>;
+
+// AFTER:
+using AccumulatorType = std::conditional_t<
+    std::is_same_v<OpType<T>, detail::MinOp<T>>    ||
+    std::is_same_v<OpType<T>, detail::MaxOp<T>>    ||
+    std::is_same_v<OpType<T>, detail::NanMinOp<T>> ||
+    std::is_same_v<OpType<T>, detail::NanMaxOp<T>>,
+    T,                                      // compare ops: use T directly
+    detail::AccumulatorType<T, /*IsGPU=*/true>  // sum/etc: centralized type
+>;
+```
+
+**9d — `ReductionImplGPU.cu` (GPU dispatcher, lines ~156–219):**
+
+Added `constexpr bool is_compare_op` at line ~156 (same `is_same_v<>` check as 9c).
+Used it to guard:
+- `output_dtype`: `!is_compare_op` required to widen to Int64
+- `OutputCppT`: same condition
+- `shared_mem_size`: compare ops allocate `sizeof(T)` per warp slot instead of `sizeof(int64_t)`,
+  halving shared memory usage for integer compare ops (e.g., int32 min: 32 bytes → 32 bytes → was 64)
+
+---
+
+### Change 10: Index ops — 2-variable approach on CPU (ReductionOps.h + ReductionImpl.h)
+
+**Context — 5-part ops bifurcation:**
+After fixing Part 1 (sum/product) and Part 2 (min/max) accumulator issues, the remaining
+three groups were analyzed:
+- **Part 3** (argmin/argmax/nanargmin/nanargmax): struct-based accumulation overhead
+- **Part 4** (reduce_all/reduce_any): missing short-circuit
+- **Part 5** (mean/variance/std/nanmean/nanvar): GPU double accumulator overhead
+
+**Root cause of Part 3 problem:**
+The CPU index path used `ValueIndex<T>` struct (`{T value; int64_t index}`) to bundle both
+the running best value and its index. Every element required:
+1. `ValueIndex<T> current_val_index = {input_value, i}` — struct construction per element
+2. `op.reduce(accumulator, current_val_index)` — comparing two structs, returning a struct
+3. Storing the result struct back into `accumulator`
+
+GPU (`reduce_index_kernel`) already shuffled struct fields separately:
+```cpp
+other.value = shfl_down(accumulator.value, offset);
+other.index = shfl_down(accumulator.index, offset);
+```
+So struct overhead on GPU was zero. GPU was left unchanged.
+
+**Added to all 4 index ops in `ReductionOps.h`:**
+
+```cpp
+// Example: ArgMinOp<T>
+
+T identity_val() const { return get_max_value<T>(); }  // ArgMax: get_lowest_value<T>()
+
+// 1 NaN check per element in hot path (all-finite data).
+// IEEE 754: (NaN < x) = false → if current_best is NaN, comparison returns false naturally.
+// So current_best=NaN case needs no extra check — NaN sticks without 2nd is_nan_check.
+bool better_than(const T& candidate, const T& current_best) const {
+    if constexpr (is_any_float_v<T>) {
+        if (is_nan_check(candidate)) return !is_nan_check(current_best);
+    }
+    return candidate < current_best;   // (> for ArgMax)
+}
+```
+
+NaN semantics:
+
+| Op | `better_than` for NaN | Effect |
+|----|----------------------|--------|
+| ArgMinOp | `is_nan_check(candidate)` → take it if current isn't NaN yet | First NaN wins (NaN propagates) |
+| ArgMaxOp | Same | First NaN wins |
+| NanArgMinOp | `if (is_nan_check(candidate)) return false;` | NaN inputs skipped entirely |
+| NanArgMaxOp | Same | NaN inputs skipped entirely |
+
+**Old vs new NaN check count:**
+
+| Code version | Hot path (no NaN) | After first NaN found |
+|---|---|---|
+| Old reduce() with ValueIndex | 2 checks | 2 checks |
+| New better_than() | **1 check** | **1 check** (IEEE property saves the 2nd) |
+
+**Changed in `ReductionImpl.h` (lines ~197–238):**
+
+```cpp
+// BEFORE (struct per element):
+ValueIndex<T> accumulator = op.identity();
+for (int64_t i = 0; i < reduced_count; ++i) {
+    T input_value = input_data[input_lin_idx];
+    ValueIndex<T> current_val_index = {input_value, i};
+    accumulator = op.reduce(accumulator, current_val_index);
+}
+output_data[output_index] = accumulator.index;
+
+// AFTER (2 scalars, conditional index update only):
+T best_val = op.identity_val();
+int64_t best_idx = -1;
+for (int64_t i = 0; i < reduced_count; ++i) {
+    T input_value = input_data[input_lin_idx];
+    if (op.better_than(input_value, best_val)) {
+        best_val = input_value;
+        best_idx = i;
+    }
+}
+output_data[output_index] = best_idx;
+```
+
+`identity_val()` and `better_than()` have no `DEVICE_HOST` marker — they are CPU-only helpers
+compiled only for host code, not device code. The existing `reduce()` and `identity()` methods
+(with `DEVICE_HOST`) remain unchanged for GPU use.
+
+---
+
+### Change 11: Short-circuit for `reduce_all` / `reduce_any` (ReductionOps.h + ReductionImpl.h)
+
+**Root cause of Part 4 problem:**
+The inner reduction loop iterated over all `reduced_count` elements unconditionally.
+Once `AllOp` accumulates a `false` value, the final result is `false` regardless of remaining
+elements (`AND(false, x) = false` for all x). Once `AnyOp` accumulates `true`, the result
+is `true`. Continuing the loop is pure wasted work.
+
+**Added to `AllOp` and `AnyOp` in `ReductionOps.h`:**
+
+```cpp
+struct AllOp {
+    // ... existing methods unchanged ...
+    // CPU short-circuit: once false, AND can never recover.
+    bool can_short_circuit(bool acc) const { return !acc; }
+};
+
+struct AnyOp {
+    // ... existing methods unchanged ...
+    // CPU short-circuit: once true, OR can never go back.
+    bool can_short_circuit(bool acc) const { return acc; }
+};
+```
+
+`can_short_circuit` is **not** `DEVICE_HOST` — GPU cannot short-circuit (SIMT lockstep means
+all threads in a warp execute the same instruction; a `break` in one thread does not stop others).
+
+**Added to the bool path in `ReductionImpl.h` inner loop (line ~291):**
+
+```cpp
+} else if constexpr (std::is_same_v<AccT, bool>) {
+    bool val_as_bool = to_bool_value(input_value);
+    accumulator = op.reduce(accumulator, val_as_bool);
+    if (op.can_short_circuit(accumulator)) break;  // ← new
+}
+```
+
+The `break` exits the inner `for (int64_t i = 0; i < reduced_count; ++i)` loop.
+Safe because the inner loop is sequential — OpenMP parallelizes the outer `output_index` loop,
+not the inner `reduced_count` loop.
+
+**Overhead in steady state (no early exit):**
+`can_short_circuit()` inlines to a single instruction (`!acc` or `acc`).
+The conditional branch is predicted not-taken by the CPU branch predictor after the first few
+iterations. Measured overhead ≈ 0.
+
+**PyTorch and TensorFlow comparison:**
+- PyTorch CPU: uses explicit `break` in the bool reduction kernel. Identical behaviour.
+- PyTorch GPU: no short-circuit (SIMT limitation). Same as our GPU.
+- TensorFlow: does not implement short-circuit for any reduction.
+
+---
+
+### Change 12: GPU mean kernel — `double` → `float` accumulator (ReductionKernels.cuh + ReductionImplGPU.cu)
+
+**Root cause of Part 5 problem:**
+`reduce_mean_kernel` had `AccT = double` hardcoded for every non-complex type — including
+`float`, `half`, `bfloat16`, and all integer types. This was wrong for performance on consumer
+GPUs where FP64 throughput is 1/32 to 1/64 of FP32.
+
+Example cost: `mean<float>` on a 1M-element tensor on an RTX 3080:
+- Before: kernel uses `double` → occupancy reduced (double uses 2 register slots), FP64 execution → ~32× slower
+- After: kernel uses `float` → full FP32 occupancy and throughput
+
+PyTorch's rule: `opmath_type<T>` on GPU = `float` for all of {half, bfloat16, float, integers},
+`double` for double. We now match this exactly.
+
+**Changed in `ReductionKernels.cuh` (line ~536):**
+```cpp
+// BEFORE:
+using AccT = std::conditional_t<is_complex, ..., double>;
+
+// AFTER:
+using AccT = std::conditional_t<
+    is_complex,
+    std::conditional_t<std::is_same_v<T, complex32_t>, complex64_t, complex128_t>,
+    std::conditional_t<std::is_same_v<T, double>, double, float>
+>;
+// Rationale: FP64 = 1/32 FP32 on consumer GPUs (Turing/Pascal/Maxwell).
+// float is the correct choice for mean of float, half, and integer tensors on GPU.
+// double → double preserved for double-precision input tensors.
+```
+
+**Changed in `ReductionImplGPU.cu` — `dispatch_mean_gpu` (lines ~374–425):**
+
+| Location | Before | After |
+|---|---|---|
+| `output_dtype` (integral T) | `Dtype::Float64` | `Dtype::Float32` |
+| `shared_mem_size` acc part | `num_warps * sizeof(double)` | `num_warps * mean_acc_size` (`sizeof(float)` if T≠double) |
+| `OutputCppT` (integral T) | `double` | `float` |
+
+The `shared_mem_size` fix was important: `sizeof(double) = 8` but `sizeof(float) = 4`. Without
+this fix, the kernel would have been allocated twice the shared memory it actually needs, reducing
+occupancy (number of concurrent blocks per SM).
+
+**Changed in `ReductionImplGPU.cu` — `dispatch_variance_gpu` (lines ~477–552):**
+
+| Location | Before | After |
+|---|---|---|
+| `output_dtype` (integral T) | `Dtype::Float64` | `Dtype::Float32` |
+| `MeanCppT` (integral T) | `double` | `float` (cascade: mean now outputs Float32) |
+| `OutputCppT` (integral T) | `double` | `float` |
+| `AccCppT` (integral T) | `double` | `float` |
+
+---
+
+### Change 13: CPU integer mean stays Float64 — design decision documented (ReductionImpl.h)
+
+**Question raised:** After GPU changed to Float32 for integer mean/variance, should CPU also
+change to Float32 for consistency?
+
+**Analysis of overhead:**
+CPU integer mean path accumulates in `int64_t` (exact), then does one division per output element:
+- `(double)sum / (double)count` → DIVSD: ~14–20 cycles
+- `(float)sum / (float)count` → DIVSS: ~10–14 cycles
+
+Difference: ~6 cycles, **once per output slice** (not per input element). The inner loop runs
+`reduced_count` iterations per slice. For reduced_count = 10M, 6 cycles is 0.00000006% of total work.
+**No meaningful overhead to save.**
+
+**"Cast before" vs our approach:**
+User asked: can we cast the int tensor to float before reducing to reduce overhead (like PyTorch)?
+Answer: There is no "cast before the tensor" in PyTorch either. Both approaches cast at element
+load time inside the reduction loop. "Cast before" would mean allocating an entirely new float
+tensor — wasteful. Our `int64 += int_value` performs the widening in the `+=` instruction itself
+(one MOVSX), identical cost to `float += (float)int_value` (one CVTSI2SS + one FADD vs one MOVSX
++ one IADD64). Neither is slower.
+
+Furthermore, `int64_t` accumulation is **strictly more precise** than float accumulation:
+- float sum: precision breaks down when sum > 2^24 (~16M). For N×INT32_MAX → sum can reach 2^62.
+  float cannot represent this accurately (24-bit mantissa).
+- int64_t sum: exact up to 2^63. No precision loss for any realistic integer tensor.
+
+**Decision: CPU keeps Float64 output.** GPU uses Float32 due to a hardware constraint (FP64 = 1/32 FP32).
+CPU uses Float64 because it's free. This is intentional and documented asymmetry.
+
+```
+CPU integer mean:  int64_t accumulation → (double)sum/count → Float64 output
+GPU integer mean:  float   accumulation → (float)sum/count  → Float32 output
+Reason: hardware FP64 penalty exists on GPU, not on CPU.
+```
+
+NumPy also returns `float64` for `np.mean` on integer arrays — matching our CPU behaviour.
+PyTorch throws RuntimeError on integer `mean()` — no comparison possible.
+
+---
+
+## Part 4b — The 5-Part Ops Classification Framework
+
+All 22 reduction ops were systematically divided into 5 groups to analyze accumulator behaviour,
+compare against PyTorch/TensorFlow, and decide what changes were needed in each group:
+
+### Part 1 — Arithmetic value-returning ops
+`reduce_sum`, `reduce_product`, `reduce_nansum`, `reduce_nanproduct`
+
+These ops **add or multiply** values — they can overflow. Accumulator widening is mandatory.
+- int32 sum of N × 10^9 elements exceeds INT32_MAX immediately → must accumulate in int64_t
+- float sum of N = 10^6 random values → relative error ~0.1 without double accumulator
+
+**Status after all changes:** Correct. `AccT = AccumulatorType<T>` (widened). CPU float→double,
+GPU float→float (matching PyTorch's `opmath_type`). No changes needed in this session.
+
+### Part 2 — Comparison value-returning ops
+`reduce_min`, `reduce_max`, `reduce_nanmin`, `reduce_nanmax`
+
+These ops **compare** values — the result is always one of the input values. They can never
+overflow or lose precision. Accumulator widening adds overhead with zero benefit.
+
+**Status after Change 9 (session before this one):** Fixed. `AccT = T` in all 4 op structs.
+Output dtype matches input dtype. Shared memory halved for integer compare ops on GPU.
+Matches PyTorch and NumPy behaviour.
+
+### Part 3 — Index-returning ops
+`reduce_argmin`, `reduce_argmax`, `reduce_nanargmin`, `reduce_nanargmax`
+
+These ops find the **index** of the best value. The accumulator must track both the best value
+seen so far AND its position.
+
+**Original approach:** `ValueIndex<T>` struct `{T value; int64_t index;}` — constructed per element.
+**PyTorch approach:** Two independent scalars `T best_val` + `int64_t best_idx`, index written
+only when value strictly improves.
+
+**Status after Change 10 (this session):** Fixed on CPU. GPU unchanged (struct overhead = 0
+on GPU since warp shuffle already operates field-by-field). NaN check reduced from 2 to 1
+per element using IEEE 754 property.
+
+### Part 4 — Boolean ops
+`reduce_all`, `reduce_any`
+
+These ops use `bool` as accumulator type — `AllOp` (AND) and `AnyOp` (OR). The accumulator
+type was already correct (`AccT = bool`). The missing feature was **early exit**:
+- `AND(false, x) = false` for all x
+- `OR(true, x) = true` for all x
+
+Once the result is determined, continuing the inner loop is pure wasted work.
+
+**Status after Change 11 (this session):** Fixed on CPU with `break`. GPU intentionally has no
+short-circuit (SIMT lockstep). Matches PyTorch CPU behaviour.
+
+### Part 5 — Statistical ops
+`reduce_mean`, `reduce_variance`, `reduce_std`, `reduce_nanmean`, `reduce_nanvar`, `reduce_nanstd`
+
+These ops have both a summation phase (uses Part 1 accumulator) and additional logic:
+- **mean**: sum ÷ count
+- **variance**: Σ(xi - mean)² ÷ (count - correction)
+- **std**: sqrt(variance)
+
+**GPU problem found in this session:** `reduce_mean_kernel` used hardcoded `double` for all
+non-complex types. Fixed in Change 12. CPU integer path intentionally stays Float64 (Change 13).
+
+**Pending:** `reduce_std` GPU currently calls sqrt on the float variance result. Correct
+but documented as needing review if precision edge cases arise.
+
+---
+
 ## Part 5 — Comparison with PyTorch and TensorFlow
 
 ### PyTorch
@@ -335,7 +710,11 @@ template <> struct AccumulatorType<Eigen::bfloat16>    { typedef float type; }; 
 - If a developer writes a new kernel and forgets the struct, it silently accumulates in the input type.
 - No overflow protection for integers anywhere.
 
-### master_gau (current, after changes)
+### master_gau (current, after all changes)
+
+Accumulator type depends on **both the input dtype AND the operation**:
+
+**For sum / product / mean / variance (arithmetic ops — can overflow):**
 
 | Input | CPU Accumulator | GPU Accumulator |
 |-------|----------------|----------------|
@@ -356,6 +735,22 @@ template <> struct AccumulatorType<Eigen::bfloat16>    { typedef float type; }; 
 | \_\_half (CUDA) | float | float |
 | \_\_nv_bfloat16 (CUDA) | float | float |
 
+**For min / max / nanmin / nanmax (compare ops — output always within input range):**
+
+| Input | CPU Accumulator | GPU Accumulator | Output dtype |
+|-------|----------------|----------------|--------------|
+| int8_t | **int8_t** | **int8_t** | Int8 |
+| int16_t | **int16_t** | **int16_t** | Int16 |
+| int32_t | **int32_t** | **int32_t** | Int32 |
+| int64_t | int64_t | int64_t | Int64 |
+| uint8_t | **uint8_t** | **uint8_t** | UInt8 |
+| uint32_t | **uint32_t** | **uint32_t** | UInt32 |
+| float | **float** | **float** | Float32 |
+| float16_t | **float16_t** | **float16_t** | Float16 |
+| double | double | double | Float64 |
+
+(Bold = changed from the old state where these all used widened types)
+
 **How master_gau compares:**
 
 | Feature | PyTorch | TensorFlow | master_gau |
@@ -364,12 +759,19 @@ template <> struct AccumulatorType<Eigen::bfloat16>    { typedef float type; }; 
 | Device-parameterized | Yes (`is_cuda`) | No | Yes (`IsGPU`) |
 | float CPU accumulator | double | float | **double** |
 | float GPU accumulator | float | float | float |
+| mean GPU accumulator | float | float | **float** (was double, fixed Change 12) |
 | half/bf16 accumulator | float | float | float |
 | int overflow protection | int64_t | none | int64_t |
 | unsigned overflow | not supported | not supported | **uint64_t** |
 | bool accumulator | bool | not handled | int64_t |
+| bool short-circuit CPU | Yes | No | **Yes** (Change 11) |
+| bool short-circuit GPU | No (SIMT) | No | No (SIMT limitation) |
 | complex promotion | complex\<double\> on CPU | none | none (stays same) |
 | Kahan summation | Yes, higher-level | No | Removed (double acc replaces it) |
+| argmin/argmax CPU impl | 2-variable scalars | 2-variable scalars | **2-variable** (was struct, fixed Change 10) |
+| argmin/argmax GPU impl | struct (ValueIndex equiv.) | separate fields | struct (ValueIndex, unchanged — zero overhead) |
+| int mean CPU output | not supported (throws) | float32 | **Float64** (exact, free on CPU) |
+| int mean GPU output | not supported (throws) | float32 | **Float32** (32× faster than float64 on GPU) |
 
 ---
 
@@ -484,9 +886,40 @@ Section 6: 1/1   — float16 accumulates in float correctly
 - Symptom: Large float32 sums had relative error ~O(N × 1.2e-7), visible on N > 100k
 - Fix: Added `template<> struct AccumulatorTypeSelector<float, false> { using type = double; };`
 
+**Bug B5: compare ops (min/max) using widened accumulator unnecessarily**
+- Location: `include/ops/helpers/ReductionOps.h` — `MinOp`, `MaxOp`, `NanMinOp`, `NanMaxOp`
+- Symptom (correctness): `reduce_min<int32>` returned Int64 tensor instead of Int32. Output dtype was wrong — PyTorch returns the same dtype as input for min/max.
+- Symptom (performance): 1 extra MOVSX per element on CPU; 2–4× slower comparison instruction on pre-Volta GPUs (int64 emulated as 2 × 32-bit ops on Pascal/Maxwell/Kepler).
+- Fix: Changed `using AccT = AccumulatorType<T>` → `using AccT = T` in all 4 compare op structs. Cascaded fixes to output dtype, `OutputCppT`, accumulator init block, GPU kernel accumulator type, GPU dispatcher output dtype, and GPU shared memory size calculation.
+
+**Bug B6: PackedMetadata `cudaHostAlloc` per-call overhead**
+- Location: `src/UnaryOps/cuda/ReductionImplGPU.cu`, `PackedMetadata` constructor/destructor
+- Symptom: Every reduction call paid ~300+ µs for `cudaHostAlloc` + `cudaFreeHost` driver round-trips regardless of tensor size. The CUDA driver acquires a global device-context lock on each call.
+- Fix: Replaced `PinnedCPUAllocator` (pinned buffer) with a local `std::vector<int64_t>` (pageable heap). For tiny metadata buffers, CUDA's internal staging costs ~1–2 µs — far below the driver lock overhead.
+
+**Bug B7: GPU mean kernel hardcoded `double` accumulator for all non-complex types**
+- Location: `include/ops/helpers/ReductionKernels.cuh` `reduce_mean_kernel`, line ~536; `src/UnaryOps/cuda/ReductionImplGPU.cu` `dispatch_mean_gpu` and `dispatch_variance_gpu`
+- Symptom: `mean<float>` on GPU was 32× slower than necessary. `mean<int32>` was also 32× slower. Output was `Float64` for integer tensors — unintentional, inconsistent with GPU's FP32 preference.
+- Root cause: `using AccT = ... double` hardcoded without considering that FP64 = 1/32 FP32 on consumer GPUs (Pascal/Turing/Ada).
+- Fix: Changed to `float` for all non-double, non-complex types. `dispatch_mean_gpu` now outputs `Float32` for integers. `dispatch_variance_gpu` cascade-updated to match (MeanCppT, OutputCppT, AccCppT all changed to float for integral T).
+- Also fixed: `shared_mem_size` in `dispatch_mean_gpu` was using `sizeof(double)` for AccT allocation — changed to `mean_acc_size` (4 bytes for float, 8 for double) so shared memory is not over-allocated.
+
+**Bug B8: CPU index ops (argmin/argmax) — 2 NaN checks per element in hot path, struct overhead**
+- Location: `include/ops/helpers/ReductionOps.h` (ArgMinOp/ArgMaxOp reduce method), `include/ops/helpers/ReductionImpl.h` (CPU index path)
+- Symptom: Two `is_nan_check()` calls per element in all code paths (hot path with no NaN data). Also struct `ValueIndex<T>` constructed on stack per element.
+- Fix: Added `better_than()` using IEEE 754 property (NaN < x = false eliminates the need for a second check when current_best is NaN). Changed CPU loop from struct-based to 2-variable scalars. Result: 1 NaN check in hot path instead of 2, no struct construction per element.
+
 ---
 
 ## Part 8 — Pending work
+
+### Completed in this session (were in earlier pending list)
+
+- **Index ops 2-variable approach**: Done (Change 10). CPU path now uses `T best_val` + `int64_t best_idx`.
+- **Short-circuit for reduce_all/reduce_any**: Done (Change 11). `break` on first determination.
+- **GPU mean double accumulator**: Done (Change 12). Now `float` for all non-double, non-complex types.
+- **Integer mean/variance GPU output dtype**: Done (Float32 instead of Float64 on GPU).
+- **CPU/GPU consistency analysis**: Done (Change 13). CPU stays Float64 (free precision), GPU Float32 (hardware constraint). Documented.
 
 ### Pending: pairwise (tree) reduction to replace sequential loop
 
@@ -530,13 +963,34 @@ Fix: reload the window or clear the IntelliSense cache (Ctrl+Shift+P → "C/C++:
 
 ## Part 9 — File summary
 
-| File | Change |
-|------|--------|
-| `include/ops/helpers/ReductionOps.h` | Replaced 1-param struct with 2-param `IsGPU` struct; added float→double on CPU; unsigned → uint64_t; int8_t added; renamed `G` → `IsGPU` |
-| `include/ops/helpers/ReductionImpl.h` | Removed Kahan summation entirely (use_kahan constexpr + entire if-constexpr block) |
-| `include/ops/helpers/ReductionKernels.cuh` | Replaced inline conditional_t chain with `detail::AccumulatorType<T, /*IsGPU=*/true>` |
+| File | All changes |
+|------|-------------|
+| `include/ops/helpers/ReductionOps.h` | Replaced 1-param struct with 2-param `IsGPU` struct; float→double on CPU; unsigned→uint64_t; int8_t added; renamed `G`→`IsGPU`; **MinOp/MaxOp/NanMinOp/NanMaxOp AccT = T**; **ArgMinOp/ArgMaxOp/NanArgMinOp/NanArgMaxOp: added `identity_val()` + `better_than()` (CPU 2-variable helpers)**; **AllOp/AnyOp: added `can_short_circuit()`** |
+| `include/ops/helpers/ReductionImpl.h` | Removed Kahan summation; output dtype + OutputCppT + accumulator init updated for compare ops; **CPU index path replaced: ValueIndex struct → 2-variable `best_val`/`best_idx`**; **bool path inner loop: added `break` for short-circuit**; **CPU integer mean comment: Float64 output is intentional (free precision, documented asymmetry vs GPU Float32)** |
+| `include/ops/helpers/ReductionKernels.cuh` | Replaced inline conditional_t chain with unified struct; compare ops branch to T; **`reduce_mean_kernel` AccT: `double`→`float` for non-double, non-complex types** |
 | `include/core/TensorDispatch.h` | Added `case Dtype::Int8:` to both dispatch switch statements |
-| `src/UnaryOps/cuda/ReductionImplGPU.cu` | Added 9 explicit template instantiations for int8_t |
+| `src/UnaryOps/cuda/ReductionImplGPU.cu` | Added 9 int8_t instantiations; removed `__cxa_demangle` debug call; removed `cudaHostAlloc` pinned buffer → `std::vector`; output dtype + OutputCppT + shared_mem_size updated for compare ops; **`dispatch_mean_gpu`: output dtype Float64→Float32 for integers, `OutputCppT` double→float, `shared_mem_size` `sizeof(double)`→`mean_acc_size`**; **`dispatch_variance_gpu`: output dtype Float64→Float32, `MeanCppT` double→float, `OutputCppT` double→float, `AccCppT` double→float for integral T** |
 | `Tests/ReductionsTests/accumulator_type_test.cpp` | New file: 22 tests across 6 sections |
 | `Tests/ReductionsTests/kahan_precision_test.cpp` | Existing file: precision+timing baseline vs after changes |
 | `Tests/ReductionsTests/baseline_before_changes.txt` | Saved precision baseline (Kahan active, float accumulator) |
+
+---
+
+## Part 10 — Summary of all design decisions and why
+
+| Decision | Chosen approach | Alternatives considered | Reason |
+|----------|----------------|------------------------|--------|
+| float CPU accumulator | `double` | Keep `float`, use Kahan | Double more precise than Kahan, no overhead on CPU |
+| float GPU accumulator | `float` | `double` | GPU FP64 = 1/32 FP32 on consumer hardware |
+| compare ops AccT | `T` (no widening) | Keep `AccumulatorType<T>` | Compare ops can never overflow; widening gave wrong output dtype |
+| unsigned AccT | `uint64_t` | Keep `int64_t` | uint64 values > INT64_MAX would become negative in int64 |
+| index ops CPU | 2 scalars (`best_val`/`best_idx`) | Keep `ValueIndex<T>` struct | ~2–3 fewer instructions/element; struct overhead = 0 on GPU |
+| index ops GPU | Keep `ValueIndex<T>` unchanged | 2 scalars | Warp shuffle already operates field-by-field; struct overhead is zero |
+| NaN check in `better_than` | 1 check (IEEE 754 trick) | 2 checks | `NaN < x = false` (IEEE) means current_best=NaN case handled by comparison itself |
+| bool short-circuit | `break` in CPU inner loop | None (full traversal) | Once AND=false or OR=true the result is determined; O(1) branch overhead |
+| bool short-circuit GPU | Not implemented | Implement via atomic | SIMT lockstep: all threads in warp execute same instruction; `break` would diverge |
+| mean kernel AccT (GPU) | `float` for non-double | `double` | 32× faster on consumer hardware; matches PyTorch `opmath_type` |
+| int mean CPU output dtype | `Float64` | `Float32` for consistency | FP64 division is free on CPU (~6 cycle difference, 1 op per output element not per input element) |
+| int mean GPU output dtype | `Float32` | `Float64` | FP64 = 32× slower on GPU; CPU's Float64 is intentionally different |
+| "cast before" vs "cast at load" | Cast at load (inside reduction loop) | Allocate new float tensor first | No extra memory allocation; int64 accumulation is more precise than float; same cost |
+| Kahan summation | Removed | Keep Kahan, add double too | Double accumulation is strictly better for catastrophic cancellation; Kahan has serial dependency chain |

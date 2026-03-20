@@ -155,5 +155,572 @@ then immediately throws the result away (the variable was never read). Removed e
 
 ---
 
+### 1.10 PackedMetadata Host Buffer — `cudaHostAlloc` Replaced by `std::vector`
+**(File: `src/UnaryOps/cuda/ReductionImplGPU.cu`, Lines 36–123)**
+
+**Problem before:**
+The `PackedMetadata` constructor allocated its host-side staging buffer via `PinnedCPUAllocator`,
+which internally calls `cudaHostAlloc` (page-locked / pinned memory). This had two costs every
+single reduction call:
+1. `cudaHostAlloc` — the CUDA driver acquires a **global device-context lock** on every call.
+   Cost: **~100–200 µs per call** regardless of allocation size.
+2. `cudaFreeHost` in the destructor — same lock again on teardown.
+
+Additionally, `cudaStreamSynchronize(stream)` was called after the `cudaMemcpyAsync` — this
+blocked the CPU thread until the DMA engine finished copying. This was **redundant** because
+the memcpy and the subsequent kernel launch are submitted to the same stream; CUDA already
+guarantees ordering. (Already commented out by the user before this fix.)
+
+**State of host buffer before (lines ~78–79, ~118):**
+```cpp
+// BEFORE — per-call cudaHostAlloc
+device::PinnedCPUAllocator pinned_allocator;
+h_ptr = static_cast<int64_t*>(pinned_allocator.allocate(total_bytes)); // ← ~150µs driver lock
+...
+if(h_ptr) device::PinnedCPUAllocator().deallocate(h_ptr);              // ← ~150µs driver lock
+```
+
+**Fix applied (lines ~77–79):**
+```cpp
+// AFTER — normal heap allocation, nanoseconds
+// PinnedCPUAllocator used cudaHostAlloc which takes a global device-context
+// lock on every call (~100-200µs, see PinnedCPUAllocator.cpp TODO). For tiny metadata buffers,
+// CUDA's internal staging of pageable memory is only ~1-2µs — far cheaper than the driver lock.
+std::vector<int64_t> h_buf(total_size);
+```
+
+`h_buf` is a local `std::vector`. It is automatically destroyed (RAII) when the constructor
+returns — no destructor cleanup needed. `cudaMemcpyAsync` now reads from `h_buf.data()`.
+
+**Files changed:**
+- Removed: `#include "device/PinnedCPUAllocator.h"` → replaced with `#include <vector>`
+- Removed: `int64_t* h_ptr` member from the class (line 39)
+- Constructor: replaced `pinned_allocator.allocate(total_bytes)` → `std::vector<int64_t> h_buf(total_size)` (line 79)
+- Constructor: `pack` lambda now writes to `h_buf.data()` instead of `h_ptr` (line 85)
+- Constructor: `cudaMemcpyAsync` source now `h_buf.data()` instead of `h_ptr` (line 99)
+- Destructor: removed `if(h_ptr) PinnedCPUAllocator().deallocate(h_ptr)` (line 118)
+
+**Cost trade-off:**
+| | Before (pinned) | After (pageable) |
+|---|---|---|
+| Host alloc | ~150 µs (`cudaHostAlloc` driver lock) | ~50 ns (`malloc` in `std::vector`) |
+| DMA transfer | ~0 µs (direct DMA, no staging) | ~1–2 µs (CUDA internal staging) |
+| Host free | ~150 µs (`cudaFreeHost` driver lock) | ~0 ns (RAII, stack unwind) |
+| **Net per call** | ~300+ µs | **~2 µs** |
+
+The CPU packing step (5 × `std::copy` of tiny vectors into `h_buf`) is pure L1-cache work — tens
+of nanoseconds total — and is identical in both before and after.
+
+---
+
+### 1.11 Compare Ops (Min / Max) — Accumulator Bypasses `AccumulatorTypeSelector`
+**(Files: `include/ops/helpers/ReductionOps.h`, `include/ops/helpers/ReductionImpl.h`,
+`include/ops/helpers/ReductionKernels.cuh`, `src/UnaryOps/cuda/ReductionImplGPU.cu`)**
+
+**Problem before:**
+The unified accumulator system (change 1.7) promoted ALL integer types to `int64_t` and `float`
+to `double` (CPU). This was correct for `SumOp` and `ProductOp` where arithmetic overflow is
+a real risk. But `MinOp`, `MaxOp`, `NanMinOp`, `NanMaxOp` are **compare-only** — the result is
+always one of the input values and can never exceed the input type's range. There is no
+mathematical reason to widen for comparison.
+
+The unnecessary widening had measurable costs:
+- **CPU**: `MOVSX` (sign-extend) per element + one narrowing cast at output ≈ 1 extra instruction
+  per element through the inner loop.
+- **GPU (Pascal/Maxwell/Kepler, pre-Volta)**: 64-bit integer operations are emulated as 2 × 32-bit
+  instructions on these architectures. `int32_t` comparison used `int64_t` accumulator →
+  **2–4× slower** comparison instruction for those GPUs.
+- **GPU (Volta+, SM 7.0+)**: 64-bit integer is natively supported. Overhead was ~zero.
+- **Output dtype wrong**: integer min/max was returning `Int64` tensor instead of the input dtype
+  (e.g., `reduce_min<int32_t>` returned Int64). PyTorch/NumPy return Int32 — the input dtype.
+
+**Ops affected**: `reduce_min`, `reduce_max`, `reduce_nanmin`, `reduce_nanmax` on all integer
+and float types. `reduce_sum`, `reduce_mean`, `reduce_product`, variance — **unchanged**.
+
+---
+
+**Change A — `ReductionOps.h` (lines 412–413, 458–459, 588–589, 632–633):**
+
+Changed `AccT` in all 4 compare op structs from `AccumulatorType<T>` to `T` directly:
+```cpp
+// BEFORE (MinOp, MaxOp, NanMinOp, NanMaxOp all had):
+using AccT = AccumulatorType<T>;   // int32 → int64_t, float(CPU) → double
+
+// AFTER:
+using AccT = T;   // compare op: result always within input range, no widening needed
+```
+`SumOp`, `ProductOp`, `NanSumOp`, `VarianceOp` — **AccT unchanged**, still use `AccumulatorType<T>`.
+
+---
+
+**Change B — `ReductionImpl.h` (CPU kernel, 3 sub-changes):**
+
+**(B1) Output dtype (line ~123):**
+```cpp
+// BEFORE — all integer types widened to Int64:
+} else if constexpr (std::is_integral_v<T>) {
+    output_dtype = Dtype::Int64;
+
+// AFTER — only when accumulator is wider than T (sum/product):
+} else if constexpr (std::is_integral_v<T> && !std::is_same_v<AccT, T>) {
+    output_dtype = Dtype::Int64;  // sum/product: AccT widened → output must widen
+}
+// if AccT == T (min/max), falls to else: output_dtype = input.dtype() (Int32 stays Int32)
+```
+
+**(B2) `OutputCppT` determination (lines ~148–156):**
+```cpp
+// BEFORE:
+using OutputCppT = ... std::is_integral_v<T> → int64_t ...
+
+// AFTER:
+using OutputCppT = typename std::conditional<
+    std::is_same_v<AccT, ValueIndex<T>>,
+    int64_t,
+    typename std::conditional<
+        std::is_integral_v<T> && !std::is_same_v<AccT, T>,
+        int64_t,   // sum/product: AccT widened → output is int64
+        T          // min/max (AccT==T) and floats: output same as input
+    >::type
+>::type;
+```
+
+**(B3) Accumulator initializer simplification (lines ~238–249):**
+
+The old init had a 3-branch chain that hard-coded conversions to `double` or `int64_t` based on
+the input type `T`. With `AccT = T` for compare ops this was wrong (narrowing conversions).
+Replaced with a single universal cast:
+```cpp
+// BEFORE:
+if constexpr (should_use_double_accumulation<T>()) {
+    accumulator = static_cast<double>(op.identity());   // assumed AccT = double/float
+} else if constexpr (std::is_integral_v<T>) {
+    accumulator = static_cast<int64_t>(op.identity()); // assumed AccT = int64_t
+} else {
+    accumulator = op.identity();
+}
+
+// AFTER — works for all ops since AccumulatorT is already the correct type:
+} else {
+    accumulator = static_cast<AccumulatorT>(op.identity());
+}
+// - sum int32 (AccT=int64): static_cast<int64_t>(0)      ✓
+// - min int32 (AccT=int32): static_cast<int32_t>(INT32_MAX) ✓ (no-op)
+// - sum float16 (AccT=float): static_cast<float>(float16(0)) ✓
+// - min float16 (AccT=float16): static_cast<float16>(float16(MAX)) ✓ (no-op)
+```
+
+---
+
+**Change C — `ReductionKernels.cuh` (GPU kernel, line ~182):**
+```cpp
+// BEFORE — single line, no op awareness:
+using AccumulatorType = detail::AccumulatorType<T, /*IsGPU=*/true>;
+
+// AFTER — compare ops use T directly, others use the centralized selector:
+using AccumulatorType = std::conditional_t<
+    std::is_same_v<OpType<T>, detail::MinOp<T>>    ||
+    std::is_same_v<OpType<T>, detail::MaxOp<T>>    ||
+    std::is_same_v<OpType<T>, detail::NanMinOp<T>> ||
+    std::is_same_v<OpType<T>, detail::NanMaxOp<T>>,
+    T,
+    detail::AccumulatorType<T, /*IsGPU=*/true>
+>;
+```
+
+---
+
+**Change D — `ReductionImplGPU.cu` (GPU dispatcher, lines ~156–219):**
+
+**(D1) Added `is_compare_op` constexpr (line ~156):**
+```cpp
+constexpr bool is_compare_op =
+    std::is_same_v<OpType<T>, detail::MinOp<T>>    ||
+    std::is_same_v<OpType<T>, detail::MaxOp<T>>    ||
+    std::is_same_v<OpType<T>, detail::NanMinOp<T>> ||
+    std::is_same_v<OpType<T>, detail::NanMaxOp<T>>;
+```
+
+**(D2) Output dtype (line ~167):**
+```cpp
+} else if constexpr (std::is_integral_v<T> && !is_compare_op) {
+    output_dtype = Dtype::Int64;   // sum/product: widens
+} else {
+    output_dtype = input.dtype(); // min/max: stays same as input
+}
+```
+
+**(D3) `OutputCppT` (line ~225):**
+```cpp
+using OutputCppT = std::conditional_t<
+    std::is_integral_v<T> && !is_compare_op,
+    int64_t,   // sum/product
+    T          // min/max and floats
+>;
+```
+
+**(D4) Shared memory size (line ~213):**
+
+Shared memory for warp-level accumulator reduction was hard-coded to `sizeof(int64_t)` for all
+integer types. After the fix, compare ops need only `sizeof(T)`:
+```cpp
+// BEFORE:
+if constexpr (std::is_integral_v<T>) {
+    shared_mem_size = (threads_per_block / 32) * sizeof(int64_t);  // all integers
+
+// AFTER:
+if constexpr (std::is_integral_v<T> && is_compare_op) {
+    shared_mem_size = (threads_per_block / 32) * sizeof(T);        // min/max: uses T
+} else if constexpr (std::is_integral_v<T>) {
+    shared_mem_size = (threads_per_block / 32) * sizeof(int64_t);  // sum/product: uses int64
+```
+For int32 min/max with 256 threads: shared memory per block = `(256/32) × 4 = 32 bytes`
+instead of `(256/32) × 8 = 64 bytes`. Halved shared memory usage for those ops.
+
+---
+
+**Before vs After summary:**
+
+| Op | dtype | Before: accumulator | After: accumulator | Before: output dtype | After: output dtype |
+|----|-------|---------------------|--------------------|----------------------|---------------------|
+| reduce_min | int32_t | int64_t | **int32_t** | Int64 | **Int32** |
+| reduce_max | int32_t | int64_t | **int32_t** | Int64 | **Int32** |
+| reduce_min | int8_t  | int64_t | **int8_t**  | Int64 | **Int8**  |
+| reduce_min | float   | double (CPU) | **float** | Float32 | Float32 |
+| reduce_min | float16 | float   | **float16** | Float16 | Float16 |
+| reduce_sum | int32_t | int64_t | int64_t (unchanged) | Int64 | Int64 |
+| reduce_sum | float   | double (CPU) | double (CPU, unchanged) | Float32 | Float32 |
+
+**PyTorch and TensorFlow both follow the same rule**: min/max use the input type directly as
+accumulator, not a promoted type. This change brings master_gau in line with both frameworks
+for compare ops.
+
+---
+
+---
+
+### 1.12 Index Reductions — 2-Variable Approach (PyTorch-Style)
+**(Files: `include/ops/helpers/ReductionOps.h`, `include/ops/helpers/ReductionImpl.h`)**
+
+**Background — the 5-part ops classification:**
+All 22 reduction ops were split into 5 groups to analyze each group's accumulator behaviour
+separately and compare against PyTorch / TensorFlow:
+
+| Part | Ops | Issue |
+|------|-----|-------|
+| 1 | sum, product, nansum, nanproduct | Use `AccumulatorType<T>` — correct, already fixed in changes 1.6–1.7 |
+| 2 | min, max, nanmin, nanmax | Were using widened accumulator — fixed in change 1.11 |
+| 3 | argmin, argmax, nanargmin, nanargmax | Were using `ValueIndex<T>` struct per element — fixed here |
+| 4 | reduce_all, reduce_any | Missing short-circuit early exit — fixed in change 1.13 |
+| 5 | mean, variance, std, nanmean, nanvar, nanstd | GPU was using slow `double` — fixed in change 1.14 |
+
+**Problem (Part 3 — index ops):**
+The CPU `reduce_kernel` index path used `ValueIndex<T>` struct (`{ T value; int64_t index; }`) to
+bundle both the running best value and its index. Per element this required:
+1. Constructing a new `ValueIndex<T> current_val_index = {input_value, i}` on the stack
+2. Calling `op.reduce(accumulator, current_val_index)` which returns a whole struct
+3. Storing the full struct back into `accumulator`
+
+PyTorch uses two independent scalar variables `T best_val` + `int64_t best_idx` and only
+updates `best_idx` when `best_val` changes. This avoids struct construction per element and
+makes the index update conditional (often NOT taken in practice), eliminating ~2–3 extra
+instructions per element on CPU.
+
+**Note**: GPU `reduce_index_kernel` in `ReductionKernels.cuh` already shuffles `ValueIndex<T>`
+fields **separately** in warp-level reduction:
+```cpp
+other.value = shfl_down(accumulator.value, offset);
+other.index = shfl_down(accumulator.index, offset);
+```
+So the struct overhead is effectively zero on GPU (both fields live in registers). GPU was
+**left unchanged** — the optimization is CPU-only.
+
+**Changes made:**
+
+**(A) `ReductionOps.h` — added two new methods to all 4 index ops:**
+
+```cpp
+// ArgMinOp (same pattern for ArgMaxOp, NanArgMinOp, NanArgMaxOp):
+
+// CPU 2-variable path: initial sentinel value
+T identity_val() const { return get_max_value<T>(); }
+
+// CPU 2-variable path: returns true if candidate should replace current_best.
+// Uses IEEE 754 property: any comparison involving NaN returns false.
+// So (NaN < x) = false, meaning if current_best is NaN the comparison below
+// naturally returns false and NaN sticks — no 2nd is_nan_check needed.
+// Hot path (all-finite data): only 1 is_nan_check per element (on candidate).
+bool better_than(const T& candidate, const T& current_best) const {
+    if constexpr (is_any_float_v<T>) {
+        if (is_nan_check(candidate)) return !is_nan_check(current_best);
+    }
+    return candidate < current_best;   // ArgMin
+    // return candidate > current_best;  // ArgMax variant
+}
+```
+
+**NaN semantics per op:**
+
+| Op | NaN rule | `better_than` logic |
+|----|----------|---------------------|
+| `ArgMinOp` | NaN propagates (first NaN wins) | If candidate=NaN: take it only if current isn't NaN yet |
+| `ArgMaxOp` | NaN propagates (first NaN wins) | Same |
+| `NanArgMinOp` | NaN is **skipped** (ignored) | `if (is_nan_check(candidate)) return false;` — skip always |
+| `NanArgMaxOp` | NaN is **skipped** (ignored) | Same |
+
+**NaN check count comparison (float T):**
+
+| Version | Hot path (no NaN) | After first NaN found |
+|---------|------------------|-----------------------|
+| Old (`ValueIndex` struct) | 2 checks inside `reduce()` | 2 checks |
+| New (`better_than`) | **1 check** | **1 check** (IEEE short-circuits the comparison) |
+
+**(B) `ReductionImpl.h` — CPU index path replaced (lines ~197–238):**
+
+```cpp
+// BEFORE — struct construction per element:
+ValueIndex<T> accumulator = op.identity();
+for (int64_t i = 0; i < reduced_count; ++i) {
+    // ... coordinate mapping (unchanged) ...
+    T input_value = input_data[input_lin_idx];
+    ValueIndex<T> current_val_index = {input_value, i};   // ← struct per element
+    accumulator = op.reduce(accumulator, current_val_index); // ← full struct return
+}
+output_data[output_index] = accumulator.index;
+
+// AFTER — 2 scalars, index only written on improvement:
+T best_val = op.identity_val();
+int64_t best_idx = -1;
+for (int64_t i = 0; i < reduced_count; ++i) {
+    // ... coordinate mapping (unchanged) ...
+    T input_value = input_data[input_lin_idx];
+    if (op.better_than(input_value, best_val)) {  // ← conditional: often NOT taken
+        best_val = input_value;
+        best_idx = i;
+    }
+}
+output_data[output_index] = best_idx;
+```
+
+**Benefits:**
+- ~2–3 fewer instructions per element on CPU
+- No struct construction in the hot path
+- `best_idx` write is conditional — the CPU branch predictor handles "no update needed" at near-zero cost for nearly-sorted or highly-duplicate data
+- `best_val` stays in a register (scalar), not a struct member — fewer memory operations
+
+**Decision vs PyTorch:** PyTorch uses the same 2-variable pattern. TensorFlow uses a similar 2-variable approach for reduction with separate value/index tracking. GPU code left as-is — struct overhead is zero there.
+
+---
+
+### 1.13 Short-Circuit for `reduce_all` / `reduce_any` (CPU)
+**(Files: `include/ops/helpers/ReductionOps.h`, `include/ops/helpers/ReductionImpl.h`)**
+
+**Problem (Part 4 — bool ops):**
+`reduce_all` and `reduce_any` were traversing the entire reduced dimension even when the result
+was already determined:
+- `AllOp` (AND): once any element is `false`, the result is `false` — remaining elements cannot change this
+- `AnyOp` (OR): once any element is `true`, the result is `true` — remaining elements cannot change this
+
+For a large tensor where the first element satisfies the early-exit condition, we were doing
+`O(reduced_count)` work instead of `O(1)`.
+
+PyTorch's CPU kernel explicitly uses `break` for bool reductions. GPU cannot short-circuit
+(SIMT lockstep — all threads in a warp execute together regardless).
+
+**Changes made:**
+
+**(A) `ReductionOps.h` — added `can_short_circuit()` to AllOp and AnyOp:**
+
+```cpp
+template <typename T>
+struct AllOp {
+    using AccT = bool;
+    DEVICE_HOST bool identity() const { return true; }
+    DEVICE_HOST bool reduce(const bool& a, const bool& b) const { return a && b; }
+
+    // CPU short-circuit: once accumulator is false, AND can never recover — stop.
+    bool can_short_circuit(bool acc) const { return !acc; }
+};
+
+template <typename T>
+struct AnyOp {
+    using AccT = bool;
+    DEVICE_HOST bool identity() const { return false; }
+    DEVICE_HOST bool reduce(const bool& a, const bool& b) const { return a || b; }
+
+    // CPU short-circuit: once accumulator is true, OR can never go back — stop.
+    bool can_short_circuit(bool acc) const { return acc; }
+};
+```
+
+`can_short_circuit` is NOT marked `DEVICE_HOST` — it is intentionally CPU-only. GPU kernels
+never call it. The method inlines to a single instruction (`!acc` or `acc`).
+
+**(B) `ReductionImpl.h` — added `break` in the bool path inner loop (lines ~285–291):**
+
+```cpp
+} else if constexpr (std::is_same_v<AccT, bool>) {
+    bool val_as_bool = to_bool_value(input_value);
+    accumulator = op.reduce(accumulator, val_as_bool);
+    // Short-circuit: AllOp exits on first false, AnyOp on first true.
+    // Safe because the inner loop is sequential (not GPU/SIMT).
+    if (op.can_short_circuit(accumulator)) break;
+}
+```
+
+The `break` exits the `for (int64_t i = 0; i < reduced_count; ++i)` loop.
+This is safe because:
+1. The inner loop is sequential (not parallelized — OpenMP is on the outer `output_index` loop)
+2. `AND(false, x) = false` and `OR(true, x) = true` for all x — the accumulated result cannot
+   change after the short-circuit condition is met
+
+**Overhead when NOT short-circuiting (worst case — condition never met):**
+`can_short_circuit(acc)` compiles to a single conditional branch per element.
+The CPU branch predictor will predict "not taken" after the first few iterations. Cost ≈ 0.
+No measurable overhead in the steady state.
+
+**Savings when short-circuiting (best case):**
+For `reduce_all` on a tensor where element 0 is false: saves `reduced_count - 1` iterations.
+For `reduce_any` on a tensor where element 0 is true: same.
+
+**Decision vs PyTorch:** PyTorch uses the identical `break` pattern on CPU. This change matches PyTorch behaviour exactly.
+
+---
+
+### 1.14 GPU Mean / Variance — Hardcoded `double` Accumulator Replaced by `float`
+**(Files: `include/ops/helpers/ReductionKernels.cuh`, `src/UnaryOps/cuda/ReductionImplGPU.cu`)**
+
+**Problem (Part 5 — statistical ops, GPU side):**
+`reduce_mean_kernel` in `ReductionKernels.cuh` had a hardcoded `double` accumulator for **all**
+non-complex types, including `float`, `half`, `bfloat16`, and all integer types:
+
+```cpp
+// BEFORE — double for EVERYTHING (wrong for all non-double types on GPU):
+using AccT = typename std::conditional_t<
+    is_complex,
+    typename std::conditional_t<std::is_same_v<T, complex32_t>, complex64_t, complex128_t>,
+    double    // ← ALL non-complex types used double accumulator
+>;
+```
+
+On consumer GPUs (GeForce, RTX up to 4090, Tesla T4, etc.), FP64 throughput is a small fraction
+of FP32:
+
+| GPU generation | FP64 / FP32 ratio |
+|---------------|-------------------|
+| Kepler / Maxwell / Pascal | 1 / 32 or 1 / 64 |
+| Turing (RTX 20xx) | 1 / 32 |
+| Ampere A100 (datacenter) | 1 / 2 |
+| Ada Lovelace RTX 40xx | 1 / 64 |
+
+Using `double` for `mean<float>` was making the GPU kernel **32–64× slower** on consumer hardware
+for no precision benefit (the output was still cast back to `float`).
+
+The same problem existed in `dispatch_mean_gpu` and `dispatch_variance_gpu` in `ReductionImplGPU.cu`:
+output dtype was `Float64` for integer inputs, `OutputCppT = double`, `AccCppT = double`.
+
+**The user's question that identified this:** "u said double is slow, what pytorch is using? float
+right? then why are we using double?"
+
+**PyTorch's approach:** `opmath_type<T>` for GPU: `half → float`, `bfloat16 → float`, `float → float`,
+`double → double`. All non-double, non-complex types → `float`. This is exactly what we changed to.
+
+**Changes made:**
+
+**(A) `ReductionKernels.cuh` — `reduce_mean_kernel` AccT (line ~536):**
+
+```cpp
+// BEFORE:
+using AccT = std::conditional_t<is_complex, ..., double>;  // double for ALL
+
+// AFTER:
+using AccT = std::conditional_t<
+    is_complex,
+    std::conditional_t<std::is_same_v<T, complex32_t>, complex64_t, complex128_t>,
+    std::conditional_t<std::is_same_v<T, double>, double, float>
+    // double input → double accumulator; everything else (float, half, int*) → float
+>;
+```
+
+**(B) `ReductionImplGPU.cu` — `dispatch_mean_gpu` (lines ~374–425):**
+
+| What changed | Before | After |
+|---|---|---|
+| `output_dtype` for integral T | `Dtype::Float64` | `Dtype::Float32` |
+| `shared_mem_size` acc part | `num_warps * sizeof(double)` | `num_warps * mean_acc_size` where `mean_acc_size = is_same_v<T,double> ? 8 : 4` |
+| `OutputCppT` for integral T | `double` | `float` |
+
+Comment added to explain the intentional device difference:
+```cpp
+// Float32 is 32x faster than Float64 on consumer GPUs (FP64 = 1/32 FP32 on Pascal/Turing).
+// PyTorch uses float (opmath_type) for integer reductions.
+// CPU uses Float64 for exact integer arithmetic — GPU trades some precision for 32x speed.
+```
+
+**(C) `ReductionImplGPU.cu` — `dispatch_variance_gpu` (lines ~477–552):**
+
+| What changed | Before | After |
+|---|---|---|
+| `output_dtype` for integral T | `Dtype::Float64` | `Dtype::Float32` |
+| `MeanCppT` for integral T | `double` | `float` (mean now outputs Float32) |
+| `OutputCppT` for integral T | `double` | `float` |
+| `AccCppT` for integral T | `double` | `float` |
+
+---
+
+### 1.15 CPU vs GPU Integer Mean — Intentional Float64 vs Float32 (Design Decision)
+**(Files: `include/ops/helpers/ReductionImpl.h`)**
+
+**The question raised:** After making GPU output Float32 for integer mean, should CPU also be
+changed to Float32 for consistency?
+
+**Analysis — does changing CPU to Float32 reduce any overhead?**
+
+CPU integer mean loop:
+```cpp
+int64_t accumulator = 0;
+for (int64_t i = 0; i < reduced_count; ++i)
+    accumulator += input_value;   // int64 add — dominates all cost, O(reduced_count)
+// ONE division per output element:
+output = (double)accumulator / (double)reduced_count;   // O(1) — negligible
+```
+
+Changing to Float32 changes only the final per-output-slice division:
+- `DIVSD` (double): ~14–20 cycles
+- `DIVSS` (float): ~10–14 cycles
+
+Savings: ~6 cycles, once per output element. The inner loop runs `reduced_count` iterations.
+**This overhead is completely dominated by the reduction loop — changing to Float32 saves zero
+meaningful time on CPU.**
+
+**"Cast before" question — does PyTorch reduce overhead by casting int tensor to float first?**
+
+PyTorch doesn't support `mean()` on integer tensors (throws RuntimeError). So there is no
+PyTorch comparison here. NumPy returns `float64` for integer `mean()`.
+
+The phrase "cast before" could mean two things:
+1. **Allocate a new float tensor from the int tensor before reducing** — wasteful, extra memory
+2. **Cast each element to float at the point it is loaded** — this is what we do (T→int64 at `+=`)
+
+Both our approach and PyTorch's `opmath_type` approach do #2 ("cast at load"). Neither allocates
+an extra tensor. Our `int64_t` accumulation is actually **more precise** than float accumulation:
+- `float` has a 24-bit mantissa — exact for sums up to ~16M only
+- `int64_t` accumulation: exact for all practical sizes (overflow only at N × INT32_MAX > 2^63)
+
+**Decision:** Keep CPU integer mean at **Float64** output. Reasoning:
+- FP64 division costs the same as FP32 on modern x86 (DIVSD vs DIVSS differ by ~6 cycles, negligible)
+- Higher precision is free at CPU — no reason to reduce it
+- GPU uses Float32 because FP64 is 32× slower there — a hardware constraint, not a precision choice
+
+This intentional asymmetry is documented in the source comment:
+```cpp
+// CPU integer mean → Float64 (intentionally different from GPU's Float32).
+// Accumulation in int64_t is exact; dividing to double adds no loop overhead
+// (the division is O(1) per output slice, dominated by the O(reduced_count) loop).
+// GPU uses Float32 because FP64 is 32× slower on consumer hardware; CPU FP64 is free.
+```
+
+---
+
 ## 2. Hardware Optimizations
 *(Reserved for hardware-specific optimizations)*

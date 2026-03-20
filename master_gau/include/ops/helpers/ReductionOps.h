@@ -410,7 +410,7 @@ struct ProductOp {
 
 template <typename T>
 struct MinOp {
-    using AccT = AccumulatorType<T>;
+    using AccT = T;  // compare op: result always within input range, no widening needed
     
     DEVICE_HOST AccT identity() const { 
         if constexpr (std::is_integral_v<T>) {
@@ -456,7 +456,7 @@ struct MinOp {
 
 template <typename T>
 struct MaxOp {
-    using AccT = AccumulatorType<T>;
+    using AccT = T;  // compare op: result always within input range, no widening needed
     
     DEVICE_HOST AccT identity() const { 
         if constexpr (std::is_integral_v<T>) {
@@ -586,7 +586,7 @@ struct NanProductOp {
 
 template <typename T>
 struct NanMinOp {
-    using AccT = AccumulatorType<T>;
+    using AccT = T;  // compare op: result always within input range, no widening needed
     
     DEVICE_HOST AccT identity() const { 
         if constexpr (std::is_integral_v<T>) {
@@ -630,7 +630,7 @@ struct NanMinOp {
 
 template <typename T>
 struct NanMaxOp {
-    using AccT = AccumulatorType<T>;
+    using AccT = T;  // compare op: result always within input range, no widening needed
     
     DEVICE_HOST AccT identity() const { 
         if constexpr (std::is_integral_v<T>) {
@@ -707,9 +707,25 @@ struct NanVarianceOp {
 template <typename T>
 struct ArgMinOp {
     using AccumulatorType = ValueIndex<T>;
-    
-    DEVICE_HOST ValueIndex<T> identity() const { 
-        return ValueIndex<T>(get_max_value<T>(), -1); 
+
+    DEVICE_HOST ValueIndex<T> identity() const {
+        return ValueIndex<T>(get_max_value<T>(), -1);
+    }
+
+    // CPU 2-variable path: initial sentinel (no element seen yet)
+    T identity_val() const { return get_max_value<T>(); }
+
+    // CPU 2-variable path: true if candidate should replace current_best.
+    // NaN propagates: first NaN encountered "wins" (keeps lowest NaN index).
+    // 1 NaN check per element in the hot path (all-finite data): if candidate is
+    // not NaN, skip the NaN branch entirely. If current_best is NaN, IEEE 754
+    // guarantees (NaN < x) = false, so the comparison below returns false
+    // and the NaN accumulator is preserved without an extra check.
+    bool better_than(const T& candidate, const T& current_best) const {
+        if constexpr (is_any_float_v<T>) {
+            if (is_nan_check(candidate)) return !is_nan_check(current_best);
+        }
+        return candidate < current_best;
     }
 
     DEVICE_HOST ValueIndex<T> reduce(const ValueIndex<T>& a, const ValueIndex<T>& b) const {
@@ -753,9 +769,21 @@ struct ArgMinOp {
 template <typename T>
 struct ArgMaxOp {
     using AccumulatorType = ValueIndex<T>;
-    
+
     DEVICE_HOST ValueIndex<T> identity() const {
-        return ValueIndex<T>(get_lowest_value<T>(), -1); 
+        return ValueIndex<T>(get_lowest_value<T>(), -1);
+    }
+
+    // CPU 2-variable path: initial sentinel
+    T identity_val() const { return get_lowest_value<T>(); }
+
+    // CPU 2-variable path: true if candidate should replace current_best.
+    // NaN propagates: first NaN encountered "wins".
+    bool better_than(const T& candidate, const T& current_best) const {
+        if constexpr (is_any_float_v<T>) {
+            if (is_nan_check(candidate)) return !is_nan_check(current_best);
+        }
+        return candidate > current_best;
     }
 
     DEVICE_HOST ValueIndex<T> reduce(const ValueIndex<T>& a, const ValueIndex<T>& b) const {
@@ -799,9 +827,21 @@ struct ArgMaxOp {
 template <typename T>
 struct NanArgMinOp {
     using AccumulatorType = ValueIndex<T>;
-    
-    DEVICE_HOST ValueIndex<T> identity() const { 
-        return ValueIndex<T>(get_max_value<T>(), -1); 
+
+    DEVICE_HOST ValueIndex<T> identity() const {
+        return ValueIndex<T>(get_max_value<T>(), -1);
+    }
+
+    // CPU 2-variable path: initial sentinel
+    T identity_val() const { return get_max_value<T>(); }
+
+    // CPU 2-variable path: true if candidate should replace current_best.
+    // NaN is skipped (treated as if not present in the tensor).
+    bool better_than(const T& candidate, const T& current_best) const {
+        if constexpr (is_any_float_v<T>) {
+            if (is_nan_check(candidate)) return false;  // skip NaN inputs
+        }
+        return candidate < current_best;
     }
 
     DEVICE_HOST ValueIndex<T> reduce(const ValueIndex<T>& a, const ValueIndex<T>& b) const {
@@ -847,9 +887,21 @@ struct NanArgMinOp {
 template <typename T>
 struct NanArgMaxOp {
     using AccumulatorType = ValueIndex<T>;
-    
+
     DEVICE_HOST ValueIndex<T> identity() const {
-        return ValueIndex<T>(get_lowest_value<T>(), -1); 
+        return ValueIndex<T>(get_lowest_value<T>(), -1);
+    }
+
+    // CPU 2-variable path: initial sentinel
+    T identity_val() const { return get_lowest_value<T>(); }
+
+    // CPU 2-variable path: true if candidate should replace current_best.
+    // NaN is skipped (treated as if not present in the tensor).
+    bool better_than(const T& candidate, const T& current_best) const {
+        if constexpr (is_any_float_v<T>) {
+            if (is_nan_check(candidate)) return false;  // skip NaN inputs
+        }
+        return candidate > current_best;
     }
 
     DEVICE_HOST ValueIndex<T> reduce(const ValueIndex<T>& a, const ValueIndex<T>& b) const {
@@ -901,27 +953,33 @@ struct NanArgMaxOp {
 template <typename T>
 struct AllOp {
     using AccT = bool;  // Always accumulate as bool
-    
-    DEVICE_HOST bool identity() const { 
+
+    DEVICE_HOST bool identity() const {
         return true;  // Neutral element for AND operation
     }
-    
+
     DEVICE_HOST bool reduce(const bool& a, const bool& b) const {
         return a && b;  // Logical AND
     }
+
+    // CPU short-circuit: once accumulator is false, AND can never recover — stop.
+    bool can_short_circuit(bool acc) const { return !acc; }
 };
 
 template <typename T>
 struct AnyOp {
     using AccT = bool;  // Always accumulate as bool
-    
-    DEVICE_HOST bool identity() const { 
+
+    DEVICE_HOST bool identity() const {
         return false;  // Neutral element for OR operation
     }
-    
+
     DEVICE_HOST bool reduce(const bool& a, const bool& b) const {
         return a || b;  // Logical OR
     }
+
+    // CPU short-circuit: once accumulator is true, OR can never go back — stop.
+    bool can_short_circuit(bool acc) const { return acc; }
 };
 // ═══════════════════════════════════════════════════════════
 // REDUCTION TYPE DISPATCHER

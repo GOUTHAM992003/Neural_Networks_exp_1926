@@ -179,7 +179,16 @@ __global__ void reduce_kernel(
     //     int64_t,
     //     typename std::conditional_t<is_half, float, T>
     // >;
-    using AccumulatorType = detail::AccumulatorType<T, /*IsGPU=*/true>;  ///* */ --->comment in c++,and compiler ignores it,and here i had used for understanding refeence .
+    // compare ops (min/max): use T directly — result always within input range, no widening.
+    // sum/product/etc: use the centralized GPU accumulator type (float→float, int→int64, etc.)
+    using AccumulatorType = std::conditional_t<
+        std::is_same_v<OpType<T>, detail::MinOp<T>>    ||
+        std::is_same_v<OpType<T>, detail::MaxOp<T>>    ||
+        std::is_same_v<OpType<T>, detail::NanMinOp<T>> ||
+        std::is_same_v<OpType<T>, detail::NanMaxOp<T>>,
+        T,
+        detail::AccumulatorType<T, /*IsGPU=*/true>
+    >;
 
     extern __shared__ char shared_mem[];
     // Metadata caching
@@ -523,11 +532,17 @@ __global__ void reduce_mean_kernel(
     constexpr bool is_half = std::is_same_v<T, __half> || std::is_same_v<T, __nv_bfloat16>;
     constexpr bool is_complex = std::is_same_v<T, complex32_t> || std::is_same_v<T, complex64_t> || std::is_same_v<T, complex128_t>;
 
-    // Determine accumulator type: complex types use complex128_t (or complex64_t for complex32_t), others use double
+    // Accumulator type for mean:
+    // - complex32  → complex64  (widen for precision)
+    // - complex64/128 → complex128
+    // - double     → double     (keep full precision)
+    // - everything else (float, half, bfloat16, int*) → float
+    //   float is 32x faster than double on consumer GPUs (FP64 = 1/32 FP32 on Pascal/Turing).
+    //   PyTorch uses float (opmath_type) for all of these same types.
     using AccT = typename std::conditional_t<
         is_complex,
         typename std::conditional_t<std::is_same_v<T, complex32_t>, complex64_t, complex128_t>,
-        double
+        typename std::conditional_t<std::is_same_v<T, double>, double, float>
     >;
 
     extern __shared__ char shared_mem[];

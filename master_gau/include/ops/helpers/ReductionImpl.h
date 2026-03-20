@@ -120,10 +120,10 @@ Tensor reduce_kernel(
     } else if constexpr (std::is_same_v<AccT, ValueIndex<T>>) {
         // Index reductions always output Int64
         output_dtype = Dtype::Int64;
-    } else if constexpr (std::is_integral_v<T>) {
-        // Integer reductions widen to Int64
+    } else if constexpr (std::is_integral_v<T> && !std::is_same_v<AccT, T>) {
+        // sum/product: AccT is widened (int64_t != T), so output must also widen
         output_dtype = Dtype::Int64;
-    } 
+    }
     
     Tensor output({output_shape}, TensorOptions().with_dtype(output_dtype).with_device(input.device()).with_req_grad(input.requires_grad()));
 
@@ -146,12 +146,12 @@ Tensor reduce_kernel(
     
     // Determine output C++ type
     using OutputCppT = typename std::conditional<
-        std::is_same_v<AccT, ValueIndex<T>>, 
+        std::is_same_v<AccT, ValueIndex<T>>,
         int64_t,
         typename std::conditional<
-            std::is_integral_v<T>,
-            int64_t,
-            T
+            std::is_integral_v<T> && !std::is_same_v<AccT, T>,
+            int64_t,  // sum/product: AccT widened → output is int64
+            T         // min/max (AccT==T) and float: output same as input
         >::type
     >::type;
     
@@ -197,19 +197,22 @@ Tensor reduce_kernel(
         if constexpr (std::is_same_v<AccT, ValueIndex<T>>) {
             // =========================================================
             // INDEX REDUCTIONS PATH (argmax, argmin, etc.)
+            // 2-variable approach (PyTorch-style): no struct construction
+            // per element, index only updated on strict improvement.
             // =========================================================
-            ValueIndex<T> accumulator = op.identity();
-          
+            T best_val = op.identity_val();
+            int64_t best_idx = -1;
+
             for (int64_t i = 0; i < reduced_count; ++i) {
                 // Use stack-allocated buffers for indices
                 int64_t slice_coords_buf[MAX_DIMS];
                 int64_t full_input_coords_buf[MAX_DIMS];
-                
+
                 unravel_index_stack(i, reduced_dims.data(), reduced_dims.size(), slice_coords_buf);
-                
+
                 int out_coord_idx = 0;
                 int slice_coord_idx = 0;
-                
+
                 for (size_t dim = 0; dim < input_dims.size(); ++dim) {
                     bool is_reduced = reduced_bitmap[dim];
                     if (is_reduced) {
@@ -223,29 +226,29 @@ Tensor reduce_kernel(
                         out_coord_idx++;
                     }
                 }
-                
+
                 int64_t input_lin_idx = ravel_index_stack(full_input_coords_buf, input_strides.data(), input_dims.size());
                 T input_value = input_data[input_lin_idx];
-                ValueIndex<T> current_val_index = {input_value, i};
-                accumulator = op.reduce(accumulator, current_val_index);
+                if (op.better_than(input_value, best_val)) {
+                    best_val = input_value;
+                    best_idx = i;
+                }
             }
-            
-            output_data[output_index] = accumulator.index;
+
+            output_data[output_index] = best_idx;
             
         } else {
                 // Initialize standard accumulator (used for all other reductions)
                 AccumulatorT accumulator;
-                    //  FIX: Don't cast identity for index reductions (ValueIndex type)
+                // Universal init: static_cast<AccumulatorT>(identity) works for all ops:
+                // - sum int32 (AccT=int64): cast int32(0) → int64(0)
+                // - min int32 (AccT=int32): cast int32(MAX) → int32(MAX), no-op
+                // - sum float16 (AccT=float): cast float16(0) → float(0)
+                // - min float16 (AccT=float16): cast float16(MAX) → float16(MAX), no-op
                 if constexpr (std::is_same_v<AccT, ValueIndex<T>>) {
-                    // This path should never be reached since index reductions
-                    // are handled in the first if branch above
-                    accumulator = op.identity();
-                } else if constexpr (should_use_double_accumulation<T>()) {
-                    accumulator = static_cast<double>(op.identity());
-                } else if constexpr (std::is_integral_v<T>) {
-                    accumulator = static_cast<int64_t>(op.identity());
+                    accumulator = op.identity();  // index path, never reached here
                 } else {
-                    accumulator = op.identity();
+                    accumulator = static_cast<AccumulatorT>(op.identity());
                 }
 
                 // Standard Loop
@@ -283,6 +286,9 @@ Tensor reduce_kernel(
                         // For AllOp/AnyOp: convert input value to bool
                         bool val_as_bool = to_bool_value(input_value);
                         accumulator = op.reduce(accumulator, val_as_bool);
+                        // Short-circuit: AllOp exits on first false, AnyOp on first true.
+                        // Safe because the inner loop is sequential (not GPU/SIMT).
+                        if (op.can_short_circuit(accumulator)) break;
                     } else {
                         AccumulatorT val_acc = static_cast<AccumulatorT>(input_value);
                         accumulator = op.reduce(accumulator, val_acc);
@@ -517,7 +523,10 @@ Tensor dispatch_mean_kernel(const Tensor& input, const std::vector<int64_t>& nor
     }
 
     if constexpr (std::is_integral_v<T>) {
-        // Integers output Float64
+        // CPU integer mean → Float64 (intentionally different from GPU's Float32).
+        // Accumulation in int64_t is exact; dividing to double adds no loop overhead
+        // (the division is O(1) per output slice, dominated by the O(reduced_count) loop).
+        // GPU uses Float32 because FP64 is 32× slower on consumer hardware; CPU FP64 is free.
         Tensor output({output_shape}, TensorOptions().with_dtype(Dtype::Float64).with_device(input.device()).with_req_grad(input.requires_grad()));
         
         const T* input_data = input.data<T>();
@@ -824,23 +833,23 @@ Tensor dispatch_variance_kernel(const Tensor& input,
         throw std::runtime_error("Tensor rank exceeds maximum supported dimensions (16)");
     }
     
-    // Determine output dtype
+    // Determine output dtype: CPU integers → Float64 (FP64 is free on CPU; GPU uses Float32).
     Dtype output_dtype;
     if constexpr (std::is_integral_v<T>) {
         output_dtype = Dtype::Float64;
     } else {
         output_dtype = input.dtype();
     }
-    
+
     Tensor output({output_shape}, TensorOptions()
         .with_dtype(output_dtype)
         .with_device(input.device())
         .with_req_grad(input.requires_grad()));
-    
+
     //  STEP 3: Prepare data pointers
     const T* input_data = input.data<T>();
-    
-    //  CRITICAL FIX: For integers, mean is stored as double
+
+    // Integer mean is Float64 on CPU; cast mean pointer accordingly.
     using MeanCppT = typename std::conditional<
         std::is_integral_v<T>,
         double,

@@ -153,14 +153,21 @@ Tensor dispatch_reduction_gpu(const Tensor& input,
     // Calculate output shape
     Shape output_shape = calculate_output_shape(input.shape().dims, normalized_axes, keepdim);
     
+    // min/max ops use T directly as accumulator — result always within input range
+    constexpr bool is_compare_op =
+        std::is_same_v<OpType<T>, detail::MinOp<T>>    ||
+        std::is_same_v<OpType<T>, detail::MaxOp<T>>    ||
+        std::is_same_v<OpType<T>, detail::NanMinOp<T>> ||
+        std::is_same_v<OpType<T>, detail::NanMaxOp<T>>;
+
     // Determine output dtype
     Dtype output_dtype;
     if constexpr (std::is_same_v<T, bool>) {
-        output_dtype = Dtype::Bool;  //  Boolean operations return Bool
-    } else if constexpr (std::is_integral_v<T>) {
-        output_dtype = Dtype::Int64;
+        output_dtype = Dtype::Bool;
+    } else if constexpr (std::is_integral_v<T> && !is_compare_op) {
+        output_dtype = Dtype::Int64;  // sum/product: accumulator widens, output is int64
     } else {
-        output_dtype = input.dtype();
+        output_dtype = input.dtype();  // min/max: output same dtype as input
     }
     
     // Create output tensor
@@ -210,8 +217,10 @@ Tensor dispatch_reduction_gpu(const Tensor& input,
     // Metadata size (input_dims + input_strides + output_dims + reduced_dims + normalized_axes)
     size_t metadata_size = (input_dims.size() + input_strides.size() + output_shape.dims.size() + reduced_dims.size() + normalized_axes.size()) * sizeof(int64_t);
 
-    if constexpr (std::is_integral_v<T>) {
-        shared_mem_size = (threads_per_block / 32) * sizeof(int64_t);
+    if constexpr (std::is_integral_v<T> && is_compare_op) {
+        shared_mem_size = (threads_per_block / 32) * sizeof(T);       // min/max: AccT = T
+    } else if constexpr (std::is_integral_v<T>) {
+        shared_mem_size = (threads_per_block / 32) * sizeof(int64_t); // sum/product: AccT = int64
     } else if constexpr (std::is_same_v<T, float16_t> || std::is_same_v<T, bfloat16_t>) {
         shared_mem_size = (threads_per_block / 32) * sizeof(float);
     } else {
@@ -221,12 +230,11 @@ Tensor dispatch_reduction_gpu(const Tensor& input,
     // Add metadata size to total shared memory
     shared_mem_size += metadata_size;
     
-    //  FIXED: Proper output type selection
-    using OutputCppT = typename std::conditional<
-        std::is_integral_v<T>,
-        int64_t,
-        T
-    >::type;
+    using OutputCppT = std::conditional_t<
+        std::is_integral_v<T> && !is_compare_op,
+        int64_t,  // sum/product: widened output
+        T         // min/max and floats: same as input
+    >;
     
     //  CRITICAL: Cast pointers to NATIVE CUDA types
     const CudaT* input_data = reinterpret_cast<const CudaT*>(input.data<T>());
@@ -361,10 +369,13 @@ Tensor dispatch_mean_gpu(const Tensor& input,
         throw std::runtime_error("Cannot compute mean: reduced count is zero.");
     }
     
-    // Mean output dtype
+    // Mean output dtype: integers output Float32 (not Float64).
+    // Float32 is 32x faster than Float64 on consumer GPUs (FP64 = 1/32 FP32 on Pascal/Turing).
+    // PyTorch uses float (opmath_type) for integer reductions.
+    // CPU uses Float64 for exact integer arithmetic — GPU trades some precision for 32x speed.
     Dtype output_dtype;
     if constexpr (std::is_integral_v<T>) {
-        output_dtype = Dtype::Float64;
+        output_dtype = Dtype::Float32;
     } else {
         output_dtype = input.dtype();
     }
@@ -399,16 +410,20 @@ PackedMetadata metadata(input_dims,input_strides,output_shape.dims,normalized_ax
     
     int num_warps = (threads_per_block + 31) / 32;
     // Metadata size (input_strides + output_dims + reduced_dims + normalized_axes)
-   size_t metadata_size = (input_dims.size() + input_strides.size() + output_shape.dims.size() + reduced_dims.size() + normalized_axes.size()) * sizeof(int64_t);
+    size_t metadata_size = (input_dims.size() + input_strides.size() + output_shape.dims.size() + reduced_dims.size() + normalized_axes.size()) * sizeof(int64_t);
 
-    size_t shared_mem_size = num_warps * sizeof(double) + num_warps * sizeof(int64_t) + metadata_size;
-    
+    // AccT in reduce_mean_kernel = double for T=double, float for everything else.
+    // Match that here so shared memory allocation is not over-/under-sized.
+    constexpr size_t mean_acc_size = std::is_same_v<T, double> ? sizeof(double) : sizeof(float);
+    size_t shared_mem_size = num_warps * mean_acc_size + num_warps * sizeof(int64_t) + metadata_size;
+
     //  TYPE CONVERSION
     using CudaT = CudaNativeType<T>;
-    
+
+    // Integers → float output (matches kernel AccT = float; see reduce_mean_kernel comment)
     using OutputCppT = typename std::conditional<
         std::is_integral_v<T>,
-        double,
+        float,
         T
     >::type;
     
@@ -465,20 +480,20 @@ Tensor dispatch_variance_gpu(const Tensor& input,
     Shape output_shape = calculate_output_shape(input.shape().dims, normalized_axes, keepdim);
     int64_t reduced_count = calculate_reduced_count(input.shape().dims, normalized_axes);
     
-    // Determine output dtype
+    // Determine output dtype: integers → Float32 (matches mean's Float32 output, 32x faster GPU FP32)
     Dtype output_dtype;
     if constexpr (std::is_integral_v<T>) {
-        output_dtype = Dtype::Float64;
+        output_dtype = Dtype::Float32;
     } else {
         output_dtype = input.dtype();
     }
-    
+
     // Create output tensor
     Tensor output({output_shape}, TensorOptions()
         .with_dtype(output_dtype)
         .with_device(input.device())
         .with_req_grad(input.requires_grad()));
-    
+
     // Setup metadata
     const std::vector<int64_t>& input_dims = input.shape().dims;
     const std::vector<int64_t>& input_strides = input.stride().strides;
@@ -509,32 +524,31 @@ PackedMetadata metadata(input_dims,input_strides,output_shape.dims,normalized_ax
     // Type conversion for input
     using CudaT = CudaNativeType<T>;
     
-    //  CRITICAL FIX: Determine the ACTUAL mean tensor type
-    // For integers: mean_tensor has dtype Float64, so mean is stored as double
-    // For floats: mean_tensor has same dtype as input
+    // Mean tensor type: for integers dispatch_mean_gpu now outputs Float32 (not Float64).
+    // For floats: mean has the same dtype as input.
     using MeanCppT = typename std::conditional<
         std::is_integral_v<T>,
-        double,  // Integer inputs → Float64 mean
+        float,   // Integer inputs → Float32 mean (changed from Float64 for GPU speed)
         T        // Float inputs → same type mean
     >::type;
     
     using MeanCudaT = CudaNativeType<MeanCppT>;
     
-    // Output type
+    // Output type: integers → float (GPU, 32x faster than double)
     using OutputCppT = typename std::conditional<
         std::is_integral_v<T>,
-        double,
+        float,
         T
     >::type;
-    
+
     using OutputCudaT = CudaNativeType<OutputCppT>;
-    
-    //  Define Accumulator Type
+
+    // Variance accumulator type: integers → float (matches output + mean types)
     using AccCppT = typename std::conditional<
         std::is_integral_v<T>,
-        double,
+        float,
         typename std::conditional<
-            std::is_same_v<T, float16_t> || std::is_same_v<T, bfloat16_t> || 
+            std::is_same_v<T, float16_t> || std::is_same_v<T, bfloat16_t> ||
             std::is_same_v<T, float4_e2m1_t> || std::is_same_v<T, float4_e2m1_2x_t>,
             float,
             T
