@@ -189,6 +189,8 @@ __global__ void reduce_kernel(
         T,
         detail::AccumulatorType<T, /*IsGPU=*/true>
     >;
+    // complex32_t (2×float16) promotes to complex64_t (2×float) — needs explicit component conversion
+    constexpr bool is_complex_promotion = std::is_same_v<T, complex32_t> && !std::is_same_v<T, AccumulatorType>;
 
     extern __shared__ char shared_mem[];
     // Metadata caching
@@ -297,6 +299,9 @@ __global__ void reduce_kernel(
                     accumulator += static_cast<int64_t>(input_value);
                 } else if constexpr (is_integer_product) {
                     accumulator *= static_cast<int64_t>(input_value);
+                } else if constexpr (is_complex_promotion) {
+                    AccumulatorType val_acc(static_cast<float>(input_value.real()), static_cast<float>(input_value.imag()));
+                    accumulator = op.reduce(accumulator, val_acc);
                 } else {
                     accumulator = op.reduce(accumulator, input_value);
                 }
@@ -333,6 +338,9 @@ __global__ void reduce_kernel(
                     accumulator += static_cast<int64_t>(input_value);
                 } else if constexpr (is_integer_product) {
                     accumulator *= static_cast<int64_t>(input_value);
+                } else if constexpr (is_complex_promotion) {
+                    AccumulatorType val_acc(static_cast<float>(input_value.real()), static_cast<float>(input_value.imag()));
+                    accumulator = op.reduce(accumulator, val_acc);
                 } else {
                     accumulator = op.reduce(accumulator, input_value);
                 }
@@ -706,11 +714,19 @@ __global__ void reduce_mean_kernel(
                     // Divide in AccT precision: float/float for non-double, double/double for double.
                     // Old: static_cast<double>(valid_count) caused float→double promotion,
                     // double division (slow on consumer GPU), then truncation back to float — no benefit.
-                    mean_val = accumulator / static_cast<AccT>(valid_count);
+                    if constexpr (is_complex) {
+                        mean_val = accumulator / AccT(static_cast<float>(valid_count), 0.0f);
+                    } else {
+                        mean_val = accumulator / static_cast<AccT>(valid_count);
+                    }
                 }
             } else {
                 // Same fix: divide in AccT precision (float for non-double, double for double).
-                mean_val = accumulator / static_cast<AccT>(reduced_count);
+                if constexpr (is_complex) {
+                    mean_val = accumulator / AccT(static_cast<float>(reduced_count), 0.0f);
+                } else {
+                    mean_val = accumulator / static_cast<AccT>(reduced_count);
+                }
             }
 
             //   CONVERT BACK USING GPU INTRINSICS

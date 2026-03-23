@@ -4,93 +4,78 @@
 #include <vector>
 #include <cstdint>
 #include <numeric>   // For std::accumulate
-#include <numeric>   // For std::accumulate
-// #include <algorithm> // For std::find, std::sort, etc.
 #include <set>       // For unique axes check
 #include <stdexcept> // For runtime_error
 
 namespace OwnTensor {
 namespace detail { // <<< START OF THE INTERNAL DETAIL NAMESPACE
 
-// ========================================================================
-// STACK-BASED HELPERS (INLINE - NO REDEFINITION ISSUES)
-// ========================================================================
+//=========================================================================
+// REDUCTION LAYOUT - describes the simplified post-coalesce problem shape (this is a hybrid version designed by gautam_k_1926 similar to functionalities of reorder_dimensions() and coalesce_dimensions() functions in pytorch)
+//=========================================================================
+//describes which kernel path to take and the 2D parameters needed ,
+// computed once before reduce_kernel and replaces per-element div/mod(from unravel_index and ravel_index that we had in earlier naive implementation) ,
+// Path 1 ---> InnerContiguous ---> horizantal SIMD (reduce rightmost dims , C - contiguous input );
+// Path 2 ---> OuterContiguous ---> vertical SIMD (reduce leftmost dims, C-contiguous input );
+// Path 3 ---> Generic  ----> no SIMD , naive reduction loop fallback,generic basic loop
+struct ReductionLayout {
+    enum class Path : uint8_t {
+        InnerContiguous,
+        OuterContiguous,
+        Generic
+    };
+    Path path = Path::Generic;
+    //InnerContiguous params
+    //Outer loop (OpenMP) : for i in 0--->num_outputs
+    // in_ptr = input_data + i * input_outer_stride     (element offset)
+    // Reduce in_ptr[0.... reduced_count-1] ---> output_data[i]
+    // Access is perfectly sequential --> cache-friendly ---> horizantal SIMD
+    int64_t num_outputs = 0 ; // independent output elements (outer loop)
+    int64_t reduced_count = 0 ; //element per output slice (inner tight loop)
+    int64_t input_outer_stride = 0 ; // element stride between slices ( = reduced_count forC-contiguous)
 
-/**
- * @brief Stack-allocated unravel_index (no heap allocations)
- * INLINE means this is compiled into each translation unit that uses it.
- * NO redefinition errors because of inline keyword.
- */
-inline void unravel_index_stack(int64_t linear_index,
-                                const int64_t* shape_data,
-                                size_t ndim,
-                                int64_t* out_coords) {
-    int64_t temp_index = linear_index;
-    for (int d = static_cast<int>(ndim) - 1; d >= 0; --d) {
-        if (shape_data[d] == 0) {
-            out_coords[d] = 0;
-            continue;
-        }
-        out_coords[d] = temp_index % shape_data[d];
-        temp_index /= shape_data[d];
-    }
-}
+    //OuterContiguous params (also uses num_outputs = inner_count )
+    // Reduction loop : for r in (0 ---> reduced_count)
+    // in_row = input_data + r * input_row_stride (element offset)
+    //for j in (0 ---> inner_count -1) : out[j] = op(out[j],in_row[j])
+    // Each SIMD lane accumulates a different output position ---> veritcal SIMD
+    int64_t inner_count = 0 ; // preserved innermost dim size (= num_outputs for  outer path)
+    int64_t input_row_stride =  0 ; //element stride between reduction rows ( = inner_count for C-contiguous)
 
-/**
- * @brief Stack-based ravel_index (no allocations)
- * INLINE means this is compiled into each translation unit.
- */
-inline int64_t ravel_index_stack(const int64_t* coords,
-                                 const int64_t* strides,
-                                 size_t ndim) {
-    int64_t linear_index = 0;
-    for (size_t i = 0; i < ndim; ++i) {
-        linear_index += coords[i] * strides[i];
-    }
-    return linear_index;
-}
-
+};
 // ========================================================================
-// ORIGINAL FUNCTIONS (DECLARATIONS ONLY - IMPLEMENTED IN .CPP)
+// FUNCTIONS (DECLARATIONS ONLY - IMPLEMENTED IN .CPP)
 // ========================================================================
 
 /**
  * @brief Normalizes the input axes to positive indices (0 to N-1) and validates them.
  * DECLARED here, IMPLEMENTED in ReductionUtils.cpp
  */
-std::vector<int64_t> normalize_axes(const std::vector<int64_t>& input_dims, 
+std::vector<int64_t> normalize_axes(const std::vector<int64_t>& input_dims,
                                     const std::vector<int64_t>& axes);
 
 /**
  * @brief Calculates the shape of the output tensor after reduction.
  * DECLARED here, IMPLEMENTED in ReductionUtils.cpp
  */
-Shape calculate_output_shape(const std::vector<int64_t>& input_dims, 
-                             const std::vector<int64_t>& normalized_axes, 
+Shape calculate_output_shape(const std::vector<int64_t>& input_dims,
+                             const std::vector<int64_t>& normalized_axes,
                              bool keepdim);
 
 /**
  * @brief Calculates the total number of elements that will be combined for each reduction slice.
  * DECLARED here, IMPLEMENTED in ReductionUtils.cpp
  */
-int64_t calculate_reduced_count(const std::vector<int64_t>& input_dims, 
+int64_t calculate_reduced_count(const std::vector<int64_t>& input_dims,
                                 const std::vector<int64_t>& normalized_axes);
-
-/**
- * @brief Converts a linear index to a multi-dimensional coordinate vector (HEAP VERSION).
- * DECLARED here, IMPLEMENTED in ReductionUtils.cpp
- * NOTE: This version allocates a vector. Use unravel_index_stack for performance-critical paths.
- */
-std::vector<int64_t> unravel_index(int64_t linear_index, 
-                                   const std::vector<int64_t>& shape);
-
-/**
- * @brief Converts a multi-dimensional coordinate vector back to a linear index using strides (HEAP VERSION).
- * DECLARED here, IMPLEMENTED in ReductionUtils.cpp
- * NOTE: This version takes vectors. Use ravel_index_stack for performance-critical paths.
- */
-int64_t ravel_index(const std::vector<int64_t>& coords, 
-                   const std::vector<int64_t>& strides);
+/*
+* @brief computes the simplified 2D layout of a reduction after coalescing .
+*Detects whether input is C-contiguous and axes are innermost or outermost ,
+*allowing vectorized_inner_reduction (horizantal SIMD)  or vectorized_outer_reduction (vertical SIMD) to be used ,
+* falls back to Path::Generic for non-contiguous or mized-axis reductions .
+*Declared here,implemented in reductionUtils.cpp
+*/
+ReductionLayout compute_reduction_layout(const Tensor& input,const std::vector<int64_t>& normalized_axes);
 
 } // namespace detail
 } // namespace OwnTensor

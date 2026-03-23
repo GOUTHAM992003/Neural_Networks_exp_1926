@@ -47,7 +47,7 @@ Tensor dispatch_variance_gpu(const Tensor& input,
                              int64_t correction,
                              cudaStream_t stream);//✨✨✨                        
 
-constexpr size_t MAX_DIMS = 16;
+constexpr size_t MAX_DIMS = 64;
 // =================================================================
 // HELPER: Safe isnan check for both real and complex types
 // =================================================================
@@ -102,6 +102,124 @@ constexpr bool should_use_double_accumulation() {
 }
 
 // =================================================================
+// --- BINARY KERNEL REDUCE FOR INDEX OPS (argmax/argmin) ---
+// Multi-threaded approach with thread-local accumulators (PyTorch style)
+// =================================================================
+
+template <typename T, template <typename> class OpType>
+Tensor binary_kernel_reduce_index(
+    const Tensor& input,
+    const std::vector<int64_t>& normalized_axes,
+    const Shape& output_shape)
+{
+    using Op = OpType<T>;
+
+    // Output is always Int64 for index operations
+    Tensor output({output_shape}, TensorOptions().with_dtype(Dtype::Int64).with_device(input.device()).with_req_grad(input.requires_grad()));
+
+    const T* input_data = input.data<T>();
+    const std::vector<int64_t>& input_dims = input.shape().dims;
+    const std::vector<int64_t>& input_strides = input.stride().strides;
+
+    const int64_t reduced_count = calculate_reduced_count(input_dims, normalized_axes);
+    int64_t* output_data = output.data<int64_t>();
+
+    Op op;
+    const int64_t num_slices = output.numel();
+
+    if (input_dims.size() > MAX_DIMS) {
+        throw std::runtime_error("Tensor rank exceeds maximum supported dimensions (64)");
+    }
+
+    bool reduced_bitmap[MAX_DIMS] = {false};
+    for (int64_t axis : normalized_axes) {
+        reduced_bitmap[axis] = true;
+    }
+
+    std::vector<int64_t> reduced_dims;
+    for(size_t dim = 0; dim < input_dims.size(); ++dim) {
+        bool is_reduced = reduced_bitmap[dim];
+        if (is_reduced) {
+            reduced_dims.push_back(input_dims[dim]);
+        }
+    }
+
+    ReductionLayout layout = compute_reduction_layout(input, normalized_axes);
+    const int64_t k = static_cast<int64_t>(normalized_axes.size());
+    int64_t red_input_strides[MAX_DIMS];
+    for (int64_t d = 0; d < k; ++d)
+        red_input_strides[d] = input_strides[normalized_axes[d]];
+
+    // Precompute base linear indices for Generic path
+    int64_t M_nr = 0;
+    int64_t nr_sizes[MAX_DIMS], nr_strides_nr[MAX_DIMS];
+    std::vector<int64_t> base_lin_idxs;
+    if (layout.path == ReductionLayout::Path::Generic) {
+        for (size_t dim = 0; dim < input_dims.size(); ++dim) {
+            if (!reduced_bitmap[dim]) {
+                nr_sizes[M_nr] = input_dims[dim];
+                nr_strides_nr[M_nr] = input_strides[dim];
+                ++M_nr;
+            }
+        }
+        base_lin_idxs.resize(num_slices);
+        int64_t oc[MAX_DIMS] = {}, blk = 0;
+        for (int64_t o = 0; o < num_slices; ++o) {
+            base_lin_idxs[o] = blk;
+            for (int64_t j = M_nr - 1; j >= 0; --j) {
+                ++oc[j]; blk += nr_strides_nr[j];
+                if (oc[j] < nr_sizes[j]) break;
+                blk -= oc[j] * nr_strides_nr[j]; oc[j] = 0;
+            }
+        }
+    }
+
+    // Parallel execution: each thread accumulates over its output slices
+    #pragma omp parallel for collapse(1)
+    for (int64_t output_index = 0; output_index < num_slices; ++output_index)
+    {
+        ValueIndex<T> accumulator = op.identity();
+
+        if (layout.path == ReductionLayout::Path::InnerContiguous) {
+            // Input row is flat contiguous — plain pointer walk
+            const T* in_ptr = input_data + output_index * layout.input_outer_stride;
+            for (int64_t j = 0; j < layout.reduced_count; ++j) {
+                ValueIndex<T> curr = {in_ptr[j], j};
+                accumulator = op.reduce(accumulator, curr);
+            }
+        } else if (layout.path == ReductionLayout::Path::OuterContiguous) {
+            // Walk down a column
+            for (int64_t r = 0; r < layout.reduced_count; ++r) {
+                const T* in_ptr = input_data + output_index + r * layout.input_row_stride;
+                ValueIndex<T> curr = {*in_ptr, r};
+                accumulator = op.reduce(accumulator, curr);
+            }
+        } else {
+            // Generic path
+            int64_t red_coords[MAX_DIMS] = {};
+            int64_t input_lin_idx = base_lin_idxs[output_index];
+            for (int64_t i = 0; i < reduced_count; ++i) {
+                T input_value = input_data[input_lin_idx];
+                ValueIndex<T> curr = {input_value, i};
+                accumulator = op.reduce(accumulator, curr);
+
+                for (int64_t d = k - 1; d >= 0; --d) {
+                    ++red_coords[d];
+                    input_lin_idx += red_input_strides[d];
+                    if (red_coords[d] < reduced_dims[d]) break;
+                    input_lin_idx -= red_coords[d] * red_input_strides[d];
+                    red_coords[d] = 0;
+                }
+            }
+        }
+
+        output_data[output_index] = accumulator.index;
+    }
+
+    return output;
+}
+
+// =================================================================
 // --- CORE REDUCTION KERNEL (TENSOR -> TENSOR) ---
 // =================================================================
 
@@ -120,10 +238,10 @@ Tensor reduce_kernel(
     } else if constexpr (std::is_same_v<AccT, ValueIndex<T>>) {
         // Index reductions always output Int64
         output_dtype = Dtype::Int64;
-    } else if constexpr (std::is_integral_v<T> && !std::is_same_v<AccT, T>) {
-        // sum/product: AccT is widened (int64_t != T), so output must also widen
+    } else if constexpr (std::is_integral_v<T>) {
+        // Integer reductions widen to Int64
         output_dtype = Dtype::Int64;
-    }
+    } 
     
     Tensor output({output_shape}, TensorOptions().with_dtype(output_dtype).with_device(input.device()).with_req_grad(input.requires_grad()));
 
@@ -146,12 +264,12 @@ Tensor reduce_kernel(
     
     // Determine output C++ type
     using OutputCppT = typename std::conditional<
-        std::is_same_v<AccT, ValueIndex<T>>,
+        std::is_same_v<AccT, ValueIndex<T>>, 
         int64_t,
         typename std::conditional<
-            std::is_integral_v<T> && !std::is_same_v<AccT, T>,
-            int64_t,  // sum/product: AccT widened → output is int64
-            T         // min/max (AccT==T) and float: output same as input
+            std::is_integral_v<T>,
+            int64_t,
+            T
         >::type
     >::type;
     
@@ -159,13 +277,16 @@ Tensor reduce_kernel(
 
     Op op;
     const int64_t num_slices = output.numel();
-    const bool rank_preserved = input_dims.size() == output_shape.dims.size();
-    
+
+    if (input_dims.size() > MAX_DIMS) {
+        throw std::runtime_error("Tensor rank exceeds maximum supported dimensions (64)");
+    }
+
     bool reduced_bitmap[MAX_DIMS] = {false};
     for (int64_t axis : normalized_axes) {
         reduced_bitmap[axis] = true;
     }
-    
+
     // Calculate reduced_dims once
     std::vector<int64_t> reduced_dims;
     for(size_t dim = 0; dim < input_dims.size(); ++dim) {
@@ -174,124 +295,146 @@ Tensor reduce_kernel(
             reduced_dims.push_back(input_dims[dim]);
         }
     }
-    const size_t ndim = output_shape.dims.size();
-    
-    if (input_dims.size() > MAX_DIMS) {
-        throw std::runtime_error("Tensor rank exceeds maximum supported dimensions (16)");
+    // Layout dispatch — computed once, replaces per-element coordinate math
+    ReductionLayout layout = compute_reduction_layout(input, normalized_axes);
+    // Precompute input strides for reduced axes (used by generic carry-add path)
+    const int64_t k = static_cast<int64_t>(normalized_axes.size());
+    int64_t red_input_strides[MAX_DIMS];
+    for (int64_t d = 0; d < k; ++d)
+        red_input_strides[d] = input_strides[normalized_axes[d]];
+    // Precompute base linear indices for Generic path (sequential carry-add, avoids per-element div/mod)
+    int64_t M_nr = 0;
+    int64_t nr_sizes[MAX_DIMS], nr_strides_nr[MAX_DIMS];
+    std::vector<int64_t> base_lin_idxs;
+    if (layout.path == ReductionLayout::Path::Generic) {
+        for (size_t dim = 0; dim < input_dims.size(); ++dim) {
+            if (!reduced_bitmap[dim]) {
+                nr_sizes[M_nr] = input_dims[dim];
+                nr_strides_nr[M_nr] = input_strides[dim];
+                ++M_nr;
+            }
+        }
+        base_lin_idxs.resize(num_slices);
+        int64_t oc[MAX_DIMS] = {}, blk = 0;
+        for (int64_t o = 0; o < num_slices; ++o) {
+            base_lin_idxs[o] = blk;
+            for (int64_t j = M_nr - 1; j >= 0; --j) {
+                ++oc[j]; blk += nr_strides_nr[j];
+                if (oc[j] < nr_sizes[j]) break;
+                blk -= oc[j] * nr_strides_nr[j]; oc[j] = 0;
+            }
+        }
     }
-    // =================================================================
-    // Use double accumulation for FP16/BF16 for maximum precision
-    // =================================================================
     // Use AccT directly if it's explicitly provided, otherwise compute based on T
     using AccumulatorT = AccT;
 
-   
-
     // 3. Parallel execution
     #pragma omp parallel for
-    for (int64_t output_index = 0; output_index < num_slices; ++output_index) 
+    for (int64_t output_index = 0; output_index < num_slices; ++output_index)
     {
-          //  STACK-ALLOCATED BUFFER (no heap allocation)
-        int64_t out_coords_buf[MAX_DIMS];
-        unravel_index_stack(output_index, output_shape.dims.data(), ndim, out_coords_buf);
         if constexpr (std::is_same_v<AccT, ValueIndex<T>>) {
             // =========================================================
-            // INDEX REDUCTIONS PATH (argmax, argmin, etc.)
-            // 2-variable approach (PyTorch-style): no struct construction
-            // per element, index only updated on strict improvement.
+            // INDEX REDUCTIONS PATH (argmax, argmin)
+            // 3-way dispatch: no per-element div/mod for Inner/Outer paths
             // =========================================================
-            T best_val = op.identity_val();
-            int64_t best_idx = -1;
+            ValueIndex<T> accumulator = op.identity();
 
-            for (int64_t i = 0; i < reduced_count; ++i) {
-                // Use stack-allocated buffers for indices
-                int64_t slice_coords_buf[MAX_DIMS];
-                int64_t full_input_coords_buf[MAX_DIMS];
-
-                unravel_index_stack(i, reduced_dims.data(), reduced_dims.size(), slice_coords_buf);
-
-                int out_coord_idx = 0;
-                int slice_coord_idx = 0;
-
-                for (size_t dim = 0; dim < input_dims.size(); ++dim) {
-                    bool is_reduced = reduced_bitmap[dim];
-                    if (is_reduced) {
-                        full_input_coords_buf[dim] = slice_coords_buf[slice_coord_idx++];
-                    } else {
-                        if (rank_preserved) {
-                            full_input_coords_buf[dim] = out_coords_buf[dim];
-                        } else {
-                            full_input_coords_buf[dim] = out_coords_buf[out_coord_idx];
-                        }
-                        out_coord_idx++;
-                    }
+            if (layout.path == ReductionLayout::Path::InnerContiguous) {
+                // Input row is flat contiguous — plain pointer walk, zero index math
+                const T* in_ptr = input_data + output_index * layout.input_outer_stride;
+                for (int64_t j = 0; j < layout.reduced_count; ++j) {
+                    ValueIndex<T> curr = {in_ptr[j], j};
+                    accumulator = op.reduce(accumulator, curr);
                 }
-
-                int64_t input_lin_idx = ravel_index_stack(full_input_coords_buf, input_strides.data(), input_dims.size());
-                T input_value = input_data[input_lin_idx];
-                if (op.better_than(input_value, best_val)) {
-                    best_val = input_value;
-                    best_idx = i;
+            } else if (layout.path == ReductionLayout::Path::OuterContiguous) {
+                // Walk down a column — one stride-multiply per reduction row, no div/mod
+                for (int64_t r = 0; r < layout.reduced_count; ++r) {
+                    const T* in_ptr = input_data + output_index + r * layout.input_row_stride;
+                    ValueIndex<T> curr = {*in_ptr, r};
+                    accumulator = op.reduce(accumulator, curr);
+                }
+            } else {
+                // Generic: precomputed base + carry-add inner counter — zero div/mod per element
+                int64_t red_coords[MAX_DIMS] = {};
+                int64_t input_lin_idx = base_lin_idxs[output_index];
+                for (int64_t i = 0; i < reduced_count; ++i) {
+                    T input_value = input_data[input_lin_idx];
+                    ValueIndex<T> curr = {input_value, i};
+                    accumulator = op.reduce(accumulator, curr);
+                    // Carry-add: advance pointer, no division
+                    for (int64_t d = k - 1; d >= 0; --d) {
+                        ++red_coords[d];
+                        input_lin_idx += red_input_strides[d];
+                        if (red_coords[d] < reduced_dims[d]) break;
+                        input_lin_idx -= red_coords[d] * red_input_strides[d];
+                        red_coords[d] = 0;
+                    }
                 }
             }
 
-            output_data[output_index] = best_idx;
-            
+            output_data[output_index] = accumulator.index;
+
         } else {
-                // Initialize standard accumulator (used for all other reductions)
+                // =========================================================
+                // STANDARD PATH (sum/product/min/max/all/any)
+                // =========================================================
                 AccumulatorT accumulator;
-                // Universal init: static_cast<AccumulatorT>(identity) works for all ops:
-                // - sum int32 (AccT=int64): cast int32(0) → int64(0)
-                // - min int32 (AccT=int32): cast int32(MAX) → int32(MAX), no-op
-                // - sum float16 (AccT=float): cast float16(0) → float(0)
-                // - min float16 (AccT=float16): cast float16(MAX) → float16(MAX), no-op
-                if constexpr (std::is_same_v<AccT, ValueIndex<T>>) {
-                    accumulator = op.identity();  // index path, never reached here
+                // ValueIndex<T> case is handled entirely in the INDEX path above — unreachable here
+                if constexpr (should_use_double_accumulation<T>()) {
+                    accumulator = static_cast<double>(op.identity());
+                } else if constexpr (std::is_integral_v<T>) {
+                    accumulator = static_cast<int64_t>(op.identity());
                 } else {
-                    accumulator = static_cast<AccumulatorT>(op.identity());
+                    accumulator = op.identity();
                 }
 
-                // Standard Loop
-                for (int64_t i = 0; i < reduced_count; ++i) {
-                    int64_t slice_coords_buf[MAX_DIMS];
-                    int64_t full_input_coords_buf[MAX_DIMS];
-                    
-                    unravel_index_stack(i, reduced_dims.data(), reduced_dims.size(), slice_coords_buf);
-                    
-                    int out_coord_idx = 0;
-                    int slice_coord_idx = 0;
-                    
-                    for (size_t dim = 0; dim < input_dims.size(); ++dim) {
-                        bool is_reduced = reduced_bitmap[dim];
-                        if (is_reduced) {
-                            full_input_coords_buf[dim] = slice_coords_buf[slice_coord_idx++];
+                if (layout.path == ReductionLayout::Path::InnerContiguous) {
+                    // Input row is flat contiguous — plain pointer walk, zero index math
+                    const T* in_ptr = input_data + output_index * layout.input_outer_stride;
+                    for (int64_t j = 0; j < layout.reduced_count; ++j) {
+                        T input_value = in_ptr[j];
+                        if constexpr (std::is_same_v<AccT, bool>) {
+                            bool val_as_bool = to_bool_value(input_value);
+                            accumulator = op.reduce(accumulator, val_as_bool);
                         } else {
-                            if (rank_preserved) {
-                                full_input_coords_buf[dim] = out_coords_buf[dim];
-                            } else {
-                                full_input_coords_buf[dim] = out_coords_buf[out_coord_idx];
-                            }
-                            out_coord_idx++;
+                            AccumulatorT val_acc = static_cast<AccumulatorT>(input_value);
+                            accumulator = op.reduce(accumulator, val_acc);
                         }
                     }
-                    
-                    int64_t input_lin_idx = ravel_index_stack(full_input_coords_buf, input_strides.data(), input_dims.size());
-                    T input_value = input_data[input_lin_idx];
-
-
-                      //  FIX: Proper type conversion based on AccumulatorT
-                    if constexpr (std::is_same_v<AccT, ValueIndex<T>>) {
-                        // Should never reach here - handled above
-                    } else if constexpr (std::is_same_v<AccT, bool>) {
-                        // For AllOp/AnyOp: convert input value to bool
-                        bool val_as_bool = to_bool_value(input_value);
-                        accumulator = op.reduce(accumulator, val_as_bool);
-                        // Short-circuit: AllOp exits on first false, AnyOp on first true.
-                        // Safe because the inner loop is sequential (not GPU/SIMT).
-                        if (op.can_short_circuit(accumulator)) break;
-                    } else {
-                        AccumulatorT val_acc = static_cast<AccumulatorT>(input_value);
-                        accumulator = op.reduce(accumulator, val_acc);
+                } else if (layout.path == ReductionLayout::Path::OuterContiguous) {
+                    // Walk down a column — one stride-multiply per reduction row, no div/mod
+                    for (int64_t r = 0; r < layout.reduced_count; ++r) {
+                        const T* in_ptr = input_data + output_index + r * layout.input_row_stride;
+                        T input_value = *in_ptr;
+                        if constexpr (std::is_same_v<AccT, bool>) {
+                            bool val_as_bool = to_bool_value(input_value);
+                            accumulator = op.reduce(accumulator, val_as_bool);
+                        } else {
+                            AccumulatorT val_acc = static_cast<AccumulatorT>(input_value);
+                            accumulator = op.reduce(accumulator, val_acc);
+                        }
+                    }
+                } else {
+                    // Generic: precomputed base + carry-add inner counter — zero div/mod per element
+                    int64_t red_coords[MAX_DIMS] = {};
+                    int64_t input_lin_idx = base_lin_idxs[output_index];
+                    for (int64_t i = 0; i < reduced_count; ++i) {
+                        T input_value = input_data[input_lin_idx];
+                        if constexpr (std::is_same_v<AccT, bool>) {
+                            bool val_as_bool = to_bool_value(input_value);
+                            accumulator = op.reduce(accumulator, val_as_bool);
+                        } else {
+                            AccumulatorT val_acc = static_cast<AccumulatorT>(input_value);
+                            accumulator = op.reduce(accumulator, val_acc);
+                        }
+                        // Carry-add: advance pointer, no division
+                        for (int64_t d = k - 1; d >= 0; --d) {
+                            ++red_coords[d];
+                            input_lin_idx += red_input_strides[d];
+                            if (red_coords[d] < reduced_dims[d]) break;
+                            input_lin_idx -= red_coords[d] * red_input_strides[d];
+                            red_coords[d] = 0;
+                        }
                     }
                 }
                 
@@ -339,7 +482,6 @@ Tensor reduce_kernel(
                 } else {
                     output_data[output_index] = static_cast<OutputCppT>(accumulator);
                 }
-           // }
         }
     }
 
@@ -443,14 +585,14 @@ Tensor dispatch_reduction(const Tensor& input, const std::vector<int64_t>& norma
     }
 #endif
 
-    // CPU path continues as before
-    if constexpr (std::is_same_v<OpType<T>, ArgMaxOp<T>> || 
-                  std::is_same_v<OpType<T>, ArgMinOp<T>> || 
-                  std::is_same_v<OpType<T>, NanArgMaxOp<T>> || 
-                  std::is_same_v<OpType<T>, NanArgMinOp<T>>) 
+    // CPU path: optimized binary_kernel_reduce for index ops
+    if constexpr (std::is_same_v<OpType<T>, ArgMaxOp<T>> ||
+                  std::is_same_v<OpType<T>, ArgMinOp<T>> ||
+                  std::is_same_v<OpType<T>, NanArgMaxOp<T>> ||
+                  std::is_same_v<OpType<T>, NanArgMinOp<T>>)
     {
         Shape output_shape = detail::calculate_output_shape(input.shape().dims, normalized_axes, keepdim);
-        return reduce_kernel<T, OpType, ValueIndex<T>>(input, normalized_axes, output_shape);
+        return detail::binary_kernel_reduce_index<T, OpType>(input, normalized_axes, output_shape);
     } 
     else 
     {
@@ -512,7 +654,7 @@ Tensor dispatch_mean_kernel(const Tensor& input, const std::vector<int64_t>& nor
     }
 
     if (input.shape().dims.size() > MAX_DIMS) {
-        throw std::runtime_error("Tensor rank exceeds maximum supported dimensions (16)");
+        throw std::runtime_error("Tensor rank exceeds maximum supported dimensions (64)");
     }
 
     Shape output_shape = detail::calculate_output_shape(input.shape().dims, normalized_axes, keepdim);
@@ -523,10 +665,7 @@ Tensor dispatch_mean_kernel(const Tensor& input, const std::vector<int64_t>& nor
     }
 
     if constexpr (std::is_integral_v<T>) {
-        // CPU integer mean → Float64 (intentionally different from GPU's Float32).
-        // Accumulation in int64_t is exact; dividing to double adds no loop overhead
-        // (the division is O(1) per output slice, dominated by the O(reduced_count) loop).
-        // GPU uses Float32 because FP64 is 32× slower on consumer hardware; CPU FP64 is free.
+        // Integers output Float64
         Tensor output({output_shape}, TensorOptions().with_dtype(Dtype::Float64).with_device(input.device()).with_req_grad(input.requires_grad()));
         
         const T* input_data = input.data<T>();
@@ -534,8 +673,7 @@ Tensor dispatch_mean_kernel(const Tensor& input, const std::vector<int64_t>& nor
         const std::vector<int64_t>& input_strides = input.stride().strides;
         
         const int64_t num_slices = output.numel();
-        const bool rank_preserved = input_dims.size() == output_shape.dims.size();
-        
+
         std::vector<int64_t> reduced_dims;
         for(size_t dim = 0; dim < input_dims.size(); ++dim) {
             bool is_reduced = reduced_bitmap[dim];
@@ -545,70 +683,84 @@ Tensor dispatch_mean_kernel(const Tensor& input, const std::vector<int64_t>& nor
         }
         
         double* output_data = output.data<double>();
-        //SumOpType<T> op;
-        
-        const size_t ndim = output_shape.dims.size();
+
+        // Layout dispatch: replaces per-element unravel/ravel in inner loop
+        ReductionLayout layout_int = compute_reduction_layout(input, normalized_axes);
+        const int64_t k_int = static_cast<int64_t>(normalized_axes.size());
+        int64_t red_input_strides_int[MAX_DIMS];
+        for (int64_t d = 0; d < k_int; ++d)
+            red_input_strides_int[d] = input_strides[normalized_axes[d]];
+        // Precompute base linear indices for Generic path
+        int64_t M_nr_int = 0;
+        int64_t nr_sizes_int[MAX_DIMS], nr_strides_int[MAX_DIMS];
+        std::vector<int64_t> base_lin_idxs_int;
+        if (layout_int.path == ReductionLayout::Path::Generic) {
+            for (size_t dim = 0; dim < input_dims.size(); ++dim) {
+                if (!reduced_bitmap[dim]) {
+                    nr_sizes_int[M_nr_int] = input_dims[dim];
+                    nr_strides_int[M_nr_int] = input_strides[dim];
+                    ++M_nr_int;
+                }
+            }
+            base_lin_idxs_int.resize(num_slices);
+            int64_t oc[MAX_DIMS] = {}, blk = 0;
+            for (int64_t o = 0; o < num_slices; ++o) {
+                base_lin_idxs_int[o] = blk;
+                for (int64_t j = M_nr_int - 1; j >= 0; --j) {
+                    ++oc[j]; blk += nr_strides_int[j];
+                    if (oc[j] < nr_sizes_int[j]) break;
+                    blk -= oc[j] * nr_strides_int[j]; oc[j] = 0;
+                }
+            }
+        }
         #pragma omp parallel for
         for (int64_t output_index = 0; output_index < num_slices; ++output_index) {
             int64_t accumulator = 0;
-            
-            int64_t out_coords_buf[MAX_DIMS];
-            unravel_index_stack(output_index, output_shape.dims.data(), ndim, out_coords_buf);
-            
-            for (int64_t i = 0; i < reduced_count; ++i) {
-                int64_t slice_coords_buf[MAX_DIMS];
-                int64_t full_input_coords_buf[MAX_DIMS];
-                
-                unravel_index_stack(i, reduced_dims.data(), reduced_dims.size(), slice_coords_buf);
-                
-                int out_coord_idx = 0;
-                int slice_coord_idx = 0;
-                
-                for (size_t dim = 0; dim < input_dims.size(); ++dim) {
-                    bool is_reduced = reduced_bitmap[dim];
-                    if (is_reduced) {
-                        full_input_coords_buf[dim] = slice_coords_buf[slice_coord_idx++];
-                    } else {
-                        if (rank_preserved) {
-                            full_input_coords_buf[dim] = out_coords_buf[dim];
-                        } else {
-                            full_input_coords_buf[dim] = out_coords_buf[out_coord_idx];
-                        }
-                        out_coord_idx++;
+
+            if (layout_int.path == ReductionLayout::Path::InnerContiguous) {
+                // Input row is flat contiguous — plain pointer walk
+                const T* in_ptr = input_data + output_index * layout_int.input_outer_stride;
+                for (int64_t j = 0; j < layout_int.reduced_count; ++j)
+                    accumulator += static_cast<int64_t>(in_ptr[j]);
+            } else if (layout_int.path == ReductionLayout::Path::OuterContiguous) {
+                // Walk down a column — one stride-multiply per row
+                for (int64_t r = 0; r < layout_int.reduced_count; ++r)
+                    accumulator += static_cast<int64_t>(*(input_data + output_index + r * layout_int.input_row_stride));
+            } else {
+                // Generic: precomputed base + carry-add inner counter — zero div/mod per element
+                int64_t red_coords[MAX_DIMS] = {};
+                int64_t input_lin_idx = base_lin_idxs_int[output_index];
+                for (int64_t i = 0; i < reduced_count; ++i) {
+                    accumulator += static_cast<int64_t>(input_data[input_lin_idx]);
+                    for (int64_t d = k_int - 1; d >= 0; --d) {
+                        ++red_coords[d];
+                        input_lin_idx += red_input_strides_int[d];
+                        if (red_coords[d] < reduced_dims[d]) break;
+                        input_lin_idx -= red_coords[d] * red_input_strides_int[d];
+                        red_coords[d] = 0;
                     }
                 }
-                
-                int64_t input_lin_idx = ravel_index_stack(full_input_coords_buf, input_strides.data(), input_dims.size());
-                T input_value = input_data[input_lin_idx];
-                
-                accumulator += input_value;
             }
-            
+
             output_data[output_index] = static_cast<double>(accumulator) / static_cast<double>(reduced_count);
         }
-        
+
         return output;
         
         } else {
-    // Floating point: use AccumulatorTypeSelector for correct precision per type.
-    // - float16/bfloat16/FP4: should_use_double_accumulation → double (existing rule)
-    // - float:       AccumulatorType<float, CPU> = double  (existing: float→double on CPU)
-    // - double:      AccumulatorType<double,CPU> = double
-    // - complex32_t: AccumulatorType → complex64_t  (NEW: float16 components → float32)
-    // - complex64_t: AccumulatorType → complex128_t (NEW: float32 components → double on CPU)
-    // - complex128_t:AccumulatorType → complex128_t (no change)
+    // Floating point: use double accumulation for FP16/BF16, centralized type for complex
     using AccT = typename std::conditional<
         should_use_double_accumulation<T>(),
         double,
-        detail::AccumulatorType<T, /*IsGPU=*/false>
+        AccumulatorType<T>
     >::type;
-    
+
     Tensor sum_result = reduce_kernel<T, SumOpType, AccT>(input, normalized_axes, output_shape);
-    
+
     using SumT = typename std::conditional<
         should_use_double_accumulation<T>(),
-        double,  
-        T        
+        double,
+        AccumulatorType<T>
     >::type;
     
     T* sum_data = sum_result.data<T>();
@@ -629,58 +781,86 @@ Tensor dispatch_mean_kernel(const Tensor& input, const std::vector<int64_t>& nor
             }
         }
         
-        const bool rank_preserved = input_dims.size() == output_shape.dims.size();
         const int64_t num_slices = sum_result.numel();
-        
+
         // Create a tensor to store valid counts for each output position
         std::vector<int64_t> valid_counts(num_slices, 0);
-        
-        const size_t ndim = output_shape.dims.size();
+
+        // Layout dispatch: replaces per-element unravel/ravel in inner loop
+        ReductionLayout layout_nan = compute_reduction_layout(input, normalized_axes);
+        const int64_t k_nan = static_cast<int64_t>(normalized_axes.size());
+        int64_t red_input_strides_nan[MAX_DIMS];
+        for (int64_t d = 0; d < k_nan; ++d)
+            red_input_strides_nan[d] = input_strides[normalized_axes[d]];
+        // Precompute base linear indices for Generic path
+        int64_t M_nr_nan = 0;
+        int64_t nr_sizes_nan[MAX_DIMS], nr_strides_nan[MAX_DIMS];
+        std::vector<int64_t> base_lin_idxs_nan;
+        if (layout_nan.path == ReductionLayout::Path::Generic) {
+            for (size_t dim = 0; dim < input_dims.size(); ++dim) {
+                if (!reduced_bitmap[dim]) {
+                    nr_sizes_nan[M_nr_nan] = input_dims[dim];
+                    nr_strides_nan[M_nr_nan] = input_strides[dim];
+                    ++M_nr_nan;
+                }
+            }
+            base_lin_idxs_nan.resize(num_slices);
+            int64_t oc[MAX_DIMS] = {}, blk = 0;
+            for (int64_t o = 0; o < num_slices; ++o) {
+                base_lin_idxs_nan[o] = blk;
+                for (int64_t j = M_nr_nan - 1; j >= 0; --j) {
+                    ++oc[j]; blk += nr_strides_nan[j];
+                    if (oc[j] < nr_sizes_nan[j]) break;
+                    blk -= oc[j] * nr_strides_nan[j]; oc[j] = 0;
+                }
+            }
+        }
         #pragma omp parallel for
         for (int64_t output_index = 0; output_index < num_slices; ++output_index) {
             int64_t valid_count = 0;
-            int64_t out_coords_buf[MAX_DIMS];
-            unravel_index_stack(output_index, output_shape.dims.data(), ndim, out_coords_buf);
-            
-            for (int64_t i = 0; i < reduced_count; ++i) {
-                int64_t slice_coords_buf[MAX_DIMS];
-                int64_t full_input_coords_buf[MAX_DIMS];
-                
-                unravel_index_stack(i, reduced_dims.data(), reduced_dims.size(), slice_coords_buf);
-                
-                int out_coord_idx = 0;
-                int slice_coord_idx = 0;
-                
-                for (size_t dim = 0; dim < input_dims.size(); ++dim) {
-                    bool is_reduced = reduced_bitmap[dim];
-                    if (is_reduced) {
-                        full_input_coords_buf[dim] = slice_coords_buf[slice_coord_idx++];
+
+            if (layout_nan.path == ReductionLayout::Path::InnerContiguous) {
+                // Input row is flat contiguous — plain pointer walk
+                const T* in_ptr = input_data + output_index * layout_nan.input_outer_stride;
+                for (int64_t j = 0; j < layout_nan.reduced_count; ++j) {
+                    T input_value = in_ptr[j];
+                    if constexpr (std::is_same_v<T, float16_t> || std::is_same_v<T, bfloat16_t>) {
+                        if (!std::isnan(static_cast<float>(input_value))) valid_count++;
                     } else {
-                        if (rank_preserved) {
-                            full_input_coords_buf[dim] = out_coords_buf[dim];
-                        } else {
-                            full_input_coords_buf[dim] = out_coords_buf[out_coord_idx];
-                        }
-                        out_coord_idx++;
+                        if (!safe_isnan(input_value)) valid_count++;
                     }
                 }
-                
-                int64_t input_lin_idx = ravel_index_stack(full_input_coords_buf, input_strides.data(), input_dims.size());
-                T input_value = input_data[input_lin_idx];
-                
-                
-                // Check if value is not NaN
-                if constexpr (std::is_same_v<T, float16_t> || std::is_same_v<T, bfloat16_t>) {
-                    if (!std::isnan(static_cast<float>(input_value))) {
-                        valid_count++;
+            } else if (layout_nan.path == ReductionLayout::Path::OuterContiguous) {
+                // Walk down a column — one stride-multiply per row
+                for (int64_t r = 0; r < layout_nan.reduced_count; ++r) {
+                    T input_value = *(input_data + output_index + r * layout_nan.input_row_stride);
+                    if constexpr (std::is_same_v<T, float16_t> || std::is_same_v<T, bfloat16_t>) {
+                        if (!std::isnan(static_cast<float>(input_value))) valid_count++;
+                    } else {
+                        if (!safe_isnan(input_value)) valid_count++;
                     }
-                } else {
-                    if (!safe_isnan(input_value)) {
-                        valid_count++;
+                }
+            } else {
+                // Generic: precomputed base + carry-add inner counter — zero div/mod per element
+                int64_t red_coords[MAX_DIMS] = {};
+                int64_t input_lin_idx = base_lin_idxs_nan[output_index];
+                for (int64_t i = 0; i < reduced_count; ++i) {
+                    T input_value = input_data[input_lin_idx];
+                    if constexpr (std::is_same_v<T, float16_t> || std::is_same_v<T, bfloat16_t>) {
+                        if (!std::isnan(static_cast<float>(input_value))) valid_count++;
+                    } else {
+                        if (!safe_isnan(input_value)) valid_count++;
+                    }
+                    for (int64_t d = k_nan - 1; d >= 0; --d) {
+                        ++red_coords[d];
+                        input_lin_idx += red_input_strides_nan[d];
+                        if (red_coords[d] < reduced_dims[d]) break;
+                        input_lin_idx -= red_coords[d] * red_input_strides_nan[d];
+                        red_coords[d] = 0;
                     }
                 }
             }
-            
+
             valid_counts[output_index] = valid_count;
         }
         
@@ -702,6 +882,8 @@ Tensor dispatch_mean_kernel(const Tensor& input, const std::vector<int64_t>& nor
                     sum_data[i] = static_cast<T>(static_cast<float>(val));
                 } else if constexpr (std::is_same_v<T, bfloat16_t>) {
                     sum_data[i] = static_cast<T>(static_cast<float>(val));
+                } else if constexpr (std::is_same_v<T, complex32_t> || std::is_same_v<T, complex64_t>) {
+                    sum_data[i] = T(static_cast<float>(val.real()), static_cast<float>(val.imag()));
                 } else {
                     sum_data[i] = val;
                 }
@@ -736,12 +918,14 @@ Tensor dispatch_mean_kernel(const Tensor& input, const std::vector<int64_t>& nor
                 sum_data[i] = static_cast<T>(static_cast<float>(val));
             } else if constexpr (std::is_same_v<T, bfloat16_t>) {
                 sum_data[i] = static_cast<T>(static_cast<float>(val));
+            } else if constexpr (std::is_same_v<T, complex32_t> || std::is_same_v<T, complex64_t>) {
+                sum_data[i] = T(static_cast<float>(val.real()), static_cast<float>(val.imag()));
             } else {
                 sum_data[i] = val;
             }
         }
     }
-    
+
     return sum_result;
 
 
@@ -836,26 +1020,26 @@ Tensor dispatch_variance_kernel(const Tensor& input,
     }
 
     if (input.shape().dims.size() > MAX_DIMS) {
-        throw std::runtime_error("Tensor rank exceeds maximum supported dimensions (16)");
+        throw std::runtime_error("Tensor rank exceeds maximum supported dimensions (64)");
     }
     
-    // Determine output dtype: CPU integers → Float64 (FP64 is free on CPU; GPU uses Float32).
+    // Determine output dtype
     Dtype output_dtype;
     if constexpr (std::is_integral_v<T>) {
         output_dtype = Dtype::Float64;
     } else {
         output_dtype = input.dtype();
     }
-
+    
     Tensor output({output_shape}, TensorOptions()
         .with_dtype(output_dtype)
         .with_device(input.device())
         .with_req_grad(input.requires_grad()));
-
+    
     //  STEP 3: Prepare data pointers
     const T* input_data = input.data<T>();
-
-    // Integer mean is Float64 on CPU; cast mean pointer accordingly.
+    
+    //  CRITICAL FIX: For integers, mean is stored as double
     using MeanCppT = typename std::conditional<
         std::is_integral_v<T>,
         double,
@@ -864,23 +1048,16 @@ Tensor dispatch_variance_kernel(const Tensor& input,
     
     const MeanCppT* mean_data = mean_tensor.data<MeanCppT>();
     
-    // Variance accumulator type (CPU):
-    // - float16/bf16/FP4 → double (should_use_double_accumulation rule, unchanged)
-    // - integers         → double (can't do float variance on int meaningfully)
-    // - float            → AccumulatorType<float,CPU> = double
-    // - complex32_t      → AccumulatorType → complex64_t  (NEW: component widening)
-    // - complex64_t      → AccumulatorType → complex128_t (NEW: component widening on CPU)
-    // - complex128_t     → complex128_t (no change)
     using AccT = typename std::conditional<
         should_use_double_accumulation<T>(),
         double,
         typename std::conditional<
             std::is_integral_v<T>,
             double,
-            detail::AccumulatorType<T, /*IsGPU=*/false>
+            AccumulatorType<T>
         >::type
     >::type;
-
+    
     using OutputT = typename std::conditional<
         std::is_integral_v<T>,
         double,
@@ -892,17 +1069,15 @@ Tensor dispatch_variance_kernel(const Tensor& input,
     const std::vector<int64_t>& input_dims = input.shape().dims;
     const std::vector<int64_t>& input_strides = input.stride().strides;
     const int64_t num_slices = output.numel();
-    const bool rank_preserved = input_dims.size() == output_shape.dims.size();
-    
-    // Get mean tensor strides for indexing
-    const std::vector<int64_t>& mean_strides = mean_tensor.stride().strides;
-    
+    // rank_preserved and mean_strides removed: mean_data[output_index] is always correct
+    // because mean was computed with keepdim=true, so its C-contiguous flat index equals output_index
+
     bool reduced_bitmap[MAX_DIMS] = {false};
     for (int64_t axis : normalized_axes) {
         reduced_bitmap[axis] = true;
     }
 
-    // Calculate reduced_dims
+    // Calculate reduced_dims (used by Generic carry-add path)
     std::vector<int64_t> reduced_dims;
     for(size_t dim = 0; dim < input_dims.size(); ++dim) {
         bool is_reduced = reduced_bitmap[dim];
@@ -910,44 +1085,52 @@ Tensor dispatch_variance_kernel(const Tensor& input,
             reduced_dims.push_back(input_dims[dim]);
         }
     }
-    
-    const size_t ndim = output_shape.dims.size();
+
+    // Layout dispatch: replaces per-element unravel/ravel in inner loop
+    ReductionLayout layout_var = compute_reduction_layout(input, normalized_axes);
+    const int64_t k_var = static_cast<int64_t>(normalized_axes.size());
+    int64_t red_input_strides_var[MAX_DIMS];
+    for (int64_t d = 0; d < k_var; ++d)
+        red_input_strides_var[d] = input_strides[normalized_axes[d]];
+    // Precompute base linear indices for Generic path
+    int64_t M_nr_var = 0;
+    int64_t nr_sizes_var[MAX_DIMS], nr_strides_var[MAX_DIMS];
+    std::vector<int64_t> base_lin_idxs_var;
+    if (layout_var.path == ReductionLayout::Path::Generic) {
+        for (size_t dim = 0; dim < input_dims.size(); ++dim) {
+            if (!reduced_bitmap[dim]) {
+                nr_sizes_var[M_nr_var] = input_dims[dim];
+                nr_strides_var[M_nr_var] = input_strides[dim];
+                ++M_nr_var;
+            }
+        }
+        base_lin_idxs_var.resize(num_slices);
+        int64_t oc[MAX_DIMS] = {}, blk = 0;
+        for (int64_t o = 0; o < num_slices; ++o) {
+            base_lin_idxs_var[o] = blk;
+            for (int64_t j = M_nr_var - 1; j >= 0; --j) {
+                ++oc[j]; blk += nr_strides_var[j];
+                if (oc[j] < nr_sizes_var[j]) break;
+                blk -= oc[j] * nr_strides_var[j]; oc[j] = 0;
+            }
+        }
+    }
+
     #pragma omp parallel for
     for (int64_t output_index = 0; output_index < num_slices; ++output_index) {
         AccT accumulator = AccT(0.0f);
         int64_t valid_count = 0;  // Only used for NaN-aware variance
-        
-        // Calculate output coordinates
-        int64_t out_coords_buf[MAX_DIMS];
-        unravel_index_stack(output_index, output_shape.dims.data(), ndim, out_coords_buf);
-        
-        //  Map output coordinates to mean tensor coordinates
-        // Since mean was computed with keepdim=true, it has same rank as input
-        int64_t mean_coords_buf[MAX_DIMS];
-        int out_coord_idx = 0;
-        
-        for (size_t dim = 0; dim < input_dims.size(); ++dim) {
-            bool is_reduced = reduced_bitmap[dim];
-            if (is_reduced) {
-                mean_coords_buf[dim] = 0;  // Mean tensor has size 1 in reduced dimensions
-            } else {
-                if (rank_preserved) {
-                    mean_coords_buf[dim] = out_coords_buf[dim];
-                } else {
-                    mean_coords_buf[dim] = out_coords_buf[out_coord_idx];
-                }
-                out_coord_idx++;
-            }
-        }
-        
-        // Get the pre-computed mean value for this slice
-        int64_t mean_lin_idx = ravel_index_stack(mean_coords_buf, mean_strides.data(), input_dims.size());
-        AccT mean_val = static_cast<AccT>(mean_data[mean_lin_idx]);
-        
+
+        // mean_data[output_index] is always the correct mean for this output slice.
+        // Proof: mean was computed with keepdim=true. The C-contiguous flat index of
+        // mean_tensor for coordinates (i0,...,0,...,in-1) equals the output_index
+        // because size-1 reduced dims contribute zero to the flat index calculation.
+        AccT mean_val = static_cast<AccT>(mean_data[output_index]);
+
         // Check if mean is NaN
         bool mean_is_nan = false;
-        if constexpr (std::is_floating_point_v<T> || 
-                      std::is_same_v<T, float16_t> || 
+        if constexpr (std::is_floating_point_v<T> ||
+                      std::is_same_v<T, float16_t> ||
                       std::is_same_v<T, bfloat16_t>) {
             if constexpr (std::is_same_v<T, float16_t> || std::is_same_v<T, bfloat16_t>) {
                 mean_is_nan = std::isnan(static_cast<float>(mean_val));
@@ -955,38 +1138,12 @@ Tensor dispatch_variance_kernel(const Tensor& input,
                 mean_is_nan = std::isnan(mean_val);
             }
         }
-        
-        //  Accumulate squared deviations
-        for (int64_t i = 0; i < reduced_count; ++i) {
-            int64_t slice_coords_buf[MAX_DIMS];
-            int64_t full_input_coords_buf[MAX_DIMS];
-            
-            unravel_index_stack(i, reduced_dims.data(), reduced_dims.size(), slice_coords_buf);
-            
-            out_coord_idx = 0;
-            int slice_coord_idx = 0;
-            
-            for (size_t dim = 0; dim < input_dims.size(); ++dim) {
-                bool is_reduced = reduced_bitmap[dim];
-                if (is_reduced) {
-                    full_input_coords_buf[dim] = slice_coords_buf[slice_coord_idx++];
-                } else {
-                    if (rank_preserved) {
-                        full_input_coords_buf[dim] = out_coords_buf[dim];
-                    } else {
-                        full_input_coords_buf[dim] = out_coords_buf[out_coord_idx];
-                    }
-                    out_coord_idx++;
-                }
-            }
-            
-            int64_t input_lin_idx = ravel_index_stack(full_input_coords_buf, input_strides.data(), input_dims.size());
-            T input_value = input_data[input_lin_idx];
-            
-            // Check if value is NaN
+
+        // Helper lambda: accumulate one input_value into accumulator
+        auto accumulate_val = [&](T input_value) {
             bool is_nan = false;
-            if constexpr (std::is_floating_point_v<T> || 
-                          std::is_same_v<T, float16_t> || 
+            if constexpr (std::is_floating_point_v<T> ||
+                          std::is_same_v<T, float16_t> ||
                           std::is_same_v<T, bfloat16_t>) {
                 if constexpr (std::is_same_v<T, float16_t> || std::is_same_v<T, bfloat16_t>) {
                     is_nan = std::isnan(static_cast<float>(input_value));
@@ -994,26 +1151,52 @@ Tensor dispatch_variance_kernel(const Tensor& input,
                     is_nan = std::isnan(input_value);
                 }
             }
-            
             if constexpr (is_nan_aware) {
-                //  NaN-aware: Skip NaN values and count valid ones
                 if (!is_nan) {
                     AccT val_acc = static_cast<AccT>(input_value);
                     AccT diff = val_acc - mean_val;
                     accumulator += diff * diff;
-                    valid_count++;  // Only increment for valid values
+                    valid_count++;
                 }
             } else {
-                //  Regular variance: Propagate NaN immediately
                 if (is_nan || mean_is_nan) {
                     accumulator = std::numeric_limits<AccT>::quiet_NaN();
-                    break;  // Early exit on NaN
+                } else {
+                    AccT val_acc = static_cast<AccT>(input_value);
+                    AccT diff = val_acc - mean_val;
+                    accumulator += diff * diff;
                 }
-                
-                AccT val_acc = static_cast<AccT>(input_value);
-                AccT diff = val_acc - mean_val;
-                accumulator += diff * diff;
-                // Don't increment valid_count here!
+            }
+        };
+
+        // 3-path dispatch: replaces unravel/ravel hot loop
+        if (layout_var.path == ReductionLayout::Path::InnerContiguous) {
+            // Input row is flat contiguous — plain pointer walk
+            const T* in_ptr = input_data + output_index * layout_var.input_outer_stride;
+            for (int64_t j = 0; j < layout_var.reduced_count; ++j) {
+                if (!is_nan_aware && safe_isnan(accumulator)) break;  // early-exit on NaN propagation
+                accumulate_val(in_ptr[j]);
+            }
+        } else if (layout_var.path == ReductionLayout::Path::OuterContiguous) {
+            // Walk down a column — one stride-multiply per row
+            for (int64_t r = 0; r < layout_var.reduced_count; ++r) {
+                if (!is_nan_aware && safe_isnan(accumulator)) break;
+                accumulate_val(*(input_data + output_index + r * layout_var.input_row_stride));
+            }
+        } else {
+            // Generic: precomputed base + carry-add inner counter — zero div/mod per element
+            int64_t red_coords[MAX_DIMS] = {};
+            int64_t input_lin_idx = base_lin_idxs_var[output_index];
+            for (int64_t i = 0; i < reduced_count; ++i) {
+                if (!is_nan_aware && safe_isnan(accumulator)) break;
+                accumulate_val(input_data[input_lin_idx]);
+                for (int64_t d = k_var - 1; d >= 0; --d) {
+                    ++red_coords[d];
+                    input_lin_idx += red_input_strides_var[d];
+                    if (red_coords[d] < reduced_dims[d]) break;
+                    input_lin_idx -= red_coords[d] * red_input_strides_var[d];
+                    red_coords[d] = 0;
+                }
             }
         }
         
@@ -1050,11 +1233,15 @@ Tensor dispatch_variance_kernel(const Tensor& input,
             output_data[output_index] = static_cast<OutputT>(
                 static_cast<T>(static_cast<float>(variance))
             );
+        } else if constexpr (std::is_same_v<T, complex32_t> || std::is_same_v<T, complex64_t>) {
+            output_data[output_index] = static_cast<OutputT>(
+                T(static_cast<float>(variance.real()), static_cast<float>(variance.imag()))
+            );
         } else {
             output_data[output_index] = static_cast<OutputT>(variance);
         }
     }
-    
+
     return output;
 }
 } // namespace detail

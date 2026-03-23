@@ -106,44 +106,70 @@ int64_t calculate_reduced_count(const std::vector<int64_t>& input_dims, const st
 }
 
 
-/**
- * @brief Converts a linear index to a multi-dimensional coordinate vector (Unravels).
- * This assumes C-order (row-major) layout.
- * @param linear_index The 1D index.
- * @param shape The shape of the tensor.
- * @return A vector of coordinates (e.g., {i, j, k}).
- */
-std::vector<int64_t> unravel_index(int64_t linear_index, const std::vector<int64_t>& shape) {
-    std::vector<int64_t> coords(shape.size());
-    int64_t temp_index = linear_index;
-
-    // Iterate backwards for C-order (row-major), using size_t for the loop index.
-    for (size_t i = shape.size(); i-- > 0; ) {
-        if (shape[i] == 0) continue; 
-        coords[i] = temp_index % shape[i];
-        temp_index /= shape[i];
-    }
-    
-    return coords;
+//returns true if normalized_axes == {ndim-k,ndim-k+1, ...., ndim-1}
+//i.e., axes are the rightmost k consecutive dimensions 
+static bool axes_are_innermost(const std::vector<int64_t>& normalized_axes,int64_t ndim){
+    int64_t k = static_cast<int64_t>(normalized_axes.size());
+    int64_t start = ndim - k;
+    for (int64_t i = 0;i<k;++i)
+        if (normalized_axes[i] != start + i) return false;  
+    return true ;
 }
 
-/**
- * @brief Converts a multi-dimensional coordinate vector back to a linear index using strides (Ravel).
- * @param coords The multi-dimensional coordinates.
- * @param strides The strides of the tensor's shape.
- * @return The 1D linear index.
- */
-int64_t ravel_index(const std::vector<int64_t>& coords, const std::vector<int64_t>& strides) {
-    if (coords.size() != strides.size()) {
-        throw std::runtime_error("Coordinate vector and stride vector must have the same rank.");
-    }
-    
-    int64_t linear_index = 0;
-    for (size_t i = 0; i < coords.size(); ++i) {
-        linear_index += coords[i] * strides[i];
-    }
-    return linear_index;
+//returns true if normalized_axes == {0,1,2,....,k-1}
+////i.e., aces are the leftmost k consecutive dimensions 
+static bool axes_are_outermost(const std::vector<int64_t>& normalized_axes){
+    int64_t k = static_cast<int64_t>(normalized_axes.size());
+    for(int64_t i = 0; i<k;++i)
+        if(normalized_axes[i] != i) return false;
+    return true ;
 }
+ReductionLayout compute_reduction_layout(const Tensor& input , const std::vector<int64_t>& normalized_axes){
+    const auto& dims = input.shape().dims;
+    const int64_t ndim = static_cast<int64_t>(dims.size());
+    const int64_t k = static_cast<int64_t>(normalized_axes.size());
+    ReductionLayout layout ; //path defaults to Generic
+    //SIMD paths only works for C-contiguous input  and all non-contiguous --->Generic path
+    if(!input.is_contiguous()) return layout ;
 
+    //Case-1 : Innercontiguous 
+    //axes are the rightmost k dims : {ndim-k,....,ndim-1)
+    //also covers full-tensor reduction : k == ndim,num_outputs = 1 
+    if(axes_are_innermost(normalized_axes,ndim)){
+        int64_t  red=1;
+        for(int64_t i=ndim-k;i<ndim;++i)
+            red*=dims[i];     
+        int64_t outer = 1;
+        for(int64_t i=0 ; i<ndim-k;++i)
+            outer*=dims[i];
+        layout.path = ReductionLayout::Path::InnerContiguous;
+        layout.num_outputs = outer; //outer OpenMP loop = inner_count positions 
+        layout.reduced_count = red ;
+        layout.input_outer_stride = red; // C-contiguous : row stride == reduced_count
+        //inner_count and input_row_stride not used for this path
+        return layout;
+    }
+     // Case-2 : OuterContiguous 
+        //axes are the leftmost k dims: {0,1,....,k-1}
+        if (axes_are_outermost(normalized_axes)){
+            int64_t red = 1;
+            for (int64_t i=0;i<k;++i)
+                red*= dims[i];
+            int64_t inner = 1;
+            for(int64_t i=k;i<ndim;++i)
+                inner*=dims[i];
+            layout.path = ReductionLayout::Path::OuterContiguous;
+            layout.num_outputs = inner; //outer OpenMP loop = inner_count_positions
+            layout.reduced_count = red ;
+            layout.inner_count = inner ;
+            layout.input_outer_stride = inner ; //same as row-stride for C-contiguous 
+            layout.input_row_stride = inner ; //C-contiguous : stride between reduction rows
+            return layout;
+        }
+
+        // Case -3 : Generic fallback 
+        //Middle-dim reduction ,non-consecutive axes ,or non-contiguous input 
+        return layout ;
+}
 } // namespace detail
 } // namespace OwnTensor

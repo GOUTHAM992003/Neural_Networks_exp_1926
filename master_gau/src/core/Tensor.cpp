@@ -1031,6 +1031,7 @@ template const complex128_t* Tensor::grad<complex128_t>() const;
 
     // Explicit instantiations for fill_grad
     template void Tensor::fill_grad<bool>(bool);
+    template void Tensor::fill_grad<int8_t>(int8_t);
     template void Tensor::fill_grad<int16_t>(int16_t);
     template void Tensor::fill_grad<int32_t>(int32_t);
     template void Tensor::fill_grad<int64_t>(int64_t);
@@ -1048,6 +1049,7 @@ template const complex128_t* Tensor::grad<complex128_t>() const;
 
     // Explicit instantiations for fill
     template void Tensor::fill<bool>(bool);
+    template void Tensor::fill<int8_t>(int8_t);
     template void Tensor::fill<int16_t>(int16_t);
     template void Tensor::fill<int32_t>(int32_t);
     template void Tensor::fill<int64_t>(int64_t);

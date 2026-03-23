@@ -94,6 +94,7 @@ void convert_to_bool_cuda(const T* input, bool* output, int64_t n, cudaStream_t 
 // ============================================================================
 
 template void convert_to_bool_cuda<bool>(const bool*, bool*, int64_t, cudaStream_t);
+template void convert_to_bool_cuda<int8_t>(const int8_t*, bool*, int64_t, cudaStream_t);
 template void convert_to_bool_cuda<int16_t>(const int16_t*, bool*, int64_t, cudaStream_t);
 template void convert_to_bool_cuda<int32_t>(const int32_t*, bool*, int64_t, cudaStream_t);
 template void convert_to_bool_cuda<int64_t>(const int64_t*, bool*, int64_t, cudaStream_t);

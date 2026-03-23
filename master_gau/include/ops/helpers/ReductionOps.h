@@ -259,43 +259,7 @@ DEVICE_HOST inline bool is_nan_check(T val) {
 template<> __device__ inline bool gpu_isnan(float4_e2m1_t val) { return std::isnan(static_cast<float>(val)); }
 template<> __device__ inline bool gpu_isnan(float4_e2m1_2x_t val) { return std::isnan(static_cast<float>(val)); }
 #endif
-//i commented this old accumulator system becoz its de-centralized and only used in CPU parts,
-//and also had bugs like used int64_t for all unsigned types etc., so restructured it.
-// ═══════════════════════════════════════════════════════════
-// ACCUMULATOR TYPE SELECTOR
-// ═══════════════════════════════════════════════════════════
 
-// template<typename T>
-// struct AccumulatorTypeSelector {
-//     using type = T;
-// };
-// // Integer types use int64_t to prevent overflow
-// template<> struct AccumulatorTypeSelector<int16_t> { using type = int64_t; };
-// template<> struct AccumulatorTypeSelector<int32_t> { using type = int64_t; };
-// template<> struct AccumulatorTypeSelector<int64_t> { using type = int64_t; };
-// template<> struct AccumulatorTypeSelector<uint8_t> { using type = int64_t; };
-// template<> struct AccumulatorTypeSelector<uint16_t> { using type = int64_t; };
-// template<> struct AccumulatorTypeSelector<uint32_t> { using type = int64_t; };
-// template<> struct AccumulatorTypeSelector<uint64_t> { using type = int64_t; };
-// // Half precision floats use float for better precision
-// template<> struct AccumulatorTypeSelector<float16_t> { using type = float; };
-// template<> struct AccumulatorTypeSelector<bfloat16_t> { using type = float; };
-// template<> struct AccumulatorTypeSelector<float> {using type = double;} ;
-// //  FIX: Bool should accumulate as int64_t (like PyTorch/NumPy)
-// template<> struct AccumulatorTypeSelector<bool> { using type = int64_t; };
-
-// // FP4 types should accumulate as float to avoid needing math operators on the types themselves
-// template<> struct AccumulatorTypeSelector<float4_e2m1_t> { using type = float; };
-// template<> struct AccumulatorTypeSelector<float4_e2m1_2x_t> { using type = float; };
-
-
-// #ifdef __CUDACC__
-// template<> struct AccumulatorTypeSelector<__half> { using type = float; };
-// template<> struct AccumulatorTypeSelector<__nv_bfloat16> { using type = float; };
-// #endif
-
-// template<typename T>
-// using AccumulatorType = typename AccumulatorTypeSelector<T>::type;
 // ═══════════════════════════════════════════════════════════
 // ACCUMULATOR TYPE SELECTOR  (IsGPU=false → CPU, IsGPU=true → GPU)
 // Pure compile-time trait — zero runtime cost.
@@ -360,7 +324,13 @@ template<bool IsGPU> struct AccumulatorTypeSelector<__nv_bfloat16, IsGPU> { usin
 #endif
 
 // ── Convenience alias ─────────────────────────────────────────────────────────
+// Default auto-selects: nvcc (.cu files) → GPU types, g++ (.cpp files) → CPU types.
+// Explicit AccumulatorType<T, true/false> overrides when needed.
+#ifdef __CUDACC__
+template<typename T, bool IsGPU = true>
+#else
 template<typename T, bool IsGPU = false>
+#endif
 using AccumulatorType = typename AccumulatorTypeSelector<T, IsGPU>::type;
 
 // ═══════════════════════════════════════════════════════════
@@ -727,25 +697,9 @@ struct NanVarianceOp {
 template <typename T>
 struct ArgMinOp {
     using AccumulatorType = ValueIndex<T>;
-
-    DEVICE_HOST ValueIndex<T> identity() const {
-        return ValueIndex<T>(get_max_value<T>(), -1);
-    }
-
-    // CPU 2-variable path: initial sentinel (no element seen yet)
-    T identity_val() const { return get_max_value<T>(); }
-
-    // CPU 2-variable path: true if candidate should replace current_best.
-    // NaN propagates: first NaN encountered "wins" (keeps lowest NaN index).
-    // 1 NaN check per element in the hot path (all-finite data): if candidate is
-    // not NaN, skip the NaN branch entirely. If current_best is NaN, IEEE 754
-    // guarantees (NaN < x) = false, so the comparison below returns false
-    // and the NaN accumulator is preserved without an extra check.
-    bool better_than(const T& candidate, const T& current_best) const {
-        if constexpr (is_any_float_v<T>) {
-            if (is_nan_check(candidate)) return !is_nan_check(current_best);
-        }
-        return candidate < current_best;
+    
+    DEVICE_HOST ValueIndex<T> identity() const { 
+        return ValueIndex<T>(get_max_value<T>(), -1); 
     }
 
     DEVICE_HOST ValueIndex<T> reduce(const ValueIndex<T>& a, const ValueIndex<T>& b) const {
@@ -789,21 +743,9 @@ struct ArgMinOp {
 template <typename T>
 struct ArgMaxOp {
     using AccumulatorType = ValueIndex<T>;
-
+    
     DEVICE_HOST ValueIndex<T> identity() const {
-        return ValueIndex<T>(get_lowest_value<T>(), -1);
-    }
-
-    // CPU 2-variable path: initial sentinel
-    T identity_val() const { return get_lowest_value<T>(); }
-
-    // CPU 2-variable path: true if candidate should replace current_best.
-    // NaN propagates: first NaN encountered "wins".
-    bool better_than(const T& candidate, const T& current_best) const {
-        if constexpr (is_any_float_v<T>) {
-            if (is_nan_check(candidate)) return !is_nan_check(current_best);
-        }
-        return candidate > current_best;
+        return ValueIndex<T>(get_lowest_value<T>(), -1); 
     }
 
     DEVICE_HOST ValueIndex<T> reduce(const ValueIndex<T>& a, const ValueIndex<T>& b) const {
@@ -847,21 +789,9 @@ struct ArgMaxOp {
 template <typename T>
 struct NanArgMinOp {
     using AccumulatorType = ValueIndex<T>;
-
-    DEVICE_HOST ValueIndex<T> identity() const {
-        return ValueIndex<T>(get_max_value<T>(), -1);
-    }
-
-    // CPU 2-variable path: initial sentinel
-    T identity_val() const { return get_max_value<T>(); }
-
-    // CPU 2-variable path: true if candidate should replace current_best.
-    // NaN is skipped (treated as if not present in the tensor).
-    bool better_than(const T& candidate, const T& current_best) const {
-        if constexpr (is_any_float_v<T>) {
-            if (is_nan_check(candidate)) return false;  // skip NaN inputs
-        }
-        return candidate < current_best;
+    
+    DEVICE_HOST ValueIndex<T> identity() const { 
+        return ValueIndex<T>(get_max_value<T>(), -1); 
     }
 
     DEVICE_HOST ValueIndex<T> reduce(const ValueIndex<T>& a, const ValueIndex<T>& b) const {
@@ -907,21 +837,9 @@ struct NanArgMinOp {
 template <typename T>
 struct NanArgMaxOp {
     using AccumulatorType = ValueIndex<T>;
-
+    
     DEVICE_HOST ValueIndex<T> identity() const {
-        return ValueIndex<T>(get_lowest_value<T>(), -1);
-    }
-
-    // CPU 2-variable path: initial sentinel
-    T identity_val() const { return get_lowest_value<T>(); }
-
-    // CPU 2-variable path: true if candidate should replace current_best.
-    // NaN is skipped (treated as if not present in the tensor).
-    bool better_than(const T& candidate, const T& current_best) const {
-        if constexpr (is_any_float_v<T>) {
-            if (is_nan_check(candidate)) return false;  // skip NaN inputs
-        }
-        return candidate > current_best;
+        return ValueIndex<T>(get_lowest_value<T>(), -1); 
     }
 
     DEVICE_HOST ValueIndex<T> reduce(const ValueIndex<T>& a, const ValueIndex<T>& b) const {
@@ -973,33 +891,27 @@ struct NanArgMaxOp {
 template <typename T>
 struct AllOp {
     using AccT = bool;  // Always accumulate as bool
-
-    DEVICE_HOST bool identity() const {
+    
+    DEVICE_HOST bool identity() const { 
         return true;  // Neutral element for AND operation
     }
-
+    
     DEVICE_HOST bool reduce(const bool& a, const bool& b) const {
         return a && b;  // Logical AND
     }
-
-    // CPU short-circuit: once accumulator is false, AND can never recover — stop.
-    bool can_short_circuit(bool acc) const { return !acc; }
 };
 
 template <typename T>
 struct AnyOp {
     using AccT = bool;  // Always accumulate as bool
-
-    DEVICE_HOST bool identity() const {
+    
+    DEVICE_HOST bool identity() const { 
         return false;  // Neutral element for OR operation
     }
-
+    
     DEVICE_HOST bool reduce(const bool& a, const bool& b) const {
         return a || b;  // Logical OR
     }
-
-    // CPU short-circuit: once accumulator is true, OR can never go back — stop.
-    bool can_short_circuit(bool acc) const { return acc; }
 };
 // ═══════════════════════════════════════════════════════════
 // REDUCTION TYPE DISPATCHER

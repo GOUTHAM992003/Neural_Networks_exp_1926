@@ -510,12 +510,12 @@ namespace OwnTensor {
         //       imag_(float16_t(static_cast<float>(imag_val))) {}
 
         // Constructor from std::complex<float> for convenience
-        __host__ explicit complex32_t(const std::complex<float>& c) 
+        __device__ __host__ explicit complex32_t(const std::complex<float>& c)
             : real_(float16_t(c.real())), imag_(float16_t(c.imag())) {}
 
         // Constructor from std::complex<double> for convenience
-        __host__ explicit complex32_t(const std::complex<double>& c) 
-            : real_(float16_t(static_cast<float>(c.real()))), 
+        __device__ __host__ explicit complex32_t(const std::complex<double>& c)
+            : real_(float16_t(static_cast<float>(c.real()))),
               imag_(float16_t(static_cast<float>(c.imag()))) {}
     
         // Conversion from other custom complex types

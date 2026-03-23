@@ -48,7 +48,7 @@ int main() {
     std::chrono::duration<double> elapsed = end - start;
     std::cout<<"Naive Sum:  "<<acc<<" Time: "<<elapsed.count()<<std::endl;
     start = std::chrono::high_resolution_clock::now();
-    for(int i=0;i<100000000000;i++){
+    for(int i=0;i<100000000;i++){
         float c=t-err;
         float sum_1 = sum+c ;
         float c_1 = (sum_1-sum);
