@@ -333,6 +333,25 @@ template<typename T, bool IsGPU = false>
 #endif
 using AccumulatorType = typename AccumulatorTypeSelector<T, IsGPU>::type;
 
+// ── Product accumulator: NO float→double promotion ────────────────────────────
+// Multiplication doesn't suffer from catastrophic cancellation (unlike addition).
+// It only scales exponents — no mantissa digits are destroyed. Promoting to double
+// doesn't help: if result > FLOAT_MAX, casting double back still gives Infinity.
+// So product stays in native precision. Only fp16/bf16 still promote to float32
+// (no native CPU math), and integers still promote to int64 (overflow protection).
+template<typename T>
+struct ProductAccumulatorSelector {
+    // Default: same as AccumulatorType (handles fp16→float, int→int64, etc.)
+    using type = AccumulatorType<T>;
+};
+// Override: float stays float on CPU (NOT double)
+template<> struct ProductAccumulatorSelector<float>      { using type = float; };
+// Override: complex64 stays complex64 on CPU (NOT complex128)
+template<> struct ProductAccumulatorSelector<complex64_t> { using type = complex64_t; };
+
+template<typename T>
+using ProductAccumType = typename ProductAccumulatorSelector<T>::type;
+
 // ═══════════════════════════════════════════════════════════
 //  CORE REDUCTION OPERATIONS (NOW USES GPU INTRINSICS!)
 // ═══════════════════════════════════════════════════════════
@@ -373,7 +392,7 @@ struct SumOp {
 
 template <typename T>
 struct ProductOp {
-    using AccT = AccumulatorType<T>;
+    using AccT = ProductAccumType<T>;
     
     DEVICE_HOST AccT identity() const { 
         return AccT(1.0f); 
@@ -553,8 +572,8 @@ struct NanSumOp {
 
 template <typename T>
 struct NanProductOp {
-    using AccT = AccumulatorType<T>;
-    
+    using AccT = ProductAccumType<T>;
+
     DEVICE_HOST AccT identity() const { return AccT(1.0f); }
     
     DEVICE_HOST AccT reduce(const AccT& a, const AccT& b) const {

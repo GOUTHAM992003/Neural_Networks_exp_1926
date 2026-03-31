@@ -40,7 +40,7 @@ CPPFLAGS = -Iinclude -I$(CUDA_INC) -I$(NVTX_INC) -DWITH_CUDA
 ifeq ($(PROFILER),1)
 CPPFLAGS += -DAUTOGRAD_PROFILER_ENABLED
 endif
-CXXFLAGS = -std=c++20 -fPIC -Wall -Wextra -g -O3 -fopenmp
+CXXFLAGS = -std=c++20 -fPIC -Wall -Wextra -g -O3 -fopenmp -mavx2 -mfma -mf16c
 NVCCFLAGS = -std=c++20 -Xcompiler="-fPIC" -arch=sm_86 -g -O3 --expt-relaxed-constexpr -lineinfo
 
 # Auto-detect CUDA targets lib directory (for NVTX and other libraries)

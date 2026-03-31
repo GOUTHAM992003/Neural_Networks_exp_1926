@@ -59,7 +59,7 @@ Tensor reduce_mean(const Tensor& input, const std::vector<int64_t>& axes, bool k
     
     return dispatch_by_dtype(input.dtype(), [&](auto T_val) -> Tensor {
         using T = decltype(T_val);
-        return detail::dispatch_mean_kernel<T, SumOp>(input, normalized_axes, keepdim, stream);
+        return detail::reduce_kernel_mean<T, SumOp>(input, normalized_axes, keepdim, stream);
     });
 }
 
@@ -142,7 +142,7 @@ Tensor reduce_nanmean(const Tensor& input, const std::vector<int64_t>& axes, boo
     
     return dispatch_by_dtype(input.dtype(), [&](auto T_val) -> Tensor {
         using T = decltype(T_val);
-        return detail::dispatch_mean_kernel<T, NanSumOp>(input, normalized_axes, keepdim, stream);
+        return detail::reduce_kernel_mean<T, NanSumOp>(input, normalized_axes, keepdim, stream);
     });
 }
 
@@ -388,12 +388,12 @@ std::pair<Tensor, Tensor> reduce_var_mean(const Tensor& input,
     //  FIX: Compute mean ONCE with the correct keepdim setting
     Tensor mean = reduce_mean(input, axes, keepdim, stream);
     
-    //  FIX: Compute variance using dispatch_variance_kernel which will compute its own mean internally
+    //  FIX: Compute variance using dispatch_variance_kernel passing the precomputed mean
     std::vector<int64_t> normalized_axes = detail::normalize_axes(input.shape().dims, axes);
     Tensor var = dispatch_by_dtype(input.dtype(), [&](auto T_val) -> Tensor {
         using T = decltype(T_val);
         return detail::dispatch_variance_kernel<T, VarianceOp>(
-            input, normalized_axes, keepdim, correction, stream
+            input, normalized_axes, keepdim, correction, stream, &mean
         );
     });
     
