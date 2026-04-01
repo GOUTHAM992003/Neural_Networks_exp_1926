@@ -14,7 +14,6 @@ int main() {
     //y.fill(300);
     //cout<<"Tensor Y:"<<endl;
    // y.to_cpu().display(std::cout,4);
-
     //Comparison
     auto start = std::chrono::high_resolution_clock::now();
     reduce_sum(x,{0,2});
