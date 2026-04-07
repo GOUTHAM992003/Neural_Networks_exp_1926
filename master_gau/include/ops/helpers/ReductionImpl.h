@@ -2174,19 +2174,6 @@ Tensor dispatch_reduction(const Tensor& input, const std::vector<int64_t>& norma
         std::is_same_v<OpType<T>, AllOp<T>> ||
         std::is_same_v<OpType<T>, AnyOp<T>>;
 
-    // constexpr bool is_complex_type =
-    //     std::is_same_v<T, complex32_t> ||
-    //     std::is_same_v<T, complex64_t> ||
-    //     std::is_same_v<T, complex128_t>;
-
-    // if constexpr (is_complex_type) {
-    //     throw std::runtime_error(
-    //         "Comparison-based reduction operations (min, max, argmin, argmax) are not supported for complex types. "
-    //         "Complex numbers do not have a natural ordering. "
-    //         "Got: " + get_dtype_name(input.dtype())
-    //     );
-    // }
-
     // ALL/ANY for non-bool types: NO separate to_bool() tensor copy.
     // Falls through to reduce_kernel<T, AllOp/AnyOp, bool> which handles
     // inline conversion via to_bool_value() per element (single pass, no allocation).
@@ -2233,6 +2220,18 @@ Tensor dispatch_reduction(const Tensor& input, const std::vector<int64_t>& norma
         std::is_same_v<OpType<T>, NanArgMaxOp<T>>;
     
     // Block comparison operations on complex types - they don't have a natural ordering
+    constexpr bool is_complex_type =
+        std::is_same_v<T, complex32_t> ||
+        std::is_same_v<T, complex64_t> ||
+        std::is_same_v<T, complex128_t>;
+
+    if constexpr (is_complex_type && is_comparison_op) {
+        throw std::runtime_error(
+            "Comparison-based reduction operations (min, max, argmin, argmax) are not supported for complex types. "
+            "Complex numbers do not have a natural ordering. "
+            "Got: " + get_dtype_name(input.dtype())
+        );
+    }
     
     
     // Block NaN operations on non-float types at compile time
@@ -3304,6 +3303,11 @@ Tensor dispatch_variance_kernel(const Tensor& input,
     if (input.is_cuda()) {
         if constexpr (std::is_same_v<T, float4_e2m1_t> || std::is_same_v<T, float4_e2m1_2x_t>) {
              throw std::runtime_error("Variance reduction is not supported for FP4 types.");
+        } else if constexpr (std::is_same_v<T, complex32_t> || std::is_same_v<T, complex64_t> || std::is_same_v<T, complex128_t>) {
+             throw std::runtime_error(
+                 "Variance reduction is not supported for complex types on GPU. "
+                 "Complex variance requires real-valued magnitude decomposition. "
+                 "Got: " + get_dtype_name(input.dtype()));
         } else {
             return dispatch_variance_gpu<T, VarianceOpType>(
                 input, normalized_axes, keepdim, correction, stream);
@@ -3617,47 +3621,28 @@ Tensor dispatch_variance_kernel(const Tensor& input,
     #pragma omp parallel for
     for (int64_t output_index = 0; output_index < num_slices; ++output_index) {
         auto [sq_sum, valid] = var_one_slice(output_index);
-        
-        //  STEP 5: Compute divisor and variance
-        int64_t divisor;
+
+        // STEP 5: Compute variance = sq_sum / (count - correction)
+        // valid = non-NaN count (for nanvar) or reduced_count (for var)
+        double divisor_d;
         if constexpr (is_nan_aware) {
-            divisor = valid - correction;  // Use counted valid values
+            divisor_d = valid - static_cast<double>(correction);
         } else {
-            divisor = reduced_count - correction;  // Use total count
+            divisor_d = static_cast<double>(reduced_count) - static_cast<double>(correction);
         }
 
-        // Compute final variance
-        AccT variance;
-        if (safe_isnan(sq_sum)) {
-            variance = static_cast<AccT>(sq_sum);
-        } else if (divisor <= 0) {
-            variance = std::numeric_limits<AccT>::quiet_NaN();
+        OutputT variance;
+        if (std::isnan(sq_sum) || divisor_d <= 0.0) {
+            if constexpr (std::is_same_v<OutputT, double>)
+                variance = std::numeric_limits<double>::quiet_NaN();
+            else
+                variance = static_cast<OutputT>(std::numeric_limits<double>::quiet_NaN());
         } else {
-            if constexpr (std::is_same_v<AccT, complex32_t> || std::is_same_v<AccT, complex64_t> || std::is_same_v<AccT, complex128_t>) {
-                variance = static_cast<AccT>(sq_sum) / AccT(static_cast<double>(divisor), 0.0);
-            } else if constexpr (std::is_same_v<AccT, float4_e2m1_2x_t> || std::is_same_v<AccT, float4_e2m1_t>) {
-                variance = static_cast<AccT>(static_cast<float>(sq_sum) / static_cast<float>(divisor));
-            } else {
-                variance = static_cast<AccT>(sq_sum / static_cast<double>(divisor));
-            }
+            variance = static_cast<OutputT>(sq_sum / divisor_d);
         }
-        
-        //  STEP 6: Convert back to output type
-        if constexpr (std::is_same_v<T, float16_t>) {
-            output_data[output_index] = static_cast<OutputT>(
-                static_cast<T>(static_cast<float>(variance))
-            );
-        } else if constexpr (std::is_same_v<T, bfloat16_t>) {
-            output_data[output_index] = static_cast<OutputT>(
-                static_cast<T>(static_cast<float>(variance))
-            );
-        } else if constexpr (std::is_same_v<T, complex32_t> || std::is_same_v<T, complex64_t>) {
-            output_data[output_index] = static_cast<OutputT>(
-                T(static_cast<float>(variance.real()), static_cast<float>(variance.imag()))
-            );
-        } else {
-            output_data[output_index] = static_cast<OutputT>(variance);
-        }
+
+        // STEP 6: Store
+        output_data[output_index] = variance;
     }
 
     return output;

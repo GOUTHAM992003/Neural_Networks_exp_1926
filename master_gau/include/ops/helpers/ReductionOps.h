@@ -12,6 +12,7 @@
     // GPU COMPILATION (nvcc)
     #define DEVICE_HOST __device__ __host__
     #include <cuda_runtime.h>
+
     #include <cuda_fp16.h>
     #include <cuda_bf16.h>
     #include <math.h>
@@ -356,6 +357,52 @@ using ProductAccumType = typename ProductAccumulatorSelector<T>::type;
 //  CORE REDUCTION OPERATIONS (NOW USES GPU INTRINSICS!)
 // ═══════════════════════════════════════════════════════════
 
+// ---- Generic shfl_down_sync handling complex types ----
+
+#ifdef __CUDACC__
+// Robust bit-cast shuffle to handle structs (Complex, etc.) via 32-bit registers
+template<typename T> __device__ inline T generic_shfl_down(T val, int offset) {
+    if constexpr (sizeof(T) == 4) {
+        unsigned int tmp;
+        memcpy(&tmp, &val, 4);
+        tmp = ::__shfl_down_sync(0xffffffff, tmp, offset, 32);
+        memcpy(&val, &tmp, 4);
+    } else if constexpr (sizeof(T) == 8) {
+        unsigned long long tmp;
+        memcpy(&tmp, &val, 8);
+        unsigned int lo = (unsigned int)(tmp & 0xffffffff);
+        unsigned int hi = (unsigned int)(tmp >> 32);
+        lo = ::__shfl_down_sync(0xffffffff, lo, offset, 32);
+        hi = ::__shfl_down_sync(0xffffffff, hi, offset, 32);
+        tmp = ((unsigned long long)hi << 32) | lo;
+        memcpy(&val, &tmp, 8);
+    } else if constexpr (sizeof(T) == 2) {
+        unsigned short tmp;
+        memcpy(&tmp, &val, 2);
+        unsigned int itmp = tmp;
+        itmp = ::__shfl_down_sync(0xffffffff, itmp, offset, 32);
+        tmp = (unsigned short)itmp;
+        memcpy(&val, &tmp, 2);
+    } else {
+        val = ::__shfl_down_sync(0xffffffff, val, offset, 32);
+    }
+    return val;
+}
+
+__device__ inline complex32_t generic_shfl_down(complex32_t val, int offset) {
+    return complex32_t(generic_shfl_down(val.real(), offset), generic_shfl_down(val.imag(), offset));
+}
+__device__ inline complex64_t generic_shfl_down(complex64_t val, int offset) {
+    return complex64_t(generic_shfl_down(val.real(), offset), generic_shfl_down(val.imag(), offset));
+}
+__device__ inline complex128_t generic_shfl_down(complex128_t val, int offset) {
+    return complex128_t(generic_shfl_down(val.real(), offset), generic_shfl_down(val.imag(), offset));
+}
+#endif
+
+// Greater-than helper (used by MinOp, MaxOp, WelfordOps::project)
+template<typename T> DEVICE_HOST inline bool generic_gt(T a, T b) { return a > b; }
+
 template <typename T>
 struct SumOp {
     using AccT = AccumulatorType<T>;
@@ -365,7 +412,6 @@ struct SumOp {
     }
    
     DEVICE_HOST AccT reduce(const AccT& a, const AccT& b) const { 
-        
         #ifdef __CUDA_ARCH__
         //  GPU: Use intrinsics for half types
         // constexpr bool is_bool = std::is_same_v<AccT, bool>;
@@ -380,14 +426,35 @@ struct SumOp {
         }
         return gpu_add(a, b);
         #else
-        // CPU: Regular addition
-          if constexpr (is_any_float_v<AccT>) {
+        if constexpr (is_any_float_v<AccT>) {
             if (is_nan_check(a)) return a;
             if (is_nan_check(b)) return b;
         }
         return a + b;
         #endif
     }
+
+    // 3-arg overload for unified kernel (idx unused for value ops)
+    DEVICE_HOST AccT reduce(const AccT& acc, const T& val, int64_t /*idx*/) const {
+        return reduce(acc, static_cast<AccT>(val));
+    }
+
+    // Merge two partial results (same as reduce for sum)
+    DEVICE_HOST AccT combine(const AccT& a, const AccT& b) const {
+        return reduce(a, b);
+    }
+
+    // Final output projection (identity for sum)
+    DEVICE_HOST AccT project(const AccT& a) const {
+        return a;
+    }
+
+#ifdef __CUDACC__
+    // Warp shuffle for GPU reduction pipeline
+    __device__ AccT warp_shfl_down(AccT val, int offset) const {
+        return generic_shfl_down(val, offset);
+    }
+#endif
 };
 
 template <typename T>
@@ -415,6 +482,24 @@ struct ProductOp {
         return a * b;
         #endif
     }
+
+    DEVICE_HOST AccT reduce(const AccT& acc, const T& val, int64_t /*idx*/) const {
+        return reduce(acc, static_cast<AccT>(val));
+    }
+
+    DEVICE_HOST AccT combine(const AccT& a, const AccT& b) const {
+        return reduce(a, b);
+    }
+
+    DEVICE_HOST AccT project(const AccT& a) const {
+        return a;
+    }
+
+#ifdef __CUDACC__
+    __device__ AccT warp_shfl_down(AccT val, int offset) const {
+        return generic_shfl_down(val, offset);
+    }
+#endif
 };
 
 template <typename T>
@@ -461,6 +546,24 @@ struct MinOp {
             #endif
         }
     }
+
+    DEVICE_HOST AccT reduce(const AccT& acc, const T& val, int64_t /*idx*/) const {
+        return reduce(acc, static_cast<AccT>(val));
+    }
+
+    DEVICE_HOST AccT combine(const AccT& a, const AccT& b) const {
+        return reduce(a, b);
+    }
+
+    DEVICE_HOST AccT project(const AccT& a) const {
+        return a;
+    }
+
+#ifdef __CUDACC__
+    __device__ AccT warp_shfl_down(AccT val, int offset) const {
+        return generic_shfl_down(val, offset);
+    }
+#endif
 };
 
 template <typename T>
@@ -507,6 +610,24 @@ struct MaxOp {
             #endif
         }
     }
+
+    DEVICE_HOST AccT reduce(const AccT& acc, const T& val, int64_t /*idx*/) const {
+        return reduce(acc, static_cast<AccT>(val));
+    }
+
+    DEVICE_HOST AccT combine(const AccT& a, const AccT& b) const {
+        return reduce(a, b);
+    }
+
+    DEVICE_HOST AccT project(const AccT& a) const {
+        return a;
+    }
+
+#ifdef __CUDACC__
+    __device__ AccT warp_shfl_down(AccT val, int offset) const {
+        return generic_shfl_down(val, offset);
+    }
+#endif
 };
 // ═══════════════════════════════════════════════════════════
 // VARIANCE OPERATION (Two-pass algorithm for numerical stability)
@@ -542,6 +663,29 @@ struct VarianceOp {
         return acc + diff * diff;
         #endif
     }
+
+    DEVICE_HOST AccT reduce(const AccT& acc, const T& val, int64_t /*idx*/) const {
+        return reduce(acc, static_cast<AccT>(val));
+    }
+
+    DEVICE_HOST AccT combine(const AccT& a, const AccT& b) const {
+        // Combining two partial sums of squared deviations
+        #ifdef __CUDA_ARCH__
+        return gpu_add(a, b);
+        #else
+        return a + b;
+        #endif
+    }
+
+    DEVICE_HOST AccT project(const AccT& a) const {
+        return a;
+    }
+
+#ifdef __CUDACC__
+    __device__ AccT warp_shfl_down(AccT val, int offset) const {
+        return generic_shfl_down(val, offset);
+    }
+#endif
 };
 // ═══════════════════════════════════════════════════════════
 // NaN-AWARE OPERATIONS (ALSO USE GPU INTRINSICS)
@@ -568,6 +712,24 @@ struct NanSumOp {
         return a + b;
         #endif
     }
+
+    DEVICE_HOST AccT reduce(const AccT& acc, const T& val, int64_t /*idx*/) const {
+        return reduce(acc, static_cast<AccT>(val));
+    }
+
+    DEVICE_HOST AccT combine(const AccT& a, const AccT& b) const {
+        return reduce(a, b);
+    }
+
+    DEVICE_HOST AccT project(const AccT& a) const {
+        return a;
+    }
+
+#ifdef __CUDACC__
+    __device__ AccT warp_shfl_down(AccT val, int offset) const {
+        return generic_shfl_down(val, offset);
+    }
+#endif
 };
 
 template <typename T>
@@ -591,6 +753,24 @@ struct NanProductOp {
         return a * b;
         #endif
     }
+
+    DEVICE_HOST AccT reduce(const AccT& acc, const T& val, int64_t /*idx*/) const {
+        return reduce(acc, static_cast<AccT>(val));
+    }
+
+    DEVICE_HOST AccT combine(const AccT& a, const AccT& b) const {
+        return reduce(a, b);
+    }
+
+    DEVICE_HOST AccT project(const AccT& a) const {
+        return a;
+    }
+
+#ifdef __CUDACC__
+    __device__ AccT warp_shfl_down(AccT val, int offset) const {
+        return generic_shfl_down(val, offset);
+    }
+#endif
 };
 
 template <typename T>
@@ -635,6 +815,24 @@ struct NanMinOp {
             #endif
         }
     }
+
+    DEVICE_HOST AccT reduce(const AccT& acc, const T& val, int64_t /*idx*/) const {
+        return reduce(acc, static_cast<AccT>(val));
+    }
+
+    DEVICE_HOST AccT combine(const AccT& a, const AccT& b) const {
+        return reduce(a, b);
+    }
+
+    DEVICE_HOST AccT project(const AccT& a) const {
+        return a;
+    }
+
+#ifdef __CUDACC__
+    __device__ AccT warp_shfl_down(AccT val, int offset) const {
+        return generic_shfl_down(val, offset);
+    }
+#endif
 };
 
 template <typename T>
@@ -680,6 +878,24 @@ struct NanMaxOp {
             #endif
         }
     }
+
+    DEVICE_HOST AccT reduce(const AccT& acc, const T& val, int64_t /*idx*/) const {
+        return reduce(acc, static_cast<AccT>(val));
+    }
+
+    DEVICE_HOST AccT combine(const AccT& a, const AccT& b) const {
+        return reduce(a, b);
+    }
+
+    DEVICE_HOST AccT project(const AccT& a) const {
+        return a;
+    }
+
+#ifdef __CUDACC__
+    __device__ AccT warp_shfl_down(AccT val, int offset) const {
+        return generic_shfl_down(val, offset);
+    }
+#endif
 };// ═══════════════════════════════════════════════════════════
 // NaN-aware variance (IGNORES NaNs, doesn't propagate them)
 // ═══════════════════════════════════════════════════════════
@@ -708,6 +924,28 @@ struct NanVarianceOp {
         return acc + diff * diff;
         #endif
     }
+
+    DEVICE_HOST AccT reduce(const AccT& acc, const T& val, int64_t /*idx*/) const {
+        return reduce(acc, static_cast<AccT>(val));
+    }
+
+    DEVICE_HOST AccT combine(const AccT& a, const AccT& b) const {
+        #ifdef __CUDA_ARCH__
+        return gpu_add(a, b);
+        #else
+        return a + b;
+        #endif
+    }
+
+    DEVICE_HOST AccT project(const AccT& a) const {
+        return a;
+    }
+
+#ifdef __CUDACC__
+    __device__ AccT warp_shfl_down(AccT val, int offset) const {
+        return generic_shfl_down(val, offset);
+    }
+#endif
 };
 // ═══════════════════════════════════════════════════════════
 // INDEX REDUCTIONS (ArgMin/ArgMax) - ALSO USE GPU INTRINSICS
@@ -757,6 +995,29 @@ struct ArgMinOp {
             #endif
         }
     }
+
+    // 3-arg: wrap val+idx into ValueIndex, delegate to 2-arg
+    DEVICE_HOST ValueIndex<T> reduce(const ValueIndex<T>& acc, const T& val, int64_t idx) const {
+        return reduce(acc, ValueIndex<T>(val, idx));
+    }
+
+    DEVICE_HOST ValueIndex<T> combine(const ValueIndex<T>& a, const ValueIndex<T>& b) const {
+        return reduce(a, b);
+    }
+
+    // Project: extract index for output
+    DEVICE_HOST int64_t project(const ValueIndex<T>& a) const {
+        return a.index;
+    }
+
+#ifdef __CUDACC__
+    __device__ ValueIndex<T> warp_shfl_down(ValueIndex<T> val, int offset) const {
+        ValueIndex<T> result;
+        result.value = generic_shfl_down(val.value, offset);
+        result.index = generic_shfl_down(val.index, offset);
+        return result;
+    }
+#endif
 };
 
 template <typename T>
@@ -803,6 +1064,27 @@ struct ArgMaxOp {
             #endif
         }
     }
+
+    DEVICE_HOST ValueIndex<T> reduce(const ValueIndex<T>& acc, const T& val, int64_t idx) const {
+        return reduce(acc, ValueIndex<T>(val, idx));
+    }
+
+    DEVICE_HOST ValueIndex<T> combine(const ValueIndex<T>& a, const ValueIndex<T>& b) const {
+        return reduce(a, b);
+    }
+
+    DEVICE_HOST int64_t project(const ValueIndex<T>& a) const {
+        return a.index;
+    }
+
+#ifdef __CUDACC__
+    __device__ ValueIndex<T> warp_shfl_down(ValueIndex<T> val, int offset) const {
+        ValueIndex<T> result;
+        result.value = generic_shfl_down(val.value, offset);
+        result.index = generic_shfl_down(val.index, offset);
+        return result;
+    }
+#endif
 };
 
 template <typename T>
@@ -851,6 +1133,27 @@ struct NanArgMinOp {
             #endif
         }
     }
+
+    DEVICE_HOST ValueIndex<T> reduce(const ValueIndex<T>& acc, const T& val, int64_t idx) const {
+        return reduce(acc, ValueIndex<T>(val, idx));
+    }
+
+    DEVICE_HOST ValueIndex<T> combine(const ValueIndex<T>& a, const ValueIndex<T>& b) const {
+        return reduce(a, b);
+    }
+
+    DEVICE_HOST int64_t project(const ValueIndex<T>& a) const {
+        return a.index;
+    }
+
+#ifdef __CUDACC__
+    __device__ ValueIndex<T> warp_shfl_down(ValueIndex<T> val, int offset) const {
+        ValueIndex<T> result;
+        result.value = generic_shfl_down(val.value, offset);
+        result.index = generic_shfl_down(val.index, offset);
+        return result;
+    }
+#endif
 };
 
 template <typename T>
@@ -899,6 +1202,27 @@ struct NanArgMaxOp {
             #endif
         }
     }
+
+    DEVICE_HOST ValueIndex<T> reduce(const ValueIndex<T>& acc, const T& val, int64_t idx) const {
+        return reduce(acc, ValueIndex<T>(val, idx));
+    }
+
+    DEVICE_HOST ValueIndex<T> combine(const ValueIndex<T>& a, const ValueIndex<T>& b) const {
+        return reduce(a, b);
+    }
+
+    DEVICE_HOST int64_t project(const ValueIndex<T>& a) const {
+        return a.index;
+    }
+
+#ifdef __CUDACC__
+    __device__ ValueIndex<T> warp_shfl_down(ValueIndex<T> val, int offset) const {
+        ValueIndex<T> result;
+        result.value = generic_shfl_down(val.value, offset);
+        result.index = generic_shfl_down(val.index, offset);
+        return result;
+    }
+#endif
 };
 
 
@@ -916,8 +1240,26 @@ struct AllOp {
     }
     
     DEVICE_HOST bool reduce(const bool& a, const bool& b) const {
-        return a && b;  // Logical AND
+        return a && b;
     }
+
+    DEVICE_HOST bool reduce(const bool& acc, const bool& val, int64_t /*idx*/) const {
+        return reduce(acc, val);
+    }
+
+    DEVICE_HOST bool combine(const bool& a, const bool& b) const {
+        return reduce(a, b);
+    }
+
+    DEVICE_HOST bool project(const bool& a) const {
+        return a;
+    }
+
+#ifdef __CUDACC__
+    __device__ bool warp_shfl_down(bool val, int offset) const {
+        return generic_shfl_down(static_cast<int>(val), offset) != 0;
+    }
+#endif
 };
 
 template <typename T>
@@ -929,9 +1271,195 @@ struct AnyOp {
     }
     
     DEVICE_HOST bool reduce(const bool& a, const bool& b) const {
-        return a || b;  // Logical OR
+        return a || b;
     }
+
+    DEVICE_HOST bool reduce(const bool& acc, const bool& val, int64_t /*idx*/) const {
+        return reduce(acc, val);
+    }
+
+    DEVICE_HOST bool combine(const bool& a, const bool& b) const {
+        return reduce(a, b);
+    }
+
+    DEVICE_HOST bool project(const bool& a) const {
+        return a;
+    }
+
+#ifdef __CUDACC__
+    __device__ bool warp_shfl_down(bool val, int offset) const {
+        return generic_shfl_down(static_cast<int>(val), offset) != 0;
+    }
+#endif
 };
+// ═══════════════════════════════════════════════════════════
+// WELFORD DATA & OPS (Single-pass variance, PyTorch-compatible)
+// ═══════════════════════════════════════════════════════════
+
+template <typename acc_t, typename index_t = int64_t>
+struct WelfordData {
+    acc_t mean;
+    acc_t m2;
+    index_t n;
+    acc_t nf;
+
+    DEVICE_HOST WelfordData() : mean(acc_t(0)), m2(acc_t(0)), n(0), nf(acc_t(0)) {}
+    DEVICE_HOST WelfordData(acc_t mean, acc_t m2, index_t n, acc_t nf)
+        : mean(mean), m2(m2), n(n), nf(nf) {}
+};
+
+template <typename T>
+struct WelfordOps {
+    using AccScalar = AccumulatorType<T>;
+    using acc_t = WelfordData<AccScalar>;
+    AccScalar correction;
+    bool take_sqrt;
+
+    DEVICE_HOST WelfordOps(AccScalar corr = AccScalar(1), bool sqrt = false)
+        : correction(corr), take_sqrt(sqrt) {}
+
+    DEVICE_HOST acc_t identity() const { return acc_t{}; }
+
+    // Per-element Welford update
+    DEVICE_HOST acc_t reduce(acc_t acc, T data, int64_t /*idx*/) const {
+        int64_t new_n = acc.n + 1;
+        AccScalar s_data = static_cast<AccScalar>(data);
+        AccScalar new_nf = static_cast<AccScalar>(new_n);
+        AccScalar delta = s_data - acc.mean;
+        AccScalar new_mean = acc.mean + delta / new_nf;
+        AccScalar new_delta = s_data - new_mean;
+        return acc_t(new_mean, acc.m2 + delta * new_delta, new_n, new_nf);
+    }
+
+    // 2-arg overload for backward compat (delegates to 3-arg)
+    DEVICE_HOST acc_t reduce(const acc_t& a, const acc_t& b) const {
+        return combine(a, b);
+    }
+
+    // Merge two Welford partial aggregates (parallel reduction)
+    DEVICE_HOST acc_t combine(acc_t a, acc_t b) const {
+        if (a.nf == AccScalar(0.0f)) return b;
+        if (b.nf == AccScalar(0.0f)) return a;
+        AccScalar delta = b.mean - a.mean;
+        AccScalar new_count = a.nf + b.nf;
+        AccScalar nb_over_n = b.nf / new_count;
+        return acc_t(
+            a.mean + delta * nb_over_n,
+            a.m2 + b.m2 + delta * delta * a.nf * nb_over_n,
+            -1,  // n is unreliable after combine (may overflow int32)
+            new_count);
+    }
+
+    // Final projection: variance (or std if take_sqrt)
+    DEVICE_HOST AccScalar project(acc_t acc) const {
+        AccScalar divisor = generic_gt(acc.nf, correction) ? acc.nf - correction : AccScalar(0.0f);
+        AccScalar var = acc.m2 / divisor;
+        // take_sqrt: for std deviation
+        // Note: sqrt not available in all constexpr contexts, handled at call site
+        return var;
+    }
+
+#ifdef __CUDACC__
+    __device__ acc_t warp_shfl_down(acc_t acc, int offset) const {
+        return acc_t(
+            generic_shfl_down(acc.mean, offset),
+            generic_shfl_down(acc.m2, offset),
+            generic_shfl_down(acc.n, offset),
+            generic_shfl_down(acc.nf, offset));
+    }
+#endif
+};
+
+// ═══════════════════════════════════════════════════════════
+// MEAN OPS (Unified kernel compatible: sum + project=divide)
+// ═══════════════════════════════════════════════════════════
+
+template <typename T>
+struct MeanOps {
+    using AccT = AccumulatorType<T>;
+    AccT factor;  // = 1.0 / reduced_count (pre-computed on host)
+
+    DEVICE_HOST MeanOps(AccT f = AccT(1.0f)) : factor(f) {}
+
+    DEVICE_HOST AccT identity() const { return AccT(0.0f); }
+
+    DEVICE_HOST AccT reduce(const AccT& a, const AccT& b) const {
+        #ifdef __CUDA_ARCH__
+        return gpu_add(a, b);
+        #else
+        return a + b;
+        #endif
+    }
+
+    DEVICE_HOST AccT reduce(const AccT& acc, const T& val, int64_t /*idx*/) const {
+        return reduce(acc, static_cast<AccT>(val));
+    }
+
+    DEVICE_HOST AccT combine(const AccT& a, const AccT& b) const {
+        return reduce(a, b);
+    }
+
+    // Project: multiply by 1/count to get mean
+    DEVICE_HOST AccT project(const AccT& a) const {
+        #ifdef __CUDA_ARCH__
+        return gpu_mul(a, factor);
+        #else
+        return a * factor;
+        #endif
+    }
+
+#ifdef __CUDACC__
+    __device__ AccT warp_shfl_down(AccT val, int offset) const {
+        return generic_shfl_down(val, offset);
+    }
+#endif
+};
+
+// NaN-aware mean: skips NaN values, tracks count
+template <typename T>
+struct NanMeanOps {
+    using AccT = AccumulatorType<T>;
+    // No pre-computed factor — must divide by valid_count at end
+
+    DEVICE_HOST NanMeanOps() {}
+
+    DEVICE_HOST AccT identity() const { return AccT(0.0f); }
+
+    DEVICE_HOST AccT reduce(const AccT& a, const AccT& b) const {
+        #ifdef __CUDA_ARCH__
+        if constexpr (std::is_floating_point_v<AccT> || is_native_half_v<AccT>) {
+            if (gpu_isnan(a)) return b;
+            if (gpu_isnan(b)) return a;
+        }
+        return gpu_add(a, b);
+        #else
+        if constexpr (std::is_floating_point_v<AccT> || is_half_float_v<AccT>) {
+            if (is_nan_check(a)) return b;
+            if (is_nan_check(b)) return a;
+        }
+        return a + b;
+        #endif
+    }
+
+    DEVICE_HOST AccT reduce(const AccT& acc, const T& val, int64_t /*idx*/) const {
+        return reduce(acc, static_cast<AccT>(val));
+    }
+
+    DEVICE_HOST AccT combine(const AccT& a, const AccT& b) const {
+        return reduce(a, b);
+    }
+
+    DEVICE_HOST AccT project(const AccT& a) const {
+        return a;  // Division by valid_count handled externally
+    }
+
+#ifdef __CUDACC__
+    __device__ AccT warp_shfl_down(AccT val, int offset) const {
+        return generic_shfl_down(val, offset);
+    }
+#endif
+};
+
 // ═══════════════════════════════════════════════════════════
 // REDUCTION TYPE DISPATCHER
 // ═══════════════════════════════════════════════════════════

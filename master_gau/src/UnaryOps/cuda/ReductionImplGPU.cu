@@ -1,4 +1,5 @@
-// src/UnaryOps/ReductionImplGPU.cu - FIXED: Added type conversion layer
+// src/UnaryOps/ReductionImplGPU.cu - Unified GPU reduction dispatcher
+// ReductionKernels.cuh now contains: GpuReduceConfig + OffsetCalculator + unified_reduce_kernel
 #include "ops/helpers/ReductionKernels.cuh"
 #include "ops/helpers/ReductionUtils.h"
 #include "core/Tensor.h"
@@ -29,588 +30,236 @@ namespace detail {
 // GPU DEVICE MEMORY HELPER
 // =================================================================
 
-// =================================================================
-// PACKED METADATA: Single allocation + Single cudaMemcpy for all metadata
-// Layout: [input_dims | input_strides | output_dims | normalized_axes | reduced_dims]
-// =================================================================
-class PackedMetadata {
-public:
-int64_t* d_ptr; //single device pointer for all metadata
-int64_t* d_input_dims; //Pointer offset into d_ptr
-int64_t* d_input_strides; //Pointer offset into d_ptr
-int64_t* d_output_dims; //Pointer offset into d_ptr
-int64_t* d_normalized_axes; //Pointer offset into d_ptr
-int64_t* d_reduced_dims; //Pointer offset into d_ptr
-PackedMetadata(const std::vector<int64_t>& input_dims, 
-const std::vector<int64_t>& input_strides,
-const std::vector<int64_t>& output_dims,
-const std::vector<int64_t>& normalized_axes,
-const std::vector<int64_t>& reduced_dims,
-cudaStream_t stream) 
-{
-    size_t total_size = input_dims.size() + input_strides.size() + output_dims.size() + normalized_axes.size() + reduced_dims.size();
-
-//     std::vector<int64_t> all_metadata(total_size);
-//     size_t offset = 0;
-// std::copy(input_dims.begin(),input_dims.end(),all_metadata.begin()+offset);
-// size_t offset_input_dims = offset;
-// offset+=input_dims.size();
-
-// std::copy(input_strides.begin(),input_strides.end(),all_metadata.begin()+offset);
-// size_t offset_input_strides = offset;
-// offset+=input_strides.size();
-
-// std::copy(output_dims.begin(),output_dims.end(),all_metadata.begin()+offset);
-// size_t offset_output_dims = offset;
-// offset+=output_dims.size();
-
-// std::copy(normalized_axes.begin(),normalized_axes.end(),all_metadata.begin()+offset);
-// size_t offset_normalized_axes = offset;
-// offset+=normalized_axes.size();
-
-// std::copy(reduced_dims.begin(),reduced_dims.end(),all_metadata.begin()+offset);
-// size_t offset_reduced_dims = offset;
-// offset+=reduced_dims.size();
-
-    size_t total_bytes = total_size * sizeof(int64_t);
-
-    // Normal heap buffer — PinnedCPUAllocator used cudaHostAlloc which takes a global device-context
-    // lock on every call (~100-200µs, see PinnedCPUAllocator.cpp TODO). For tiny metadata buffers,
-    // CUDA's internal staging of pageable memory is only ~1-2µs — far cheaper than the driver lock.
-    std::vector<int64_t> h_buf(total_size);
-
-    // Packing metadata into h_buf
-    size_t offset = 0;
-    auto pack = [&](const std::vector<int64_t>& vec, size_t& off) {
-        size_t start_off = off;
-        std::copy(vec.begin(), vec.end(), h_buf.data() + off);
-        off += vec.size();
-        return start_off;
-    };
-    size_t offset_input_dims = pack(input_dims, offset);
-    size_t offset_input_strides = pack(input_strides, offset);
-    size_t offset_output_dims = pack(output_dims, offset);
-    size_t offset_normalized_axes = pack(normalized_axes, offset);
-    size_t offset_reduced_dims = pack(reduced_dims, offset);
-
-    // Allocating Device Memory - d_ptr
-    d_ptr = static_cast<int64_t*>(CachingCUDAAllocator::instance().allocate(total_bytes, stream));
-    
-    // Async copy — CUDA internally stages pageable memory via a locked page (~1-2µs for small metadata)
-    cudaMemcpyAsync(d_ptr, h_buf.data(), total_bytes, cudaMemcpyHostToDevice, stream);
-    
-    //I commented this stream synchronization becoz :  
-    //The stream already guarantees that operations happen in order
-    //The memcpy submitted before the kernel will always complete before the kernel sees the data — same stream, CUDA guarantees this.
-    //The sync is redundant.
-    // it blocks the CPU thread until the GPU DMA engine finishes the copy. 
-    //The CPU can't do anything during that time, not even submit the kernel launch. Everything serializes.
-    //cudaStreamSynchronize(stream);
-
-    d_input_dims = d_ptr + offset_input_dims;
-    d_input_strides = d_ptr + offset_input_strides;
-    d_output_dims = d_ptr + offset_output_dims;
-    d_normalized_axes = d_ptr + offset_normalized_axes; 
-    d_reduced_dims = d_ptr + offset_reduced_dims;
-}
-
-~PackedMetadata(){
-    if(d_ptr) CachingCUDAAllocator::instance().deallocate(d_ptr);
-    // h_buf is a local std::vector in the constructor — automatically destroyed, no cleanup needed
-}
-
-PackedMetadata(const PackedMetadata&) = delete;
-PackedMetadata& operator=(const PackedMetadata&) = delete;
-};
-//class DeviceArray(){ 
-//public :
-    // int64_t* ptr;
-    // cudaStream_t stream_; //~change
-    
-   
-//     DeviceArray(const std::vector<int64_t>& host_data, cudaStream_t stream) : stream_(stream) {
-//         size_t bytes = host_data.size() * sizeof(int64_t);
-//         ptr = static_cast<int64_t*>(CachingCUDAAllocator::instance().allocate(bytes, stream_));
-//         cudaMemcpyAsync(ptr, host_data.data(), bytes, cudaMemcpyHostToDevice, stream_);
-//     }
-    
-//     ~DeviceArray() {
-//         if (ptr) CachingCUDAAllocator::instance().deallocate(ptr);
-//     }
-    
-//     DeviceArray(const DeviceArray&) = delete;
-//     DeviceArray& operator=(const DeviceArray&) = delete;
-// };
 
 // ═══════════════════════════════════════════════════════════
-// GPU VALUE REDUCTION DISPATCHER (WITH TYPE CONVERSION)
+// UNIFIED LAUNCHER HELPER
+// Gets device props (cached after first call) for config solver.
+// ═══════════════════════════════════════════════════════════
+static void get_device_props(int& num_mp, int& max_tpm) {
+    static int cached_num_mp = -1, cached_max_tpm = -1;
+    if (cached_num_mp < 0) {
+        cudaDeviceProp props;
+        cudaGetDeviceProperties(&props, 0);
+        cached_num_mp  = props.multiProcessorCount;
+        cached_max_tpm = props.maxThreadsPerMultiProcessor;
+    }
+    num_mp = cached_num_mp; max_tpm = cached_max_tpm;
+}
+
+// ═══════════════════════════════════════════════════════════
+// GPU VALUE REDUCTION DISPATCHER
+// All 10 scalar ops: sum, product, min, max, nansum, nanproduct,
+// nanmin, nanmax, all, any — all route through unified_reduce_kernel.
 // ═══════════════════════════════════════════════════════════
 template <typename T, template <typename> class OpType>
-Tensor dispatch_reduction_gpu(const Tensor& input, 
-                               const std::vector<int64_t>& normalized_axes, 
-                               bool keepdim,cudaStream_t stream) //✨✨✨
+Tensor dispatch_reduction_gpu(const Tensor& input,
+                               const std::vector<int64_t>& normalized_axes,
+                               bool keepdim, cudaStream_t stream)
 {
-    // Calculate output shape
+    // ── 1. Layout analysis (replaces all per-element device metadata) ──
+    auto layout = compute_reduction_layout(input, normalized_axes);
+
+    // ── 2. Output shape + dtype ──
     Shape output_shape = calculate_output_shape(input.shape().dims, normalized_axes, keepdim);
-    
-    // min/max ops use T directly as accumulator — result always within input range
     constexpr bool is_compare_op =
         std::is_same_v<OpType<T>, detail::MinOp<T>>    ||
         std::is_same_v<OpType<T>, detail::MaxOp<T>>    ||
         std::is_same_v<OpType<T>, detail::NanMinOp<T>> ||
         std::is_same_v<OpType<T>, detail::NanMaxOp<T>>;
-
-    // Determine output dtype
     Dtype output_dtype;
-    if constexpr (std::is_same_v<T, bool>) {
-        output_dtype = Dtype::Bool;
-    } else if constexpr (std::is_integral_v<T> && !is_compare_op) {
-        output_dtype = Dtype::Int64;  // sum/product: accumulator widens, output is int64
-    } else {
-        output_dtype = input.dtype();  // min/max: output same dtype as input
-    }
-    
-    // Create output tensor
+    if constexpr (std::is_same_v<T, bool>)                      output_dtype = Dtype::Bool;
+    else if constexpr (std::is_integral_v<T> && !is_compare_op) output_dtype = Dtype::Int64;
+    else                                                          output_dtype = input.dtype();
+
     Tensor output({output_shape}, TensorOptions()
-        .with_dtype(output_dtype)
-        .with_device(input.device())
-        .with_req_grad(input.requires_grad()));
-    
-    // Setup metadata
-    const std::vector<int64_t>& input_dims = input.shape().dims;
-    const std::vector<int64_t>& input_strides = input.stride().strides;
-    const int64_t num_slices = output.numel();
-    const int64_t reduced_count = calculate_reduced_count(input_dims, normalized_axes);
-    const bool rank_preserved = input_dims.size() == output_shape.dims.size();
-    
-    if (reduced_count == 0) {
-        throw std::runtime_error("GPU Reduction error: reduced count is zero");
-    }
-    
-    // Calculate reduced_dims
-    std::vector<int64_t> reduced_dims;
-    for (size_t dim = 0; dim < input_dims.size(); ++dim) {
-        bool is_reduced = std::find(normalized_axes.begin(), normalized_axes.end(), (int64_t)dim) 
-                         != normalized_axes.end();
-        if (is_reduced) {
-            reduced_dims.push_back(input_dims[dim]);
-        }
-    }
-    
-    // Transfer metadata to device
-    // DeviceArray d_input_dims(input_dims,stream);//✨✨✨
-    // DeviceArray d_input_strides(input_strides,stream);//✨✨✨
-    // DeviceArray d_output_dims(output_shape.dims,stream);//✨✨✨
-    // DeviceArray d_normalized_axes(normalized_axes,stream);//✨✨✨
-    // DeviceArray d_reduced_dims(reduced_dims,stream);//✨✨✨
-    PackedMetadata metadata(input_dims,input_strides,output_shape.dims,normalized_axes,reduced_dims,stream);
-    // Kernel configuration
-    int threads_per_block = 256;
-    int num_blocks = num_slices;
-    
-    //  TYPE CONVERSION: Custom struct → Native CUDA type
+        .with_dtype(output_dtype).with_device(input.device()).with_req_grad(input.requires_grad()));
+
+    const int64_t reduced_count = calculate_reduced_count(input.shape().dims, normalized_axes);
+    if (reduced_count == 0) throw std::runtime_error("GPU Reduction: reduced count is zero");
+
+
+
+    // ── 3. Type conversion ──
     using CudaT = CudaNativeType<T>;
-    
-    // Calculate shared memory for accumulator type
-    size_t shared_mem_size;
-    
-    // Metadata size (input_dims + input_strides + output_dims + reduced_dims + normalized_axes)
-    size_t metadata_size = (input_dims.size() + input_strides.size() + output_shape.dims.size() + reduced_dims.size() + normalized_axes.size()) * sizeof(int64_t);
-
-    if constexpr (std::is_integral_v<T> && is_compare_op) {
-        shared_mem_size = (threads_per_block / 32) * sizeof(T);       // min/max: AccT = T
-    } else if constexpr (std::is_integral_v<T>) {
-        shared_mem_size = (threads_per_block / 32) * sizeof(int64_t); // sum/product: AccT = int64
-    } else if constexpr (std::is_same_v<T, float16_t> || std::is_same_v<T, bfloat16_t>) {
-        shared_mem_size = (threads_per_block / 32) * sizeof(float);
-    } else {
-        shared_mem_size = (threads_per_block / 32) * sizeof(T);
-    }
-    
-    // Add metadata size to total shared memory
-    shared_mem_size += metadata_size;
-    
-    using OutputCppT = std::conditional_t<
-        std::is_integral_v<T> && !is_compare_op,
-        int64_t,  // sum/product: widened output
-        T         // min/max and floats: same as input
-    >;
-    
-    //  CRITICAL: Cast pointers to NATIVE CUDA types
-    const CudaT* input_data = reinterpret_cast<const CudaT*>(input.data<T>());
-    
+    using ops_t  = OpType<CudaT>;
+    ops_t ops{};
+    using arg_t      = decltype(ops.identity());
+    using OutputCppT = std::conditional_t<std::is_integral_v<T> && !is_compare_op, int64_t, T>;
     using OutputCudaT = CudaNativeType<OutputCppT>;
-    OutputCudaT* output_data = reinterpret_cast<OutputCudaT*>(output.data<OutputCppT>());
 
-    //  Launch kernel with NATIVE CUDA types
-    cuda::reduce_kernel<CudaT, OutputCudaT, OpType><<<num_blocks, threads_per_block, shared_mem_size,stream>>>(
-        input_data,
-        output_data,
-        metadata.d_input_dims,
-        metadata.d_input_strides,
-        metadata.d_output_dims,
-        metadata.d_normalized_axes,
-        metadata.d_reduced_dims,
-        num_slices,
-        reduced_count,
-        input_dims.size(),
-        normalized_axes.size(),
-        reduced_dims.size(),
-        rank_preserved
-    );
-    
-    // Check for errors
+    // ── 4. Config solver ──
+    int num_mp, max_tpm; get_device_props(num_mp, max_tpm);
+    auto config = detail::build_reduce_config<arg_t>(layout, num_mp, max_tpm);
+
+    // ── 5. OffsetCalculator (empty: Tier 1/2 use direct pointer math) ──
+    detail::OffsetCalculator<1, uint32_t> input_calc{}, output_calc{};
+    int64_t step_stride = (layout.path == detail::ReductionLayout::Path::OuterContiguous)
+                          ? layout.inner_count : 1;
+
+    // ── 6. Shared memory = warps × sizeof(arg_t), min 1 warp ──
+    int smem = std::max(config.shared_memory_size(),
+                        (config.block_width * config.block_height / 32 + 1) * (int)sizeof(arg_t));
+
+    // ── 7. Launch via packed struct + compile-time Path dispatch ──
+    const CudaT*   src = reinterpret_cast<const CudaT*>(input.data<T>());
+    OutputCudaT*   dst = reinterpret_cast<OutputCudaT*>(output.data<OutputCppT>());
+    cuda::launch_reduce_kernel<CudaT, OutputCudaT, ops_t>(
+        ops, config, input_calc, output_calc, src, dst, layout.path, step_stride, smem, stream);
+
     cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        throw std::runtime_error(std::string("CUDA kernel launch failed: ") + 
-                               cudaGetErrorString(err));
-    }
-    
-    // cudaDeviceSynchronize();
-    
+    if (err != cudaSuccess)
+        throw std::runtime_error(std::string("CUDA reduce_kernel failed: ") + cudaGetErrorString(err));
     return output;
 }
 
 // ═══════════════════════════════════════════════════════════
-// GPU INDEX REDUCTION DISPATCHER (WITH TYPE CONVERSION)
+// GPU INDEX REDUCTION DISPATCHER
+// ArgMin, ArgMax, NanArgMin, NanArgMax — output is always int64.
+// project() in the functor extracts .index from ValueIndex<T>.
 // ═══════════════════════════════════════════════════════════
-
 template <typename T, template <typename> class OpType>
-Tensor dispatch_index_reduction_gpu(const Tensor& input, 
-                                     const std::vector<int64_t>& normalized_axes, 
-                                     bool keepdim,cudaStream_t stream) //✨✨✨
+Tensor dispatch_index_reduction_gpu(const Tensor& input,
+                                     const std::vector<int64_t>& normalized_axes,
+                                     bool keepdim, cudaStream_t stream)
 {
+    auto layout = compute_reduction_layout(input, normalized_axes);
     Shape output_shape = calculate_output_shape(input.shape().dims, normalized_axes, keepdim);
-    
-    Tensor output({output_shape}, TensorOptions()
-        .with_dtype(Dtype::Int64)
-        .with_device(input.device())
-        .with_req_grad(input.requires_grad()));
-    
-    const std::vector<int64_t>& input_dims = input.shape().dims;
-    const std::vector<int64_t>& input_strides = input.stride().strides;
-    const int64_t num_slices = output.numel();
-    const int64_t reduced_count = calculate_reduced_count(input_dims, normalized_axes);
-    const bool rank_preserved = input_dims.size() == output_shape.dims.size();
-    
-    if (reduced_count == 0) {
-        throw std::runtime_error("GPU Index Reduction error: reduced count is zero");
-    }
-    
-    std::vector<int64_t> reduced_dims;
-    for (size_t dim = 0; dim < input_dims.size(); ++dim) {
-        bool is_reduced = std::find(normalized_axes.begin(), normalized_axes.end(), (int64_t)dim) 
-                         != normalized_axes.end();
-        if (is_reduced) {
-            reduced_dims.push_back(input_dims[dim]);
-        }
-    }
-    
-    // DeviceArray d_input_dims(input_dims,stream); //✨✨✨
-    // DeviceArray d_input_strides(input_strides,stream);//✨✨✨
-    // DeviceArray d_output_dims(output_shape.dims,stream);//✨✨✨
-    // DeviceArray d_normalized_axes(normalized_axes,stream);//✨✨✨
-    // DeviceArray d_reduced_dims(reduced_dims,stream);//✨✨✨
-PackedMetadata metadata(input_dims,input_strides,output_shape.dims,normalized_axes,reduced_dims,stream);
-    int threads_per_block = 256;
-    int num_blocks = num_slices;
-    
-    //  TYPE CONVERSION
-    using CudaT = CudaNativeType<T>;
-    // Metadata size (input_strides + output_dims + reduced_dims + normalized_axes)
-   size_t metadata_size = (input_dims.size() + input_strides.size() + output_shape.dims.size() + reduced_dims.size() + normalized_axes.size()) * sizeof(int64_t);
 
-    size_t shared_mem_size = (threads_per_block / 32) * sizeof(detail::ValueIndex<CudaT>) + metadata_size;
-    
-    //  Cast pointers to native CUDA types
-    const CudaT* input_data = reinterpret_cast<const CudaT*>(input.data<T>());
-    int64_t* output_data = output.data<int64_t>();
-    
-    cuda::reduce_index_kernel<CudaT, OpType><<<num_blocks, threads_per_block, shared_mem_size,stream>>>(
-        input_data,
-        output_data,
-        metadata.d_input_dims,
-        metadata.d_input_strides,
-        metadata.d_output_dims,
-        metadata.d_normalized_axes,
-        metadata.d_reduced_dims,
-        num_slices,
-        reduced_count,
-        input_dims.size(),
-        normalized_axes.size(),
-        reduced_dims.size(),
-        rank_preserved
-    );
-    
+    Tensor output({output_shape}, TensorOptions()
+        .with_dtype(Dtype::Int64).with_device(input.device()).with_req_grad(input.requires_grad()));
+
+    const int64_t reduced_count = calculate_reduced_count(input.shape().dims, normalized_axes);
+    if (reduced_count == 0) throw std::runtime_error("GPU Index Reduction: reduced count is zero");
+
+
+    using CudaT = CudaNativeType<T>;
+    using ops_t  = OpType<CudaT>;
+    ops_t ops{};
+    using arg_t = decltype(ops.identity()); // = ValueIndex<CudaT>
+
+    int num_mp, max_tpm; get_device_props(num_mp, max_tpm);
+    auto config = detail::build_reduce_config<arg_t>(layout, num_mp, max_tpm);
+    detail::OffsetCalculator<1, uint32_t> input_calc{}, output_calc{};
+    int64_t step_stride = (layout.path == detail::ReductionLayout::Path::OuterContiguous)
+                          ? layout.inner_count : 1;
+    int smem = std::max(config.shared_memory_size(),
+                        (config.block_width * config.block_height / 32 + 1) * (int)sizeof(arg_t));
+
+    const CudaT* src = reinterpret_cast<const CudaT*>(input.data<T>());
+    int64_t*     dst = output.data<int64_t>();
+    cuda::launch_reduce_kernel<CudaT, int64_t, ops_t>(
+        ops, config, input_calc, output_calc, src, dst, layout.path, step_stride, smem, stream);
+
     cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        throw std::runtime_error(std::string("CUDA index kernel launch failed: ") + 
-                               cudaGetErrorString(err));
-    }
-    
-    //cudaDeviceSynchronize();
-    
+    if (err != cudaSuccess)
+        throw std::runtime_error(std::string("CUDA index_kernel failed: ") + cudaGetErrorString(err));
     return output;
 }
 
 // ═══════════════════════════════════════════════════════════
-// GPU MEAN REDUCTION DISPATCHER (WITH TYPE CONVERSION)
+// GPU MEAN REDUCTION DISPATCHER
+// Uses MeanOps functor: sum then project(a) = a * (1/count).
+// NaN-aware path uses NanSumOp which skips NaN in accumulate step.
 // ═══════════════════════════════════════════════════════════
-
 template <typename T, template <typename> class SumOpType>
-Tensor dispatch_mean_gpu(const Tensor& input, 
-                         const std::vector<int64_t>& normalized_axes, 
-                         bool keepdim, cudaStream_t stream) //✨✨✨ 
+Tensor dispatch_mean_gpu(const Tensor& input,
+                         const std::vector<int64_t>& normalized_axes,
+                         bool keepdim, cudaStream_t stream)
 {
+    auto layout = compute_reduction_layout(input, normalized_axes);
     Shape output_shape = calculate_output_shape(input.shape().dims, normalized_axes, keepdim);
-    
-    int64_t reduced_count = calculate_reduced_count(input.shape().dims, normalized_axes);
-    if (reduced_count == 0) {
-        throw std::runtime_error("Cannot compute mean: reduced count is zero.");
-    }
-    
-    // Mean output dtype: integers output Float32 (not Float64).
-    // Float32 is 32x faster than Float64 on consumer GPUs (FP64 = 1/32 FP32 on Pascal/Turing).
-    // PyTorch uses float (opmath_type) for integer reductions.
-    // CPU uses Float64 for exact integer arithmetic — GPU trades some precision for 32x speed.
-    Dtype output_dtype;
-    if constexpr (std::is_integral_v<T>) {
-        output_dtype = Dtype::Float32;
-    } else {
-        output_dtype = input.dtype();
-    }
-    
+
+    // Mean output is always float32 for integer inputs, or same as input for float
+    Dtype output_dtype = (std::is_integral_v<T>) ? Dtype::Float32 : input.dtype();
     Tensor output({output_shape}, TensorOptions()
-        .with_dtype(output_dtype)
-        .with_device(input.device())
-        .with_req_grad(input.requires_grad()));
-    
-    const std::vector<int64_t>& input_dims = input.shape().dims;
-    const std::vector<int64_t>& input_strides = input.stride().strides;
-    const int64_t num_slices = output.numel();
-    const bool rank_preserved = input_dims.size() == output_shape.dims.size();
-    
-    std::vector<int64_t> reduced_dims;
-    for (size_t dim = 0; dim < input_dims.size(); ++dim) {
-        bool is_reduced = std::find(normalized_axes.begin(), normalized_axes.end(), (int64_t)dim) 
-                         != normalized_axes.end();
-        if (is_reduced) {
-            reduced_dims.push_back(input_dims[dim]);
-        }
-    }
-    
-    // DeviceArray d_input_dims(input_dims,stream); //✨✨✨
-    // DeviceArray d_input_strides(input_strides,stream);//✨✨✨
-    // DeviceArray d_output_dims(output_shape.dims,stream);//✨✨✨
-    // DeviceArray d_normalized_axes(normalized_axes,stream);//✨✨✨
-    // DeviceArray d_reduced_dims(reduced_dims,stream);//✨✨✨
-PackedMetadata metadata(input_dims,input_strides,output_shape.dims,normalized_axes,reduced_dims,stream);
-    int threads_per_block = 256;
-    int num_blocks = num_slices;
-    
-    int num_warps = (threads_per_block + 31) / 32;
-    // Metadata size (input_strides + output_dims + reduced_dims + normalized_axes)
-    size_t metadata_size = (input_dims.size() + input_strides.size() + output_shape.dims.size() + reduced_dims.size() + normalized_axes.size()) * sizeof(int64_t);
+        .with_dtype(output_dtype).with_device(input.device()).with_req_grad(input.requires_grad()));
 
-    // Compute shared memory size to match reduce_mean_kernel's AccT exactly.
-    // Kernel rule: complex uses AccumulatorType<T,GPU>; non-complex: double if T=double, else float.
-    // complex32_t  → complex64_t  (8 bytes), complex64_t GPU → complex64_t (8 bytes),
-    // complex128_t → complex128_t (16 bytes), double → double (8), everything else → float (4).
-    constexpr bool is_complex_T = std::is_same_v<T, complex32_t> ||
-                                  std::is_same_v<T, complex64_t>  ||
-                                  std::is_same_v<T, complex128_t>;
-    using MeanAccT = std::conditional_t<
-        is_complex_T,
-        detail::AccumulatorType<T, /*IsGPU=*/true>,
-        std::conditional_t<std::is_same_v<T, double>, double, float>
-    >;
-    constexpr size_t mean_acc_size = sizeof(MeanAccT);
-    size_t shared_mem_size = num_warps * mean_acc_size + num_warps * sizeof(int64_t) + metadata_size;
-
-    //  TYPE CONVERSION
     using CudaT = CudaNativeType<T>;
-
-    // Integers → float output (matches kernel AccT = float; see reduce_mean_kernel comment)
-    using OutputCppT = typename std::conditional<
-        std::is_integral_v<T>,
-        float,
-        T
-    >::type;
-    
-    using OutputCudaT = CudaNativeType<OutputCppT>;
-    
-    //  Cast pointers to native CUDA types
-    const CudaT* input_data = reinterpret_cast<const CudaT*>(input.data<T>());
-    OutputCudaT* output_data = reinterpret_cast<OutputCudaT*>(output.data<OutputCppT>());
-    
-    cuda::reduce_mean_kernel<CudaT, OutputCudaT, SumOpType><<<num_blocks, threads_per_block, shared_mem_size,stream>>>(
-        input_data,
-        output_data,
-        metadata.d_input_dims,
-        metadata.d_input_strides,
-        metadata.d_output_dims,
-        metadata.d_normalized_axes,
-        metadata.d_reduced_dims,
-        num_slices,
-        reduced_count,
-        input_dims.size(),
-        normalized_axes.size(),
-        reduced_dims.size(),
-        rank_preserved
-    );
-    
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        throw std::runtime_error(std::string("CUDA mean kernel launch failed: ") + 
-                               cudaGetErrorString(err));
+    using OutT  = std::conditional_t<std::is_integral_v<T>, float, T>;
+    using OutCudaT = CudaNativeType<OutT>;
+    using AccT  = detail::AccumulatorType<CudaT>;
+    double inv_count = 1.0 / static_cast<double>(calculate_reduced_count(input.shape().dims, normalized_axes));
+    AccT factor;
+    if constexpr (std::is_same_v<CudaT, complex32_t> || std::is_same_v<CudaT, complex64_t> || std::is_same_v<CudaT, complex128_t>) {
+        factor = AccT(inv_count, 0.0);
+    } else {
+        factor = static_cast<AccT>(inv_count);
     }
-    
-    //cudaDeviceSynchronize();
-    
+    using ops_t = detail::MeanOps<CudaT>;
+    ops_t ops{factor};
+
+    int num_mp, max_tpm; get_device_props(num_mp, max_tpm);
+    auto config = detail::build_reduce_config<CudaT>(layout, num_mp, max_tpm);
+    detail::OffsetCalculator<1, uint32_t> input_calc{}, output_calc{};
+    int64_t step_stride = (layout.path == detail::ReductionLayout::Path::OuterContiguous) ? layout.inner_count : 1;
+    int smem = std::max(config.shared_memory_size(), (config.block_width * config.block_height / 32 + 1) * (int)sizeof(CudaT));
+
+    const CudaT* src = reinterpret_cast<const CudaT*>(input.data<T>());
+    OutCudaT*    dst = reinterpret_cast<OutCudaT*>(output.data<OutT>());
+    cuda::launch_reduce_kernel<CudaT, OutCudaT, ops_t>(
+        ops, config, input_calc, output_calc, src, dst, layout.path, step_stride, smem, stream);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+        throw std::runtime_error(std::string("CUDA mean kernel failed: ") + cudaGetErrorString(err));
     return output;
 }
+
 // ═══════════════════════════════════════════════════════════
 // GPU VARIANCE REDUCTION DISPATCHER (COMPLETE IMPLEMENTATION)
 //═══════════════════════════════════════════════════════════
 
 template <typename T, template <typename> class VarianceOpType>
-Tensor dispatch_variance_gpu(const Tensor& input, 
-                             const std::vector<int64_t>& normalized_axes, 
-                             bool keepdim,
-                             int64_t correction, cudaStream_t stream) //✨✨✨ 
-                             {
-    constexpr bool is_nan_aware = std::is_same_v<VarianceOpType<T>, NanVarianceOp<T>>;
-    
-    //  STEP 1: Compute mean on GPU (always keepdim=true for variance)
-    Tensor mean_tensor = is_nan_aware
-        ? dispatch_mean_gpu<T, NanSumOp>(input, normalized_axes, true, stream)
-        : dispatch_mean_gpu<T, SumOp>(input, normalized_axes, true, stream);
-
-    //  STEP 2: Calculate output shape and metadata
+Tensor dispatch_variance_gpu(const Tensor& input,
+                              const std::vector<int64_t>& normalized_axes,
+                              bool keepdim, int64_t correction,
+                              cudaStream_t stream)
+{
+    // Single-pass Welford: 1x HBM read vs old 2-pass (2x reads).
+    auto layout = compute_reduction_layout(input, normalized_axes);
     Shape output_shape = calculate_output_shape(input.shape().dims, normalized_axes, keepdim);
-    int64_t reduced_count = calculate_reduced_count(input.shape().dims, normalized_axes);
-    
-    // Determine output dtype: integers → Float32 (matches mean's Float32 output, 32x faster GPU FP32)
-    Dtype output_dtype;
-    if constexpr (std::is_integral_v<T>) {
-        output_dtype = Dtype::Float32;
-    } else {
-        output_dtype = input.dtype();
-    }
+    const int64_t reduced_count = calculate_reduced_count(input.shape().dims, normalized_axes);
+    if (reduced_count == 0) throw std::runtime_error("GPU Variance: reduced count is zero");
 
-    // Create output tensor
+
+    Dtype output_dtype = std::is_integral_v<T> ? Dtype::Float32 : input.dtype();
     Tensor output({output_shape}, TensorOptions()
-        .with_dtype(output_dtype)
-        .with_device(input.device())
-        .with_req_grad(input.requires_grad()));
+        .with_dtype(output_dtype).with_device(input.device()).with_req_grad(input.requires_grad()));
 
-    // Setup metadata
-    const std::vector<int64_t>& input_dims = input.shape().dims;
-    const std::vector<int64_t>& input_strides = input.stride().strides;
-    const int64_t num_slices = output.numel();
-    const bool rank_preserved = input_dims.size() == output_shape.dims.size();
-    
-    // Calculate reduced_dims
-    std::vector<int64_t> reduced_dims;
-    for (size_t dim = 0; dim < input_dims.size(); ++dim) {
-        bool is_reduced = std::find(normalized_axes.begin(), normalized_axes.end(), (int64_t)dim) 
-                         != normalized_axes.end();
-        if (is_reduced) {
-            reduced_dims.push_back(input_dims[dim]);
-        }
-    }
-    
-    //  STEP 3: Transfer metadata to device
-    // DeviceArray d_input_dims(input_dims, stream);//✨✨✨
-    // DeviceArray d_input_strides(input_strides, stream);//✨✨✨
-    // DeviceArray d_output_dims(output_shape.dims, stream);//✨✨✨
-    // DeviceArray d_normalized_axes(normalized_axes, stream);//✨✨✨
-    // DeviceArray d_reduced_dims(reduced_dims, stream);//✨✨✨
-PackedMetadata metadata(input_dims,input_strides,output_shape.dims,normalized_axes,reduced_dims,stream);
-    //  STEP 4: Kernel configuration
-    int threads_per_block = 256;
-    int num_blocks = num_slices;
-    
-    // Type conversion for input
-    using CudaT = CudaNativeType<T>;
-    
-    // Mean tensor type: for integers dispatch_mean_gpu now outputs Float32 (not Float64).
-    // For floats: mean has the same dtype as input.
-    using MeanCppT = typename std::conditional<
-        std::is_integral_v<T>,
-        float,   // Integer inputs → Float32 mean (changed from Float64 for GPU speed)
-        T        // Float inputs → same type mean
-    >::type;
-    
-    using MeanCudaT = CudaNativeType<MeanCppT>;
-    
-    // Output type: integers → float (GPU, 32x faster than double)
-    using OutputCppT = typename std::conditional<
-        std::is_integral_v<T>,
-        float,
-        T
-    >::type;
-
+    using CudaT       = CudaNativeType<T>;
+    using OutputCppT  = std::conditional_t<std::is_integral_v<T>, float, T>;
     using OutputCudaT = CudaNativeType<OutputCppT>;
-
-    // Variance accumulator type: integers → float (matches output + mean types)
-    using AccCppT = typename std::conditional<
-        std::is_integral_v<T>,
-        float,
-        typename std::conditional<
-            std::is_same_v<T, float16_t> || std::is_same_v<T, bfloat16_t> ||
-            std::is_same_v<T, float4_e2m1_t> || std::is_same_v<T, float4_e2m1_2x_t>,
-            float,
-            T
-        >::type
-    >::type;
-
-    using AccCudaT = CudaNativeType<AccCppT>;
-    
-    // Metadata size (input_dims + input_strides + output_dims + reduced_dims + normalized_axes)
-    size_t metadata_size = (input_dims.size() + input_strides.size() + output_shape.dims.size() + reduced_dims.size() + normalized_axes.size()) * sizeof(int64_t);
-    
-    // Calculate shared memory size based on Accumulator Type
-    size_t shared_mem_size = (threads_per_block / 32) * sizeof(AccCudaT) + metadata_size;
-    
-    //  STEP 5: Cast pointers to CORRECT native CUDA types
-    const CudaT* input_data = reinterpret_cast<const CudaT*>(input.data<T>());
-    
-    //  FIX: Use the ACTUAL mean tensor type (not the input type!)
-    const MeanCudaT* mean_data = reinterpret_cast<const MeanCudaT*>(mean_tensor.data<MeanCppT>());
-    
-    OutputCudaT* output_data = reinterpret_cast<OutputCudaT*>(output.data<OutputCppT>());
-    
-    //  STEP 6: LAUNCH THE VARIANCE KERNEL
-    cuda::reduce_variance_kernel<CudaT, MeanCudaT, OutputCudaT, AccCudaT, VarianceOpType>
-        <<<num_blocks, threads_per_block, shared_mem_size, stream>>>(//✨✨✨
-        input_data,
-        mean_data,           // Pre-computed mean (CORRECT TYPE!)
-        output_data,
-        metadata.d_input_dims,
-        metadata.d_input_strides,
-        metadata.d_output_dims,
-        metadata.d_normalized_axes,
-        metadata.d_reduced_dims,
-        num_slices,
-        reduced_count,
-        correction,          // Bessel's correction parameter
-        input_dims.size(),
-        normalized_axes.size(),
-        reduced_dims.size(),
-        rank_preserved
-    );
-    
-    //  STEP 7: Error checking
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        throw std::runtime_error(std::string("CUDA variance kernel launch failed: ") + 
-                               cudaGetErrorString(err));
+    using AccScalar   = detail::AccumulatorType<CudaT>;
+    using ops_t = detail::WelfordOps<CudaT>;
+    AccScalar corr_val;
+    if constexpr (std::is_same_v<CudaT, complex32_t> || std::is_same_v<CudaT, complex64_t> || std::is_same_v<CudaT, complex128_t>) {
+        corr_val = AccScalar(static_cast<double>(correction), 0.0);
+    } else {
+        corr_val = static_cast<AccScalar>(static_cast<double>(correction));
     }
-    
-    // cudaDeviceSynchronize();
+    ops_t ops{corr_val, /*take_sqrt=*/false};
+    using arg_t = decltype(ops.identity()); // = WelfordData<AccScalar>
+
+    int num_mp, max_tpm; get_device_props(num_mp, max_tpm);
+    auto config = detail::build_reduce_config<arg_t>(layout, num_mp, max_tpm);
+    detail::OffsetCalculator<1, uint32_t> input_calc{}, output_calc{};
+    int64_t step_stride = (layout.path == detail::ReductionLayout::Path::OuterContiguous)
+                          ? layout.inner_count : 1;
+    int smem = std::max(config.shared_memory_size(),
+                        (config.block_width * config.block_height / 32 + 1) * (int)sizeof(arg_t));
+
+    const CudaT*  src = reinterpret_cast<const CudaT*>(input.data<T>());
+    OutputCudaT*  dst = reinterpret_cast<OutputCudaT*>(output.data<OutputCppT>());
+    cuda::launch_reduce_kernel<CudaT, OutputCudaT, ops_t>(
+        ops, config, input_calc, output_calc, src, dst, layout.path, step_stride, smem, stream);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess)
+        throw std::runtime_error(std::string("CUDA variance_kernel failed: ") + cudaGetErrorString(err));
     return output;
 }
+
+
 
 // =================================================================
 //  EXPLICIT TEMPLATE INSTANTIATIONS - Using Custom Structs
@@ -812,56 +461,56 @@ template Tensor dispatch_reduction_gpu<bool, AnyOp>(const Tensor&, const std::ve
 // complex32_t
 template Tensor dispatch_reduction_gpu<complex32_t, SumOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
 template Tensor dispatch_reduction_gpu<complex32_t, ProductOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
-template Tensor dispatch_reduction_gpu<complex32_t, MinOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
-template Tensor dispatch_reduction_gpu<complex32_t, MaxOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
+// template Tensor dispatch_reduction_gpu<complex32_t, MinOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
+// template Tensor dispatch_reduction_gpu<complex32_t, MaxOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
 template Tensor dispatch_reduction_gpu<complex32_t, NanSumOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
 template Tensor dispatch_reduction_gpu<complex32_t, NanProductOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
-template Tensor dispatch_reduction_gpu<complex32_t, NanMinOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
-template Tensor dispatch_reduction_gpu<complex32_t, NanMaxOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
-template Tensor dispatch_index_reduction_gpu<complex32_t, ArgMinOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
-template Tensor dispatch_index_reduction_gpu<complex32_t, ArgMaxOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
-template Tensor dispatch_index_reduction_gpu<complex32_t, NanArgMinOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
-template Tensor dispatch_index_reduction_gpu<complex32_t, NanArgMaxOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
+// template Tensor dispatch_reduction_gpu<complex32_t, NanMinOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
+// template Tensor dispatch_reduction_gpu<complex32_t, NanMaxOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
+// template Tensor dispatch_index_reduction_gpu<complex32_t, ArgMinOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
+// template Tensor dispatch_index_reduction_gpu<complex32_t, ArgMaxOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
+// template Tensor dispatch_index_reduction_gpu<complex32_t, NanArgMinOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
+// template Tensor dispatch_index_reduction_gpu<complex32_t, NanArgMaxOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
 template Tensor dispatch_mean_gpu<complex32_t, SumOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
 template Tensor dispatch_mean_gpu<complex32_t, NanSumOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
-template Tensor dispatch_variance_gpu<complex32_t, VarianceOp>(const Tensor& input, const std::vector<int64_t>& axes, bool keepdim , int64_t correction, cudaStream_t stream);
-template Tensor dispatch_variance_gpu<complex32_t, NanVarianceOp>(const Tensor& input, const std::vector<int64_t>& axes, bool keepdim , int64_t correction, cudaStream_t stream);
+// template Tensor dispatch_variance_gpu<complex32_t, VarianceOp>(const Tensor& input, const std::vector<int64_t>& axes, bool keepdim , int64_t correction, cudaStream_t stream);
+// template Tensor dispatch_variance_gpu<complex32_t, NanVarianceOp>(const Tensor& input, const std::vector<int64_t>& axes, bool keepdim , int64_t correction, cudaStream_t stream);
 
 // complex64_t
 template Tensor dispatch_reduction_gpu<complex64_t, SumOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
 template Tensor dispatch_reduction_gpu<complex64_t, ProductOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
-template Tensor dispatch_reduction_gpu<complex64_t, MinOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
-template Tensor dispatch_reduction_gpu<complex64_t, MaxOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
+// template Tensor dispatch_reduction_gpu<complex64_t, MinOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
+// template Tensor dispatch_reduction_gpu<complex64_t, MaxOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
 template Tensor dispatch_reduction_gpu<complex64_t, NanSumOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
 template Tensor dispatch_reduction_gpu<complex64_t, NanProductOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
-template Tensor dispatch_reduction_gpu<complex64_t, NanMinOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
-template Tensor dispatch_reduction_gpu<complex64_t, NanMaxOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
-template Tensor dispatch_index_reduction_gpu<complex64_t, ArgMinOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
-template Tensor dispatch_index_reduction_gpu<complex64_t, ArgMaxOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
-template Tensor dispatch_index_reduction_gpu<complex64_t, NanArgMinOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
-template Tensor dispatch_index_reduction_gpu<complex64_t, NanArgMaxOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
+// template Tensor dispatch_reduction_gpu<complex64_t, NanMinOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
+// template Tensor dispatch_reduction_gpu<complex64_t, NanMaxOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
+// template Tensor dispatch_index_reduction_gpu<complex64_t, ArgMinOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
+// template Tensor dispatch_index_reduction_gpu<complex64_t, ArgMaxOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
+// template Tensor dispatch_index_reduction_gpu<complex64_t, NanArgMinOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
+// template Tensor dispatch_index_reduction_gpu<complex64_t, NanArgMaxOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
 template Tensor dispatch_mean_gpu<complex64_t, SumOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
 template Tensor dispatch_mean_gpu<complex64_t, NanSumOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
-template Tensor dispatch_variance_gpu<complex64_t, VarianceOp>(const Tensor& input, const std::vector<int64_t>& axes, bool keepdim , int64_t correction, cudaStream_t stream);
-template Tensor dispatch_variance_gpu<complex64_t, NanVarianceOp>(const Tensor& input, const std::vector<int64_t>& axes, bool keepdim , int64_t correction, cudaStream_t stream);
+// template Tensor dispatch_variance_gpu<complex64_t, VarianceOp>(const Tensor& input, const std::vector<int64_t>& axes, bool keepdim , int64_t correction, cudaStream_t stream);
+// template Tensor dispatch_variance_gpu<complex64_t, NanVarianceOp>(const Tensor& input, const std::vector<int64_t>& axes, bool keepdim , int64_t correction, cudaStream_t stream);
 
 // complex128_t
 template Tensor dispatch_reduction_gpu<complex128_t, SumOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
 template Tensor dispatch_reduction_gpu<complex128_t, ProductOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
-template Tensor dispatch_reduction_gpu<complex128_t, MinOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
-template Tensor dispatch_reduction_gpu<complex128_t, MaxOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
+// template Tensor dispatch_reduction_gpu<complex128_t, MinOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
+// template Tensor dispatch_reduction_gpu<complex128_t, MaxOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
 template Tensor dispatch_reduction_gpu<complex128_t, NanSumOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
 template Tensor dispatch_reduction_gpu<complex128_t, NanProductOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
-template Tensor dispatch_reduction_gpu<complex128_t, NanMinOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
-template Tensor dispatch_reduction_gpu<complex128_t, NanMaxOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
-template Tensor dispatch_index_reduction_gpu<complex128_t, ArgMinOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
-template Tensor dispatch_index_reduction_gpu<complex128_t, ArgMaxOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
-template Tensor dispatch_index_reduction_gpu<complex128_t, NanArgMinOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
-template Tensor dispatch_index_reduction_gpu<complex128_t, NanArgMaxOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
+// template Tensor dispatch_reduction_gpu<complex128_t, NanMinOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
+// template Tensor dispatch_reduction_gpu<complex128_t, NanMaxOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
+// template Tensor dispatch_index_reduction_gpu<complex128_t, ArgMinOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
+// template Tensor dispatch_index_reduction_gpu<complex128_t, ArgMaxOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
+// template Tensor dispatch_index_reduction_gpu<complex128_t, NanArgMinOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
+// template Tensor dispatch_index_reduction_gpu<complex128_t, NanArgMaxOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
 template Tensor dispatch_mean_gpu<complex128_t, SumOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
 template Tensor dispatch_mean_gpu<complex128_t, NanSumOp>(const Tensor&, const std::vector<int64_t>&, bool, cudaStream_t);
-template Tensor dispatch_variance_gpu<complex128_t, VarianceOp>(const Tensor& input, const std::vector<int64_t>& axes, bool keepdim , int64_t correction, cudaStream_t stream);
-template Tensor dispatch_variance_gpu<complex128_t, NanVarianceOp>(const Tensor& input, const std::vector<int64_t>& axes, bool keepdim , int64_t correction, cudaStream_t stream);
+// template Tensor dispatch_variance_gpu<complex128_t, VarianceOp>(const Tensor& input, const std::vector<int64_t>& axes, bool keepdim , int64_t correction, cudaStream_t stream);
+// template Tensor dispatch_variance_gpu<complex128_t, NanVarianceOp>(const Tensor& input, const std::vector<int64_t>& axes, bool keepdim , int64_t correction, cudaStream_t stream);
 #endif
 
 } // namespace detail

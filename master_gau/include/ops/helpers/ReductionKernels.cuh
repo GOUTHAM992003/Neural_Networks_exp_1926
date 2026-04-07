@@ -1,4 +1,6 @@
-// include/ops/helpers/ReductionKernels.cuh - FIXED: Uses NATIVE CUDA types
+// include/ops/helpers/ReductionKernels.cuh
+// Unified GPU reduction kernel + config solver + offset calculator
+// All in one file — these helpers are only used here, no need for separate headers.
 #pragma once
 
 #ifndef REDUCTION_KERNELS_CUH
@@ -8,1056 +10,482 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <device_launch_parameters.h>
-#include <limits>
+#include <cstdint>
+#include <algorithm>
 
-//  CRITICAL: Import operation templates (they work on ANY type)
+// gpu_isnan, gpu_add, gpu_mul, gpu_lt, gpu_gt are ALL defined in ReductionOps.h
+// under #ifdef __CUDA_ARCH__ — no need to re-declare them here.
 #include "ReductionOps.h"
+#include "ReductionUtils.h"  // For ReductionLayout
 
 namespace OwnTensor {
 namespace cuda {
 
 // ═══════════════════════════════════════════════════════════
-// GPU INTRINSIC HELPERS (NATIVE CUDA TYPES ONLY)
+// TYPE CONVERSIONS (wrappers for __half / __nv_bfloat16)
 // ═══════════════════════════════════════════════════════════
 
-// ---- Type conversion (use GPU intrinsics) ----
 template<typename T> __device__ float to_float(T val) { return static_cast<float>(val); }
-template<> __device__ float to_float(__half val) { return __half2float(val); }
+template<> __device__ float to_float(__half val)        { return __half2float(val); }
 template<> __device__ float to_float(__nv_bfloat16 val) { return __bfloat162float(val); }
 
-// ---- From float conversion ----
 template<typename T> __device__ T from_float(float val) { return static_cast<T>(val); }
-template<> __device__ __half from_float(float val) { return __float2half(val); }
+template<> __device__ __half       from_float(float val) { return __float2half(val); }
 template<> __device__ __nv_bfloat16 from_float(float val) { return __float2bfloat16(val); }
 
-// // ---- NaN check (use GPU intrinsics) ----
-// template<typename T> __device__ bool is_nan(T val) { return isnan(val); }
-// template<> __device__ bool is_nan(__half val) { return __hisnan(val); }
-// template<> __device__ bool is_nan(__nv_bfloat16 val) { return __hisnan(val); }
+} // namespace cuda
 
-// // ---- Arithmetic operations using GPU intrinsics ----
-// template<typename T> __device__ T gpu_add(T a, T b) { return a + b; }
-// template<> __device__ __half gpu_add(__half a, __half b) { return __hadd(a, b); }
-// template<> __device__ __nv_bfloat16 gpu_add(__nv_bfloat16 a, __nv_bfloat16 b) { return __hadd(a, b); }
-
-// template<typename T> __device__ T gpu_mul(T a, T b) { return a * b; }
-// template<> __device__ __half gpu_mul(__half a, __half b) { return __hmul(a, b); }
-// template<> __device__ __nv_bfloat16 gpu_mul(__nv_bfloat16 a, __nv_bfloat16 b) { return __hmul(a, b); }
-
-// template<typename T> __device__ bool gpu_lt(T a, T b) { return a < b; }
-// template<> __device__ bool gpu_lt(__half a, __half b) { return __hlt(a, b); }
-// template<> __device__ bool gpu_lt(__nv_bfloat16 a, __nv_bfloat16 b) { return __hlt(a, b); }
-
-// template<typename T> __device__ bool gpu_gt(T a, T b) { return a > b; }
-// template<> __device__ bool gpu_gt(__half a, __half b) { return __hgt(a, b); }
-// template<> __device__ bool gpu_gt(__nv_bfloat16 a, __nv_bfloat16 b) { return __hgt(a, b); }
+namespace detail {
 
 // ═══════════════════════════════════════════════════════════
-// WARP SHUFFLE (NATIVE CUDA TYPES)
+// SECTION 1: GPU REDUCE CONFIG
+// Mirrors PyTorch's ReduceConfig (Reduce.cuh:73-217)
+// Decides block/grid dimensions based on the problem shape.
 // ═══════════════════════════════════════════════════════════
 
+// Max live threads per block — conservative so we don't miss occupancy
 template<typename T>
-__device__ inline T shfl_down(T val, unsigned int delta) {
-    return ::__shfl_down_sync(0xffffffff, val, delta, 32);
+struct MaxThreads { static constexpr int VALUE = 512; };
+
+// Helpers: round to powers of 2
+inline int next_pow2(int x) {
+    if (x <= 0) return 1;
+    --x;
+    x |= x >> 1; x |= x >> 2; x |= x >> 4; x |= x >> 8; x |= x >> 16;
+    return x + 1;
 }
+inline int last_pow2(int x)   { return next_pow2(x + 1) / 2; }
+inline int div_up(int a, int b){ return (a + b - 1) / b; }
 
-//  Specialization for __half (uses intrinsic shuffle)
-__device__ inline __half shfl_down(__half val, unsigned int delta) {
-    return __shfl_down_sync(0xffffffff, val, delta, 32);
-}
+struct GpuReduceConfig {
+    static constexpr int BLOCK_X = 0;
+    static constexpr int BLOCK_Y = 1;
+    static constexpr int CTA     = 2;
 
-//  Specialization for __nv_bfloat16 (uses intrinsic shuffle)
-__device__ inline __nv_bfloat16 shfl_down(__nv_bfloat16 val, unsigned int delta) {
-    return __shfl_down_sync(0xffffffff, val, delta, 32);
-}
+    int element_size_bytes;
+    int num_inputs;           // reduced_count: elements per output
+    int num_outputs;          // independent outputs
+    int step_input  = 1;
+    int step_output = 1;
+    int ctas_per_output = 1;
+    int input_mult[3]  = {0, 0, 0};
+    int output_mult[2] = {0, 0};
+    int block_width  = 1;
+    int block_height = 1;
+    int num_threads  = 1;
+    bool vectorize_input = false;
+    int  output_vec_size = 1;
 
-//  Specialization for complex32_t (32-bit, cast to int)
-__device__ inline complex32_t shfl_down(complex32_t val, unsigned int delta) {
-    int* ptr = reinterpret_cast<int*>(&val);
-    int res = __shfl_down_sync(0xffffffff, *ptr, delta, 32);
-    return *reinterpret_cast<complex32_t*>(&res);
-}
+    GpuReduceConfig() = default;
+    GpuReduceConfig(int esz, int nout, int nin)
+        : element_size_bytes(esz), num_inputs(nin), num_outputs(nout) {}
 
-//  Specialization for complex64_t (64-bit, cast to unsigned long long)
-__device__ inline complex64_t shfl_down(complex64_t val, unsigned int delta) {
-    unsigned long long* ptr = reinterpret_cast<unsigned long long*>(&val);
-    unsigned long long res = __shfl_down_sync(0xffffffff, *ptr, delta, 32);
-    return *reinterpret_cast<complex64_t*>(&res);
-}
-
-//  Specialization for complex128_t (128-bit, shuffle components)
-__device__ inline complex128_t shfl_down(complex128_t val, unsigned int delta) {
-    double r = __shfl_down_sync(0xffffffff, val.real_, delta, 32);
-    double i = __shfl_down_sync(0xffffffff, val.imag_, delta, 32);
-    return complex128_t(r, i);
-}
-
-//  Specialization for float4_e2m1_t (8-bit, cast to int)
-__device__ inline float4_e2m1_t shfl_down(float4_e2m1_t val, unsigned int delta) {
-    int val_int = static_cast<int>(val.raw_bits);
-    int res = __shfl_down_sync(0xffffffff, val_int, delta, 32);
-    return float4_e2m1_t(static_cast<uint8_t>(res));
-}
-
-//  Specialization for float4_e2m1_2x_t (8-bit, cast to int)
-__device__ inline float4_e2m1_2x_t shfl_down(float4_e2m1_2x_t val, unsigned int delta) {
-    int val_int = static_cast<int>(val.raw_bits);
-    int res = __shfl_down_sync(0xffffffff, val_int, delta, 32);
-    return float4_e2m1_2x_t(static_cast<uint8_t>(res));
-}
-
-// ═══════════════════════════════════════════════════════════
-// WARP-LEVEL REDUCTION (USES GPU INTRINSICS)
-// ═══════════════════════════════════════════════════════════
-
-template<typename T, template<typename> class OpType>
-__device__ T warp_reduce(T val, OpType<T> op) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-        T other = shfl_down(val, offset);
-        val = op.reduce(val, other);
+    // Set block_width × block_height so it fits max_num_threads
+    template<typename T>
+    void set_block_dimension(int64_t dim0, int64_t dim1) {
+        const int max_t = MaxThreads<T>::VALUE / output_vec_size;
+        int d0 = dim0 < max_t ? static_cast<int>(last_pow2(dim0)) : max_t;
+        int d1 = dim1 < max_t ? static_cast<int>(last_pow2(dim1)) : max_t;
+        block_width  = std::min(d0, 32);
+        block_height = std::min(d1, max_t / block_width);
+        block_width  = std::min(d0, max_t / block_height);
+        num_threads  = block_width * block_height;
     }
-    return val;
+
+    int split_input (int p) { int s = step_input;  step_input  *= p; return s; }
+    int split_output(int p) { int s = step_output; step_output *= p; return s; }
+
+    dim3 block() const { return dim3(block_width, block_height); }
+    dim3 grid()  const { return dim3(div_up(num_outputs / output_vec_size, step_output), ctas_per_output); }
+
+    __host__ __device__ bool should_block_x_reduce() const { return input_mult[BLOCK_X] != 0; }
+    __host__ __device__ bool should_block_y_reduce() const { return input_mult[BLOCK_Y] != 0; }
+    __host__ __device__ bool should_global_reduce()  const { return input_mult[CTA]     != 0; }
+
+    int shared_memory_size() const {
+        if (!should_block_y_reduce() && (!should_block_x_reduce() || block_width <= 32))
+            return 0;
+        return element_size_bytes * num_threads * output_vec_size;
+    }
+    int values_per_thread() const { return div_up(num_inputs, step_input); }
+    int semaphore_size()    const {
+        return should_global_reduce() ? (int)(sizeof(int) * grid().x) : 0;
+    }
+};
+
+// Host-side solver — mirrors PyTorch's setReduceConfig()
+// Call this ONCE on the host before launching the kernel.
+template<typename acc_t>
+GpuReduceConfig build_reduce_config(const ReductionLayout& layout, int num_mp, int max_threads_per_mp) {
+    int num_outputs       = static_cast<int>(layout.num_outputs);
+    int inputs_per_output = static_cast<int>(layout.reduced_count);
+
+    // OuterContiguous: inner_count is the "fast" dimension (outputs),
+    // num_outputs is how many rows we reduce over.
+    if (layout.path == ReductionLayout::Path::OuterContiguous) {
+        num_outputs       = static_cast<int>(layout.inner_count);
+        inputs_per_output = static_cast<int>(layout.reduced_count);
+    } else if (layout.path == ReductionLayout::Path::Generic) {
+        if (num_outputs       == 0) num_outputs       = 1;
+        if (inputs_per_output == 0) inputs_per_output = 1;
+    }
+
+    auto config = GpuReduceConfig(sizeof(acc_t), num_outputs, inputs_per_output);
+    bool inner = (layout.path != ReductionLayout::Path::OuterContiguous);
+
+    int64_t dim0 = inner ? inputs_per_output : num_outputs;
+    int64_t dim1 = inner ? num_outputs       : inputs_per_output;
+    config.set_block_dimension<acc_t>(dim0, dim1);
+
+    int bw = config.block_width, bh = config.block_height;
+
+    if (inner) config.input_mult[0]  = config.split_input(bw);
+    else       config.output_mult[0] = config.split_output(bw);
+
+    constexpr int min_vpt = 16, max_vpt = 256;
+    bool split_warps = config.values_per_thread() >= std::min<int>(bh * 16, max_vpt);
+    if (split_warps) config.input_mult[1]  = config.split_input(bh);
+    else             config.output_mult[1] = config.split_output(bh);
+
+    // Multi-CTA global reduce?
+    const int blocks_per_sm = max_threads_per_mp / config.num_threads;
+    const int target_grid   = num_mp * blocks_per_sm;
+    int gx = config.grid().x;
+    if (config.input_mult[1] != 0 && config.values_per_thread() >= max_vpt && gx <= target_grid) {
+        int cpo = std::max(
+            std::min<int>(div_up(target_grid, gx), div_up(config.values_per_thread(), min_vpt)),
+            div_up(config.values_per_thread(), max_vpt));
+        config.ctas_per_output = cpo;
+        if (cpo > 1) config.input_mult[2] = config.split_input(cpo);
+    }
+    return config;
 }
 
 // ═══════════════════════════════════════════════════════════
-// BLOCK-LEVEL REDUCTION
+// SECTION 2: OFFSET CALCULATOR
+// Generic N-D stride-based index → byte offset.
+// Used only by the Generic fallback tier (~5% of DL cases).
 // ═══════════════════════════════════════════════════════════
 
-template<typename AccT, typename T, template<typename> class OpType>
-__device__ AccT block_reduce(AccT val, AccT* shared, OpType<T> op) {
+template<int NARGS = 1, typename index_t = uint32_t>
+struct OffsetCalculator {
+    static constexpr int MAX_DIMS = 10;
+    int     dims;
+    index_t sizes[MAX_DIMS];
+    index_t strides[NARGS][MAX_DIMS];
+
+    __host__ __device__ OffsetCalculator() : dims(0) {}
+
+    __host__ __device__ OffsetCalculator(int dims, const int64_t* shape,
+                                          const int64_t* const* strides_arr) : dims(dims) {
+        for (int i = 0; i < dims && i < MAX_DIMS; i++) {
+            this->sizes[i] = static_cast<index_t>(shape[i]);
+            for (int j = 0; j < NARGS; j++)
+                this->strides[j][i] = static_cast<index_t>(strides_arr[j][i]);
+        }
+    }
+
+    // O(ndim) div/mod — only called on the Generic (5%) path
+    __host__ __device__ index_t get(index_t linear_idx, int arg = 0) const {
+        index_t offset = 0;
+        for (int d = dims - 1; d >= 0; d--) {
+            index_t coord  = linear_idx % sizes[d];
+            linear_idx    /= sizes[d];
+            offset        += coord * strides[arg][d];
+        }
+        return offset;
+    }
+};
+
+// ═══════════════════════════════════════════════════════════
+// SECTION 3: PACKED REDUCE OP STRUCT
+// Packs all kernel arguments into a single struct to minimize
+// cudaLaunchKernel parameter overhead (like PyTorch's ReduceOp).
+// ═══════════════════════════════════════════════════════════
+
+template<typename scalar_t, typename out_scalar_t, typename ops_t, typename index_t = uint32_t>
+struct ReduceOp {
+    ops_t ops;
+    GpuReduceConfig config;
+    OffsetCalculator<1, index_t> input_calc;
+    OffsetCalculator<1, index_t> output_calc;
+    const scalar_t*  __restrict__ src;
+    out_scalar_t*    __restrict__ dst;
+    int64_t step_stride;
+};
+
+} // namespace detail
+
+namespace cuda {
+
+// ═══════════════════════════════════════════════════════════
+// SECTION 4: WARP / BLOCK REDUCE STAGES
+// ═══════════════════════════════════════════════════════════
+
+// Block-X reduce: all threads in a row collaborate to reduce input
+// Uses warp shuffles first (register), then shared memory for cross-warp.
+template<typename arg_t, typename ops_t>
+__device__ arg_t block_x_reduce(arg_t value, const ops_t& ops, char* shared_memory) {
     int lane = threadIdx.x % 32;
-    int wid = threadIdx.x / 32;
+    int wid  = threadIdx.x / 32;
 
-    // Warp reduction
-    OpType<AccT> acc_op;
-    val = warp_reduce(val, acc_op);
+    // Warp-level shuffle reduction
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2)
+        value = ops.combine(value, ops.warp_shfl_down(value, offset));
 
-    // Write warp results
-    if (lane == 0) shared[wid] = val;
+    // Write warp leader to shared memory
+    arg_t* smem = reinterpret_cast<arg_t*>(shared_memory);
+    if (lane == 0) smem[wid] = value;
     __syncthreads();
 
-    // Final reduction
+    // First warp reduces across all warp results
     if (wid == 0) {
-        val = (threadIdx.x < blockDim.x / 32) ? shared[lane] : acc_op.identity();
-        val = warp_reduce(val, acc_op);
+        value = (threadIdx.x < blockDim.x / 32) ? smem[lane] : ops.identity();
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2)
+            value = ops.combine(value, ops.warp_shfl_down(value, offset));
     }
-
-    return val;
+    return value;
 }
 
-// ═══════════════════════════════════════════════════════════
-// MAIN REDUCTION KERNEL (NATIVE CUDA TYPES)
-// ═══════════════════════════════════════════════════════════
-
-template<typename T, typename OutputT, template<typename> class OpType>
-__global__ void reduce_kernel(
-    const T* __restrict__ input_data,
-    OutputT* __restrict__ output_data,
-    const int64_t* __restrict__ input_dims,
-    const int64_t* __restrict__ input_strides,
-    const int64_t* __restrict__ output_dims,
-    const int64_t* __restrict__ normalized_axes,
-    const int64_t* __restrict__ reduced_dims,
-    int64_t num_slices,
-    int64_t reduced_count,
-    int ndim,
-    int num_axes,
-    int num_reduced_dims,
-    bool rank_preserved)
-{
-    OpType<T> op;
-
-    // Determine accumulator type
-    constexpr bool is_half = std::is_same_v<T, __half> || std::is_same_v<T, __nv_bfloat16>;
-    constexpr bool is_integer_sum = std::is_integral_v<T> && std::is_same_v<OpType<T>, detail::SumOp<T>>;
-    constexpr bool is_integer_product = std::is_integral_v<T> && std::is_same_v<OpType<T>, detail::ProductOp<T>>;
-//I commented these lines as i placed the accumulator logic in ReductionOps.h itself and used the AccumulatorTypeSelector struct to determine the accumulator type based on T and OpType, and whether it's GPU or CPU.
-// This way, the logic is centralized in one place (ReductionOps.h) and can be reused across both CPU and GPU implementations without duplication. The kernel just uses the resulting AccumulatorType directly. 
-    // using AccumulatorType = typename std::conditional_t<
-    //     is_integer_sum || is_integer_product,
-    //     int64_t,
-    //     typename std::conditional_t<is_half, float, T>
-    // >;
-    // compare ops (min/max): use T directly — result always within input range, no widening.
-    // sum/product/etc: use the centralized GPU accumulator type (float→float, int→int64, etc.)
-    using AccumulatorType = std::conditional_t<
-        std::is_same_v<OpType<T>, detail::MinOp<T>>    ||
-        std::is_same_v<OpType<T>, detail::MaxOp<T>>    ||
-        std::is_same_v<OpType<T>, detail::NanMinOp<T>> ||
-        std::is_same_v<OpType<T>, detail::NanMaxOp<T>>,
-        T,
-        detail::AccumulatorType<T, /*IsGPU=*/true>
-    >;
-    // complex32_t (2×float16) promotes to complex64_t (2×float) — needs explicit component conversion
-    constexpr bool is_complex_promotion = std::is_same_v<T, complex32_t> && !std::is_same_v<T, AccumulatorType>;
-
-    extern __shared__ char shared_mem[];
-    // Metadata caching
-    int64_t* s_input_strides = reinterpret_cast<int64_t*>(shared_mem);
-    int64_t* s_output_dims   = s_input_strides + ndim;
-    int64_t* s_reduced_dims  = s_output_dims + (rank_preserved ? ndim : (ndim - num_reduced_dims));
-    int64_t* s_normalized_axes = s_reduced_dims + num_reduced_dims;
-    
-    // Accumulator shared memory starts after the metadata
-    AccumulatorType* shared = reinterpret_cast<AccumulatorType*>(s_normalized_axes + num_axes);
-
-    // Calculate actual output tensor dimensions 
-    int output_ndim = rank_preserved ? ndim : 0;
-    if (!rank_preserved) {
-        // Count how many dimensions are NOT being reduced
-        // This loop is small (max 10 iterations), acceptable to keep registers/local
-        for (int dim = 0; dim < ndim; ++dim) {
-            bool is_reduced = false;
-            for (int ax = 0; ax < num_axes; ++ax) {
-                if (normalized_axes[ax] == dim) {
-                    is_reduced = true;
-                    break;
-                }
-            }
-            if (!is_reduced) output_ndim++;
-        }
-    }
-
-    // Cooperative Load of Metadata
-    if (threadIdx.x < ndim) {
-        s_input_strides[threadIdx.x] = input_strides[threadIdx.x];
-    }
-    if (threadIdx.x < output_ndim) {
-        s_output_dims[threadIdx.x] = output_dims[threadIdx.x];
-    }
-    if (threadIdx.x < num_reduced_dims) {
-        s_reduced_dims[threadIdx.x] = reduced_dims[threadIdx.x];
-    }
-    if (threadIdx.x < num_axes) {
-        s_normalized_axes[threadIdx.x] = normalized_axes[threadIdx.x];
-    }
+// Block-Y reduce: threads in the same column (same threadIdx.x) reduce
+// across all Y rows using shared memory.
+template<typename arg_t, typename ops_t>
+__device__ arg_t block_y_reduce(arg_t value, const ops_t& ops, char* shared_memory) {
+    arg_t* smem = reinterpret_cast<arg_t*>(shared_memory);
+    smem[threadIdx.x + threadIdx.y * blockDim.x] = value;
     __syncthreads();
 
+    if (threadIdx.y == 0) {
+        value = smem[threadIdx.x];
+        for (int i = 1; i < blockDim.y; i++)
+            value = ops.combine(value, smem[threadIdx.x + i * blockDim.x]);
+    }
+    return value;
+}
 
-    #pragma unroll 4
-    for (int64_t output_index = blockIdx.x; output_index < num_slices; output_index += gridDim.x) {
-        // Initialize accumulator
-        AccumulatorType accumulator;
-        if constexpr (is_integer_sum) {
-            accumulator = 0LL;
-        } else if constexpr (is_integer_product) {
-            accumulator = 1LL;
-        } else if constexpr (is_half) {
-            accumulator = to_float(op.identity());
-        } else {
-            accumulator = op.identity();
-        }
+// ═══════════════════════════════════════════════════════════
+// SECTION 5: UNIFIED REDUCTION KERNEL
+// Templated on Path to eliminate runtime branching.
+// Uses vectorized loads (vt0 elements per iteration) and
+// multiple independent accumulators for ILP.
+//
+// Template params:
+//   scalar_t      — input element type (after CudaNativeType conversion)
+//   out_scalar_t  — output element type
+//   ops_t         — functor (SumOp, MinOp, ArgMinOp, MeanOps, WelfordOps, ...)
+//   index_t       — indexing width (uint32_t for tensors < 4GB)
+//   PATH          — compile-time path selection (no runtime branching)
+//   NT            — num_threads for __launch_bounds__
+//   VT0           — values per thread for ILP (default 4)
+// ═══════════════════════════════════════════════════════════
 
-        // Calculate output coordinates using Shared Memory Metadata
-        int64_t out_coords[10];
-        int64_t temp = output_index;
-        for (int d = output_ndim - 1; d >= 0; --d) {
-            out_coords[d] = temp % s_output_dims[d]; 
-            temp /= s_output_dims[d];
-        }
+// Vectorized load helper: load VT0 elements as a single wide transaction
+template<typename T, int N>
+struct alignas(sizeof(T) * N) VecLoad {
+    T val[N];
+};
 
-        // OPTIMIZATION 1: Hoist invariant input offset calculation
-        // Calculate the base offset into input that corresponds to the output coordinates
-        int64_t base_input_offset = 0;
-        int out_coord_idx = 0;
-        for (int dim = 0; dim < ndim; ++dim) {
-            // Check if this dim is reduced using shared normalized_axes
-            bool is_reduced = false;
-            for (int ax = 0; ax < num_axes; ++ax) {
-                if (s_normalized_axes[ax] == dim) {
-                    is_reduced = true;
-                    break;
-                }
-            }
-            
-            if (!is_reduced) {
-                // For preserved dimensions, we add the offset contribution here ONCE
-                int64_t coord = rank_preserved ? out_coords[dim] : out_coords[out_coord_idx];
-                base_input_offset += coord * s_input_strides[dim];
-                if (!rank_preserved) out_coord_idx++;
-            }
-            // For reduced dimensions, the offset is calculated in the inner loop or fast path
-        }
+// Compile-time min-blocks-per-SM based on num_threads:
+//   512 threads → 4 blocks/SM (2048 threads/SM)
+//   256 threads → 8 blocks/SM
+//   128 threads → 4 blocks/SM (conservative — high register kernels)
+//   64  threads → 4 blocks/SM
+//   32  threads → 4 blocks/SM
+// Capped at 4 to avoid ptxas spilling registers trying to satisfy
+// an unreachable occupancy target for complex functors (WelfordOps, etc).
+// The compiler will still achieve higher occupancy when registers allow.
+template<int NT>
+struct MinBlocksPerSM {
+    static constexpr int VALUE = (NT >= 256) ? (2048 / NT) : 4;
+};
 
-        // OPTIMIZATION 2: Fast Path for 1D Reduction (inner-most or otherwise)
-        if (num_reduced_dims == 1) {
-            // Single dimension reduction - No unraveling needed!
-            int64_t reduced_dim_idx = s_normalized_axes[0]; // The definition index of the reduced dim
-            int64_t stride = s_input_strides[reduced_dim_idx]; // Stride for that dim
-            
-            #pragma unroll 4
-        for (int64_t i = threadIdx.x; i < reduced_count; i += blockDim.x) {
-                int64_t input_lin_idx = base_input_offset + i * stride;
-                T input_value = input_data[input_lin_idx];
-                
-                //  ACCUMULATE (FAST PATH)
-                if constexpr (is_half) {
-                    float val_f = to_float(input_value);
-                    accumulator = op.reduce(accumulator, val_f);
-                } else if constexpr (is_integer_sum) {
-                    accumulator += static_cast<int64_t>(input_value);
-                } else if constexpr (is_integer_product) {
-                    accumulator *= static_cast<int64_t>(input_value);
-                } else if constexpr (is_complex_promotion) {
-                    AccumulatorType val_acc(static_cast<float>(input_value.real()), static_cast<float>(input_value.imag()));
-                    accumulator = op.reduce(accumulator, val_acc);
-                } else {
-                    accumulator = op.reduce(accumulator, input_value);
-                }
-            }
-        } 
-        else {
-            // General Case: Multi-dimension reduction (still improved by hoisting)
-            #pragma unroll 4
-        for (int64_t i = threadIdx.x; i < reduced_count; i += blockDim.x) {
-                // Calculate reduced offsets
-                int64_t reduced_offset = 0;
-                int64_t tmp = i;
-                
-                // Unravel the reduction index and immediately multiply by stride
-                // Loop order must match the packing order of 'reduced_dims' which corresponds to 'normalized_axes'
-                // reduced_dims are packed from normalized_axes order
-                for (int d = num_reduced_dims - 1; d >= 0; --d) {
-                   int64_t coord = tmp % s_reduced_dims[d]; 
-                   tmp /= s_reduced_dims[d];
-                   
-                   // Find the original dimension index for this reduced dimension
-                   int64_t original_dim = s_normalized_axes[d];
-                   reduced_offset += coord * s_input_strides[original_dim];
-                }
-                
-                int64_t input_lin_idx = base_input_offset + reduced_offset;
-                T input_value = input_data[input_lin_idx];
+template<typename scalar_t, typename out_scalar_t, typename ops_t, typename index_t,
+         detail::ReductionLayout::Path PATH, int NT, int VT0 = 4>
+__launch_bounds__(NT, MinBlocksPerSM<NT>::VALUE)
+__global__ void unified_reduce_kernel(detail::ReduceOp<scalar_t, out_scalar_t, ops_t, index_t> op) {
+    extern __shared__ char shared_memory[];
 
-                //  ACCUMULATE (GENERAL PATH)
-                if constexpr (is_half) {
-                    float val_f = to_float(input_value);
-                    accumulator = op.reduce(accumulator, val_f);
-                } else if constexpr (is_integer_sum) {
-                    accumulator += static_cast<int64_t>(input_value);
-                } else if constexpr (is_integer_product) {
-                    accumulator *= static_cast<int64_t>(input_value);
-                } else if constexpr (is_complex_promotion) {
-                    AccumulatorType val_acc(static_cast<float>(input_value.real()), static_cast<float>(input_value.imag()));
-                    accumulator = op.reduce(accumulator, val_acc);
-                } else {
-                    accumulator = op.reduce(accumulator, input_value);
-                }
-            }
-        }
+    // accumulator type is whatever the functor's identity() returns
+    using arg_t = decltype(op.ops.identity());
+    const auto& config = op.config;
 
-        // Block reduction
-        if constexpr (is_integer_sum || is_integer_product) {
-            int lane = threadIdx.x % 32;
-            int wid = threadIdx.x / 32;
+    // ── 1. Map this thread to an output index ──
+    index_t output_idx =
+        (index_t)threadIdx.x * config.output_mult[detail::GpuReduceConfig::BLOCK_X] +
+        (index_t)threadIdx.y * config.output_mult[detail::GpuReduceConfig::BLOCK_Y] +
+        (index_t)blockIdx.x  * config.step_output;
 
+    if (output_idx >= (index_t)config.num_outputs) return;
+
+    // ── 2. Map this thread to its starting input index ──
+    index_t idx =
+        (index_t)threadIdx.x * config.input_mult[detail::GpuReduceConfig::BLOCK_X] +
+        (index_t)threadIdx.y * config.input_mult[detail::GpuReduceConfig::BLOCK_Y];
+
+    const index_t end    = (index_t)config.num_inputs;
+    const index_t stride = (index_t)config.step_input;
+
+    // ── 3. Thread-local reduction with ILP (VT0 independent accumulators) ──
+    // Multiple accumulators hide the latency of dependent reduce operations.
+    arg_t acc[VT0];
+    #pragma unroll
+    for (int i = 0; i < VT0; i++) acc[i] = op.ops.identity();
+
+    if constexpr (PATH == detail::ReductionLayout::Path::InnerContiguous) {
+        // TIER 1: Contiguous – stride=1, output × reduced_count laid out linearly.
+        // Covers ~70% of DL workloads (e.g. sum(axis=-1) on row-major tensors).
+        const scalar_t* __restrict__ base_ptr = op.src + output_idx * (index_t)config.num_inputs;
+
+        // Vectorized main loop: load VT0 elements per iteration
+        while (idx + (VT0 - 1) * stride < end) {
             #pragma unroll
-            for (int offset = 16; offset > 0; offset /= 2) {
-                int64_t other = shfl_down(accumulator, offset);
-                if constexpr (is_integer_sum) accumulator += other;
-                else accumulator *= other;
+            for (int i = 0; i < VT0; i++) {
+                acc[i] = op.ops.reduce(acc[i], base_ptr[idx + i * stride], (int64_t)(idx + i * stride));
             }
-
-            if (lane == 0) shared[wid] = accumulator;
-            __syncthreads();
-
-            if (wid == 0) {
-                accumulator = (threadIdx.x < blockDim.x / 32) ? shared[lane] : 
-                             (is_integer_sum ? 0LL : 1LL);
-                
-                #pragma unroll
-                for (int offset = 16; offset > 0; offset /= 2) {
-                    int64_t other = shfl_down(accumulator, offset);
-                    if constexpr (is_integer_sum) accumulator += other;
-                    else accumulator *= other;
-                }
-            }
-
-            if (threadIdx.x == 0) {
-                output_data[output_index] = static_cast<OutputT>(accumulator);
-            }
-        } else {
-            AccumulatorType final_val = block_reduce<AccumulatorType, T, OpType>(accumulator, shared, op);
-
-            if (threadIdx.x == 0) {
-                if constexpr (is_half) {
-                    output_data[output_index] = from_float<OutputT>(final_val);
-                } else {
-                    output_data[output_index] = static_cast<OutputT>(final_val);
-                }
-            }
+            idx += stride * VT0;
         }
+        // Scalar tail
+        while (idx < end) {
+            acc[0] = op.ops.reduce(acc[0], base_ptr[idx], (int64_t)idx);
+            idx += stride;
+        }
+    }
+    else if constexpr (PATH == detail::ReductionLayout::Path::OuterContiguous) {
+        // TIER 2: Single-stride – output dimension is innermost, reduced dim is outer.
+        // Covers ~25% of DL workloads (e.g. sum(axis=0) on NCHW → C).
+        const scalar_t* __restrict__ base_ptr = op.src + output_idx;
+        const index_t row_stride = (index_t)op.step_stride;
+
+        // ILP main loop: VT0 independent accumulators, strided access
+        while (idx + (VT0 - 1) * stride < end) {
+            #pragma unroll
+            for (int i = 0; i < VT0; i++) {
+                acc[i] = op.ops.reduce(acc[i], base_ptr[(idx + i * stride) * row_stride], (int64_t)(idx + i * stride));
+            }
+            idx += stride * VT0;
+        }
+        // Scalar tail
+        while (idx < end) {
+            acc[0] = op.ops.reduce(acc[0], base_ptr[idx * row_stride], (int64_t)idx);
+            idx += stride;
+        }
+    }
+    else {
+        // TIER 3: Generic fallback — uses OffsetCalculator (O(ndim) div/mod).
+        // Covers ~5% of cases: non-standard axes, non-contiguous or permuted tensors.
+        index_t out_base = (op.output_calc.dims > 0)
+            ? op.output_calc.get(output_idx)
+            : output_idx;
+
+        // ILP main loop for generic path
+        while (idx + (VT0 - 1) * stride < end) {
+            #pragma unroll
+            for (int i = 0; i < VT0; i++) {
+                index_t cur = idx + i * stride;
+                index_t in_off = (op.input_calc.dims > 0) ? op.input_calc.get(cur) : cur;
+                acc[i] = op.ops.reduce(acc[i], op.src[out_base + in_off], (int64_t)cur);
+            }
+            idx += stride * VT0;
+        }
+        // Scalar tail
+        while (idx < end) {
+            index_t in_off = (op.input_calc.dims > 0) ? op.input_calc.get(idx) : idx;
+            acc[0] = op.ops.reduce(acc[0], op.src[out_base + in_off], (int64_t)idx);
+            idx += stride;
+        }
+    }
+
+    // ── 4. Combine VT0 accumulators into acc[0] ──
+    #pragma unroll
+    for (int i = 1; i < VT0; i++) {
+        acc[0] = op.ops.combine(acc[0], acc[i]);
+    }
+
+    arg_t value = acc[0];
+
+    // ── 5. Block-level map-reduce stages ──
+    if (config.should_block_x_reduce())
+        value = block_x_reduce(value, op.ops, shared_memory);
+    if (config.should_block_y_reduce())
+        value = block_y_reduce(value, op.ops, shared_memory);
+
+    // ── 6. Write output (only the designated leader thread) ──
+    bool is_leader = (!config.should_block_x_reduce() || threadIdx.x == 0) &&
+                     (!config.should_block_y_reduce() || threadIdx.y == 0);
+    if (is_leader) {
+        auto final_val = op.ops.project(value);
+
+        if constexpr (std::is_same_v<out_scalar_t, __half>)
+            op.dst[output_idx] = from_float<out_scalar_t>(static_cast<float>(final_val));
+        else
+            op.dst[output_idx] = static_cast<out_scalar_t>(final_val);
     }
 }
 
 // ═══════════════════════════════════════════════════════════
-// INDEX REDUCTION KERNEL (NATIVE CUDA TYPES)
+// SECTION 6: HOST-SIDE KERNEL LAUNCHER
+// Resolves Path at compile time and dispatches to the correct
+// kernel specialization. Packs args into ReduceOp struct.
 // ═══════════════════════════════════════════════════════════
 
-template<typename T, template<typename> class OpType>
-__global__ void reduce_index_kernel(
-    const T* __restrict__ input_data,
-    int64_t* __restrict__ output_data,
-    const int64_t* __restrict__ input_dims,
-    const int64_t* __restrict__ input_strides,
-    const int64_t* __restrict__ output_dims,
-    const int64_t* __restrict__ normalized_axes,
-    const int64_t* __restrict__ reduced_dims,
-    int64_t num_slices,
-    int64_t reduced_count,
-    int ndim,
-    int num_axes,
-    int num_reduced_dims,
-    bool rank_preserved)
+template<typename scalar_t, typename out_scalar_t, typename ops_t, typename index_t = uint32_t, int VT0 = 4>
+inline void launch_reduce_kernel(
+    const ops_t& ops,
+    const detail::GpuReduceConfig& config,
+    const detail::OffsetCalculator<1, index_t>& input_calc,
+    const detail::OffsetCalculator<1, index_t>& output_calc,
+    const scalar_t* src,
+    out_scalar_t* dst,
+    detail::ReductionLayout::Path path,
+    int64_t step_stride,
+    int smem,
+    cudaStream_t stream)
 {
-    OpType<T> op;
-    using ValueIndexType = detail::ValueIndex<T>;
+    // Pack into single struct for minimal launch parameter overhead
+    detail::ReduceOp<scalar_t, out_scalar_t, ops_t, index_t> op;
+    op.ops = ops;
+    op.config = config;
+    op.input_calc = input_calc;
+    op.output_calc = output_calc;
+    op.src = src;
+    op.dst = dst;
+    op.step_stride = step_stride;
 
-    extern __shared__ char shared_mem[];
-    ValueIndexType* shared = reinterpret_cast<ValueIndexType*>(shared_mem);
+    const int nt = config.num_threads;
 
-    #pragma unroll 4
-    for (int64_t output_index = blockIdx.x; output_index < num_slices; output_index += gridDim.x) {
-        ValueIndexType accumulator = op.identity();
- 
-        //  Calculate actual output tensor dimensions 
-        int output_ndim = rank_preserved ? ndim : 0;
-        if (!rank_preserved) {
-            // Count how many dimensions are NOT being reduced
-            for (int dim = 0; dim < ndim; ++dim) {
-                bool is_reduced = false;
-                for (int ax = 0; ax < num_axes; ++ax) {
-                    if (normalized_axes[ax] == dim) {
-                        is_reduced = true;
-                        break;
-                    }
-                }
-                if (!is_reduced) output_ndim++;
-            }
-        }
-        int64_t out_coords[10];
-        int64_t temp = output_index;
-        for (int d = output_ndim - 1; d >= 0; --d) {
-            out_coords[d] = temp % output_dims[d];
-            temp /= output_dims[d];
-        }
+    // Dispatch on Path at compile time + num_threads for launch_bounds.
+    // Using a lambda to avoid duplicating the grid/block/smem logic.
+    #define LAUNCH_KERNEL(PATH_ENUM, NT_VAL) \
+        unified_reduce_kernel<scalar_t, out_scalar_t, ops_t, index_t, PATH_ENUM, NT_VAL, VT0> \
+            <<<config.grid(), config.block(), smem, stream>>>(op)
 
-        #pragma unroll 4
-        for (int64_t i = threadIdx.x; i < reduced_count; i += blockDim.x) {
-            int64_t slice_coords[10];
-            int64_t tmp = i;
-            for (int d = num_reduced_dims - 1; d >= 0; --d) {
-                slice_coords[d] = tmp % reduced_dims[d];
-                tmp /= reduced_dims[d];
-            }
-
-            int64_t full_input_coords[10];
-            int out_coord_idx = 0;
-            int slice_coord_idx = 0;
-
-            for (int dim = 0; dim < ndim; ++dim) {
-                bool is_reduced = false;
-                for (int ax = 0; ax < num_axes; ++ax) {
-                    if (normalized_axes[ax] == dim) {
-                        is_reduced = true;
-                        break;
-                    }
-                }
-
-                if (is_reduced) {
-                    full_input_coords[dim] = slice_coords[slice_coord_idx++];
-                } else {
-                    full_input_coords[dim] = rank_preserved ? out_coords[dim] : out_coords[out_coord_idx];
-                    if (!rank_preserved) out_coord_idx++;
-                }
-            }
-
-            int64_t input_lin_idx = 0;
-            for (int d = 0; d < ndim; ++d) {
-                input_lin_idx += full_input_coords[d] * input_strides[d];
-            }
-
-            T input_value = input_data[input_lin_idx];
-            ValueIndexType current = {input_value, i};
-            accumulator = op.reduce(accumulator, current);
-        }
-
-        // Warp reduction
-        int lane = threadIdx.x % 32;
-        int wid = threadIdx.x / 32;
-
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset /= 2) {
-            ValueIndexType other;
-            other.value = shfl_down(accumulator.value, offset);
-            other.index = shfl_down(accumulator.index, offset);
-            accumulator = op.reduce(accumulator, other);
-        }
-
-        if (lane == 0) shared[wid] = accumulator;
-        __syncthreads();
-
-        if (wid == 0) {
-            accumulator = (threadIdx.x < blockDim.x / 32) ? shared[lane] : op.identity();
-
-            #pragma unroll
-            for (int offset = 16; offset > 0; offset /= 2) {
-                ValueIndexType other;
-                other.value = shfl_down(accumulator.value, offset);
-                other.index = shfl_down(accumulator.index, offset);
-                accumulator = op.reduce(accumulator, other);
-            }
-        }
-
-        if (threadIdx.x == 0) {
-            output_data[output_index] = accumulator.index;
-        }
+    if (path == detail::ReductionLayout::Path::InnerContiguous) {
+        if      (nt <= 32)  { LAUNCH_KERNEL(detail::ReductionLayout::Path::InnerContiguous, 32);  }
+        else if (nt <= 64)  { LAUNCH_KERNEL(detail::ReductionLayout::Path::InnerContiguous, 64);  }
+        else if (nt <= 128) { LAUNCH_KERNEL(detail::ReductionLayout::Path::InnerContiguous, 128); }
+        else if (nt <= 256) { LAUNCH_KERNEL(detail::ReductionLayout::Path::InnerContiguous, 256); }
+        else                { LAUNCH_KERNEL(detail::ReductionLayout::Path::InnerContiguous, 512); }
     }
+    else if (path == detail::ReductionLayout::Path::OuterContiguous) {
+        if      (nt <= 32)  { LAUNCH_KERNEL(detail::ReductionLayout::Path::OuterContiguous, 32);  }
+        else if (nt <= 64)  { LAUNCH_KERNEL(detail::ReductionLayout::Path::OuterContiguous, 64);  }
+        else if (nt <= 128) { LAUNCH_KERNEL(detail::ReductionLayout::Path::OuterContiguous, 128); }
+        else if (nt <= 256) { LAUNCH_KERNEL(detail::ReductionLayout::Path::OuterContiguous, 256); }
+        else                { LAUNCH_KERNEL(detail::ReductionLayout::Path::OuterContiguous, 512); }
+    }
+    else {
+        if      (nt <= 32)  { LAUNCH_KERNEL(detail::ReductionLayout::Path::Generic, 32);  }
+        else if (nt <= 64)  { LAUNCH_KERNEL(detail::ReductionLayout::Path::Generic, 64);  }
+        else if (nt <= 128) { LAUNCH_KERNEL(detail::ReductionLayout::Path::Generic, 128); }
+        else if (nt <= 256) { LAUNCH_KERNEL(detail::ReductionLayout::Path::Generic, 256); }
+        else                { LAUNCH_KERNEL(detail::ReductionLayout::Path::Generic, 512); }
+    }
+
+    #undef LAUNCH_KERNEL
 }
 
-// ═══════════════════════════════════════════════════════════
-// MEAN REDUCTION KERNEL (NATIVE CUDA TYPES + INTRINSICS)
-// ═══════════════════════════════════════════════════════════
-
-template<typename T, typename OutputT, template<typename> class SumOpType>
-__global__ void reduce_mean_kernel(
-    const T* __restrict__ input_data,
-    OutputT* __restrict__ output_data,
-    const int64_t* __restrict__ input_dims,
-    const int64_t* __restrict__ input_strides,
-    const int64_t* __restrict__ output_dims,
-    const int64_t* __restrict__ normalized_axes,
-    const int64_t* __restrict__ reduced_dims,
-    int64_t num_slices,
-    int64_t reduced_count,
-    int ndim,
-    int num_axes,
-    int num_reduced_dims,
-    bool rank_preserved)
-{
-    constexpr bool is_nan_aware = std::is_same_v<SumOpType<T>, detail::NanSumOp<T>>;
-    constexpr bool is_half = std::is_same_v<T, __half> || std::is_same_v<T, __nv_bfloat16>;
-    constexpr bool is_complex = std::is_same_v<T, complex32_t> || std::is_same_v<T, complex64_t> || std::is_same_v<T, complex128_t>;
-
-    // Accumulator type for mean (GPU):
-    // Complex types use AccumulatorTypeSelector<T, IsGPU=true> — centralized, matches scalar rules:
-    //   complex32_t  → complex64_t  (both devices: same as scalar float16→float)
-    //   complex64_t  → complex64_t  (GPU: stay at float32 components; CPU would be complex128_t)
-    //   complex128_t → complex128_t (both devices: no promotion)
-    // NOTE: the old code had complex64_t→complex128_t on GPU which was WRONG —
-    //   double components on consumer GPUs = 32x slower for no output precision gain.
-    // Non-complex: same as before (float/half/bfloat16/int* → float, double → double).
-    using AccT = typename std::conditional_t<
-        is_complex,
-        detail::AccumulatorType<T, /*IsGPU=*/true>,
-        typename std::conditional_t<std::is_same_v<T, double>, double, float>
-    >;
-
-    extern __shared__ char shared_mem[];
-    AccT* shared_acc = reinterpret_cast<AccT*>(shared_mem);
-    int64_t* shared_count = reinterpret_cast<int64_t*>(shared_acc + blockDim.x / 32);
-
-    #pragma unroll 4
-    for (int64_t output_index = blockIdx.x; output_index < num_slices; output_index += gridDim.x) {
-        AccT accumulator;
-        if constexpr (is_complex) {
-            accumulator = AccT(0.0, 0.0);
-        } else {
-            accumulator = AccT(0);
-        }
-        int64_t valid_count = 0;
-//   Calculate actual output tensor dimensions 
-        int output_ndim = rank_preserved ? ndim : 0;
-        if (!rank_preserved) {
-            // Count how many dimensions are NOT being reduced
-            for (int dim = 0; dim < ndim; ++dim) {
-                bool is_reduced = false;
-                for (int ax = 0; ax < num_axes; ++ax) {
-                    if (normalized_axes[ax] == dim) {
-                        is_reduced = true;
-                        break;
-                    }
-                }
-                if (!is_reduced) output_ndim++;
-            }
-        }
-        int64_t out_coords[10];
-        int64_t temp = output_index;
-        for (int d = output_ndim - 1; d >= 0; --d) {
-            out_coords[d] = temp % output_dims[d];
-            temp /= output_dims[d];
-        }
-
-        //  ACCUMULATION WITH GPU INTRINSICS
-        #pragma unroll 4
-        for (int64_t i = threadIdx.x; i < reduced_count; i += blockDim.x) {
-            int64_t slice_coords[10];
-            int64_t tmp = i;
-            for (int d = num_reduced_dims - 1; d >= 0; --d) {
-                slice_coords[d] = tmp % reduced_dims[d];
-                tmp /= reduced_dims[d];
-            }
-
-            int64_t full_input_coords[10];
-            int out_coord_idx = 0;
-            int slice_coord_idx = 0;
-
-            for (int dim = 0; dim < ndim; ++dim) {
-                bool is_reduced = false;
-                for (int ax = 0; ax < num_axes; ++ax) {
-                    if (normalized_axes[ax] == dim) {
-                        is_reduced = true;
-                        break;
-                    }
-                }
-
-                if (is_reduced) {
-                    full_input_coords[dim] = slice_coords[slice_coord_idx++];
-                } else {
-                    full_input_coords[dim] = rank_preserved ? out_coords[dim] : out_coords[out_coord_idx];
-                    if (!rank_preserved) out_coord_idx++;
-                }
-            }
-
-            int64_t input_lin_idx = 0;
-            for (int d = 0; d < ndim; ++d) {
-                input_lin_idx += full_input_coords[d] * input_strides[d];
-            }
-
-            T input_value = input_data[input_lin_idx];
-
-            //  CONVERT USING GPU INTRINSICS
-            AccT val_acc;
-            if constexpr (is_half) {
-                val_acc = static_cast<double>(to_float(input_value));
-            } else {
-                val_acc = static_cast<AccT>(input_value);
-            }
-
-            if constexpr (is_nan_aware) {
-                bool is_val_nan;
-                if constexpr (is_complex) {
-                    is_val_nan = isnan(val_acc);
-                } else {
-                    is_val_nan = std::isnan(val_acc);
-                }
-                if (!is_val_nan) {
-                    accumulator += val_acc;
-                    valid_count++;
-                }
-            } else {
-                accumulator += val_acc;
-            }
-        }
-
-        // Warp reduction
-        int lane = threadIdx.x % 32;
-        int wid = threadIdx.x / 32;
-
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset /= 2) {
-            AccT other_acc = shfl_down(accumulator, offset);
-            accumulator += other_acc;
-            
-            if constexpr (is_nan_aware) {
-                int64_t other_count = shfl_down(valid_count, offset);
-                valid_count += other_count;
-            }
-        }
-
-        if (lane == 0) {
-            shared_acc[wid] = accumulator;
-            if constexpr (is_nan_aware) shared_count[wid] = valid_count;
-        }
-        __syncthreads();
-
-        if (wid == 0) {
-            if (threadIdx.x < blockDim.x / 32) {
-                accumulator = shared_acc[lane];
-            } else {
-                if constexpr (is_complex) {
-                    accumulator = AccT(0.0, 0.0);
-                } else {
-                    accumulator = AccT(0);
-                }
-            }
-            if constexpr (is_nan_aware) {
-                valid_count = (threadIdx.x < blockDim.x / 32) ? shared_count[lane] : 0;
-            }
-
-            #pragma unroll
-            for (int offset = 16; offset > 0; offset /= 2) {
-                AccT other_acc = shfl_down(accumulator, offset);
-                accumulator += other_acc;
-                
-                if constexpr (is_nan_aware) {
-                    int64_t other_count = shfl_down(valid_count, offset);
-                    valid_count += other_count;
-                }
-            }
-        }
-
-        if (threadIdx.x == 0) {
-            AccT mean_val;
-            
-            if constexpr (is_nan_aware) {
-                if (valid_count == 0) {
-                     if constexpr (is_complex) {
-                         // Create NaN for complex
-                         float nan_val = nanf("");
-                         mean_val = AccT(nan_val, nan_val);
-                     } else {
-                         mean_val = __longlong_as_double(0x7ff8000000000000ULL);
-                     }
-                } else {
-                    // Divide in AccT precision: float/float for non-double, double/double for double.
-                    // Old: static_cast<double>(valid_count) caused float→double promotion,
-                    // double division (slow on consumer GPU), then truncation back to float — no benefit.
-                    if constexpr (is_complex) {
-                        mean_val = accumulator / AccT(static_cast<float>(valid_count), 0.0f);
-                    } else {
-                        mean_val = accumulator / static_cast<AccT>(valid_count);
-                    }
-                }
-            } else {
-                // Same fix: divide in AccT precision (float for non-double, double for double).
-                if constexpr (is_complex) {
-                    mean_val = accumulator / AccT(static_cast<float>(reduced_count), 0.0f);
-                } else {
-                    mean_val = accumulator / static_cast<AccT>(reduced_count);
-                }
-            }
-
-            //   CONVERT BACK USING GPU INTRINSICS
-            if constexpr (is_half) {
-                output_data[output_index] = from_float<OutputT>(static_cast<float>(mean_val));
-            } else if constexpr (is_complex) {
-                // Handle complex type conversion (e.g., complex128_t -> complex64_t)
-                if constexpr (std::is_same_v<AccT, OutputT>) {
-                    output_data[output_index] = mean_val;
-                } else {
-                    // Convert between complex types (e.g., complex128_t to complex64_t)
-                    output_data[output_index] = OutputT(static_cast<typename std::conditional<
-                        std::is_same_v<OutputT, complex32_t>, float,
-                        typename std::conditional<std::is_same_v<OutputT, complex64_t>, float, double>::type
-                    >::type>(mean_val.real()), 
-                    static_cast<typename std::conditional<
-                        std::is_same_v<OutputT, complex32_t>, float,
-                        typename std::conditional<std::is_same_v<OutputT, complex64_t>, float, double>::type
-                    >::type>(mean_val.imag()));
-                }
-            } else if constexpr (std::is_same_v<OutputT, float4_e2m1_2x_t> || std::is_same_v<OutputT, float4_e2m1_t>) {
-                output_data[output_index] = static_cast<OutputT>(static_cast<float>(mean_val));
-            } else {
-                output_data[output_index] = static_cast<OutputT>(mean_val);
-            }
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════
-// VARIANCE REDUCTION KERNEL (FIXED - Now accepts separate MeanT type)
-// ═══════════════════════════════════════════════════════════
-
-template<typename T, typename MeanT, typename OutputT, typename AccT, template<typename> class VarianceOpType>
-__global__ void reduce_variance_kernel(
-    const T* __restrict__ input_data,
-    const MeanT* __restrict__ mean_data,  //  SEPARATE TYPE for mean!
-    OutputT* __restrict__ output_data,
-    const int64_t* __restrict__ input_dims,
-    const int64_t* __restrict__ input_strides,
-    const int64_t* __restrict__ output_dims,
-    const int64_t* __restrict__ normalized_axes,
-    const int64_t* __restrict__ reduced_dims,
-    int64_t num_slices,
-    int64_t reduced_count,
-    int64_t correction, //Bessel's correction parameter
-    int ndim,
-    int num_axes,
-    int num_reduced_dims,
-    bool rank_preserved)
-{
-    //  Determine if this is NaN-aware variance
-    constexpr bool is_nan_aware = std::is_same_v<VarianceOpType<T>, detail::NanVarianceOp<T>>;
-    constexpr bool is_complex_out = std::is_same_v<OutputT, complex32_t> || std::is_same_v<OutputT, complex64_t> || std::is_same_v<OutputT, complex128_t>;
-    
-    //  Check if AccT is complex (must come after AccT is defined)
-    constexpr bool is_complex_acc = std::is_same_v<AccT, complex32_t> || std::is_same_v<AccT, complex64_t> || std::is_same_v<AccT, complex128_t>;
-    
-    extern __shared__ char shared_mem[];
-    AccT* shared_acc = reinterpret_cast<AccT*>(shared_mem);
-    int64_t* shared_count = reinterpret_cast<int64_t*>(shared_acc + blockDim.x / 32);
-    
-    #pragma unroll 4
-    for (int64_t output_index = blockIdx.x; output_index < num_slices; output_index += gridDim.x) {
-        
-        // Calculate output coordinates
-        int64_t out_coords[10];
-        {
-            int64_t temp = output_index;
-            int output_ndim = rank_preserved ? ndim : 0;
-            
-            if (!rank_preserved) {
-                for (int dim = 0; dim < ndim; ++dim) {
-                    bool is_reduced = false;
-                    for (int ax = 0; ax < num_axes; ++ax) {
-                        if (normalized_axes[ax] == dim) {
-                            is_reduced = true;
-                            break;
-                        }
-                    }
-                    if (!is_reduced) output_ndim++;
-                }
-            }
-            
-            for (int d = output_ndim - 1; d >= 0; --d) {
-                out_coords[d] = temp % output_dims[d];
-                temp /= output_dims[d];
-            }
-        }
-
-        // Map output coords to mean tensor coords (keepdim=true → reduced dims = 1)
-        int64_t mean_coords[10];
-        int out_idx = 0;
-
-        for (int dim = 0; dim < ndim; ++dim) {
-            bool is_reduced = false;
-            for (int ax = 0; ax < num_axes; ++ax) {
-                if (normalized_axes[ax] == dim) {
-                    is_reduced = true;
-                    break;
-                }
-            }
-            
-            if (is_reduced) {
-                mean_coords[dim] = 0;
-            } else {
-                if (rank_preserved) {
-                    mean_coords[dim] = out_coords[dim];
-                } else {
-                    mean_coords[dim] = out_coords[out_idx];
-                    out_idx++;
-                }
-            }
-        }
-
-        //  Compute linear index for mean tensor
-        int64_t mean_shape[10];
-        for (int d = 0; d < ndim; ++d) {
-            bool is_reduced = false;
-            for (int ax = 0; ax < num_axes; ++ax) {
-                if (normalized_axes[ax] == d) {
-                    is_reduced = true;
-                    break;
-                }
-            }
-            mean_shape[d] = is_reduced ? 1 : input_dims[d];
-        }
-        
-        int64_t mean_index = 0;
-        int64_t mean_stride = 1;
-        
-        for (int d = ndim - 1; d >= 0; --d) {
-            mean_index += mean_coords[d] * mean_stride;
-            mean_stride *= mean_shape[d];
-        }
-        
-        //  Get mean value - now correctly typed!
-        AccT mean_val;
-        if constexpr (std::is_same_v<MeanT, __half> || std::is_same_v<MeanT, __nv_bfloat16>) {
-            mean_val = to_float(mean_data[mean_index]);
-        } else {
-            mean_val = static_cast<AccT>(mean_data[mean_index]);
-        }
-        
-        AccT accumulator;
-        if constexpr (is_complex_acc) {
-            accumulator = AccT(0.0, 0.0);
-        } else {
-            accumulator = AccT(0);
-        }
-        int64_t valid_count = 0;
-        
-        // Accumulate squared deviations
-        #pragma unroll 4
-        for (int64_t i = threadIdx.x; i < reduced_count; i += blockDim.x) {
-            int64_t slice_coords[10];
-            int64_t tmp = i;
-            for (int d = num_reduced_dims - 1; d >= 0; --d) {
-                slice_coords[d] = tmp % reduced_dims[d];
-                tmp /= reduced_dims[d];
-            }
-            
-            int64_t full_input_coords[10];
-            int out_coord_idx = 0;
-            int slice_coord_idx = 0;
-            
-            for (int dim = 0; dim < ndim; ++dim) {
-                bool is_reduced = false;
-                for (int ax = 0; ax < num_axes; ++ax) {
-                    if (normalized_axes[ax] == dim) {
-                        is_reduced = true;
-                        break;
-                    }
-                }
-                
-                if (is_reduced) {
-                    full_input_coords[dim] = slice_coords[slice_coord_idx++];
-                } else {
-                    full_input_coords[dim] = rank_preserved ? out_coords[dim] : out_coords[out_coord_idx];
-                    if (!rank_preserved) out_coord_idx++;
-                }
-            }
-            
-            int64_t input_lin_idx = 0;
-            for (int d = 0; d < ndim; ++d) {
-                input_lin_idx += full_input_coords[d] * input_strides[d];
-            }
-            
-            T input_value = input_data[input_lin_idx];
-            
-            //  Convert input to AccT (which matches mean type)
-            AccT val;
-            if constexpr (std::is_same_v<T, __half> || std::is_same_v<T, __nv_bfloat16>) {
-                val = to_float(input_value);
-            } else {
-                val = static_cast<AccT>(input_value);
-            }
-            
-            if constexpr (is_nan_aware) {
-                bool is_val_nan;
-                if constexpr (is_complex_acc) {
-                    is_val_nan = isnan(val);
-                } else {
-                    is_val_nan = std::isnan(val);
-                }
-                if (!is_val_nan) {
-                    AccT diff = val - mean_val;
-                    accumulator += diff * diff;
-                    valid_count++;
-                }
-            } else {
-                bool val_is_nan, mean_is_nan;
-                if constexpr (is_complex_acc) {
-                    val_is_nan = isnan(val);
-                    mean_is_nan = isnan(mean_val);
-                } else {
-                    val_is_nan = std::isnan(val);
-                    mean_is_nan = std::isnan(mean_val);
-                }
-                if (val_is_nan || mean_is_nan) {
-                    if constexpr (is_complex_acc) {
-                         float n = nanf("");
-                         accumulator = AccT(n, n);
-                    } else {
-                        accumulator = nanf("");
-                    }
-                } else {
-                    AccT diff = val - mean_val;
-                    accumulator += diff * diff;
-                }
-            }
-        }
-        
-        // Block reduction
-        int lane = threadIdx.x % 32;
-        int wid = threadIdx.x / 32;
-        
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset /= 2) {
-            AccT other_acc = shfl_down(accumulator, offset);
-            accumulator += other_acc;
-            
-            if constexpr (is_nan_aware) {
-                int64_t other_count = shfl_down(valid_count, offset);
-                valid_count += other_count;
-            }
-        }
-        
-        if (lane == 0) {
-            shared_acc[wid] = accumulator;
-            if constexpr (is_nan_aware) shared_count[wid] = valid_count;
-        }
-        __syncthreads();
-        
-        if (wid == 0) {
-            if (threadIdx.x < blockDim.x / 32) {
-                accumulator = shared_acc[lane];
-            } else {
-                if constexpr (is_complex_acc) {
-                    accumulator = AccT(0.0, 0.0);
-                } else {
-                    accumulator = AccT(0);
-                }
-            }
-            if constexpr (is_nan_aware) {
-                valid_count = (threadIdx.x < blockDim.x / 32) ? shared_count[lane] : 0;
-            }
-            
-            #pragma unroll
-            for (int offset = 16; offset > 0; offset /= 2) {
-                AccT other_acc = shfl_down(accumulator, offset);
-                accumulator += other_acc;
-                
-                if constexpr (is_nan_aware) {
-                    int64_t other_count = shfl_down(valid_count, offset);
-                    valid_count += other_count;
-                }
-            }
-        }
-        
-        // Final division and output
-        if (threadIdx.x == 0) {
-            int64_t divisor;
-            if constexpr (is_nan_aware) {
-                divisor = valid_count - correction;
-            } else {
-                divisor = reduced_count - correction;
-            }
-            
-            bool acc_is_nan;
-            if constexpr (is_complex_acc) {
-                acc_is_nan = isnan(accumulator);
-            } else {
-                acc_is_nan = std::isnan(accumulator);
-            }
-            if (acc_is_nan) {
-                if constexpr (std::is_same_v<OutputT, __half>) {
-                    output_data[output_index] = __float2half(nanf(""));
-                } else if constexpr (std::is_same_v<OutputT, __nv_bfloat16>) {
-                    output_data[output_index] = __float2bfloat16(nanf(""));
-                } else if constexpr (is_complex_out) {
-                     float n = nanf("");
-                     output_data[output_index] = OutputT(n, n);
-                } else {
-                    output_data[output_index] = static_cast<OutputT>(nanf(""));
-                }
-            } else if (divisor <= 0) {
-                // Insufficient data - return NaN
-                if constexpr (std::is_same_v<OutputT, __half>) {
-                    output_data[output_index] = __float2half(nanf(""));
-                } else if constexpr (std::is_same_v<OutputT, __nv_bfloat16>) {
-                    output_data[output_index] = __float2bfloat16(nanf(""));
-                } else if constexpr (is_complex_out) {
-                     float n = nanf("");
-                     output_data[output_index] = OutputT(n, n);
-                } else {
-                    output_data[output_index] = static_cast<OutputT>(nanf(""));
-                }
-            } else {
-                // Compute variance
-                AccT variance = accumulator / AccT(static_cast<double>(divisor));
-                
-                if constexpr (std::is_same_v<OutputT, __half> || std::is_same_v<OutputT, __nv_bfloat16>) {
-                    output_data[output_index] = from_float<OutputT>(static_cast<float>(variance));
-                } else {
-                    output_data[output_index] = static_cast<OutputT>(variance);
-                }
-            }
-        }
-    }
-}
 } // namespace cuda
 } // namespace OwnTensor
 

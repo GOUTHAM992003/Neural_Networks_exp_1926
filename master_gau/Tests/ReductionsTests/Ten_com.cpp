@@ -4,8 +4,10 @@ using namespace OwnTensor;
 using namespace std;
 
 int main() {
-    Tensor x({{300,200,200,200}}, Dtype::Float32, DeviceIndex(Device::CPU));
-    x.fill(100.0f);
+    TensorOptions opts;
+    opts.with_device(Device::CUDA).with_dtype(Dtype::Float32);
+    Tensor x({{8,1024,384}}, opts);
+    //x.fill(100.0f);
    // x.set_data({int16_t(150),int16_t(200) , int16_t(250), int16_t(300), int16_t(350), int16_t(400)});
     //cout<<"Tensor X:"<<endl;
     //x.to_cpu().display(std::cout,4);
@@ -16,7 +18,7 @@ int main() {
    // y.to_cpu().display(std::cout,4);
     //Comparison
     auto start = std::chrono::high_resolution_clock::now();
-    reduce_sum(x,{0,2});
+    reduce_sum(x,{0});
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> diff = end - start;
     std::cout << "Time taken: " << diff.count() << " seconds" << std::endl;

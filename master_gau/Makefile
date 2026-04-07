@@ -2,7 +2,7 @@
 # Configuration
 # =============================================================================
 CXX = g++
-NVCC = /usr/local/cuda/bin/nvcc
+NVCC = /usr/local/cuda-13.0/bin/nvcc
 SRCDIR := src
 OBJDIR := lib/objects
 LIBDIR := lib
@@ -41,7 +41,7 @@ ifeq ($(PROFILER),1)
 CPPFLAGS += -DAUTOGRAD_PROFILER_ENABLED
 endif
 CXXFLAGS = -std=c++20 -fPIC -Wall -Wextra -g -O3 -fopenmp -mavx2 -mfma -mf16c
-NVCCFLAGS = -std=c++20 -Xcompiler="-fPIC" -arch=sm_86 -g -O3 --expt-relaxed-constexpr -lineinfo
+NVCCFLAGS = -std=c++20 -Xcompiler="-fPIC" -arch=sm_86 --use_fast_math -g -O3 --expt-relaxed-constexpr -lineinfo
 
 # Auto-detect CUDA targets lib directory (for NVTX and other libraries)
 CUDA_TARGETS_LIB := $(shell find $(CUDA_ROOT)/targets -type d -name "lib" 2>/dev/null | head -1)

@@ -385,18 +385,28 @@ std::pair<Tensor, Tensor> reduce_var_mean(const Tensor& input,
         );
     }
     
-    //  FIX: Compute mean ONCE with the correct keepdim setting
-    Tensor mean = reduce_mean(input, axes, keepdim, stream);
-    
-    //  FIX: Compute variance using dispatch_variance_kernel passing the precomputed mean
+    // Compute mean with keepdim=TRUE (required for variance broadcasting).
+    // dispatch_variance_kernel uses mean_data[output_index] indexing which
+    // requires keepdim=true shape. If user wants keepdim=false, we reshape after.
+    Tensor mean_keepdim = reduce_mean(input, axes, /*keepdim=*/true, stream);
+
+    // Compute variance passing precomputed mean (avoids redundant 3rd pass)
     std::vector<int64_t> normalized_axes = detail::normalize_axes(input.shape().dims, axes);
     Tensor var = dispatch_by_dtype(input.dtype(), [&](auto T_val) -> Tensor {
         using T = decltype(T_val);
         return detail::dispatch_variance_kernel<T, VarianceOp>(
-            input, normalized_axes, keepdim, correction, stream, &mean
+            input, normalized_axes, keepdim, correction, stream, &mean_keepdim
         );
     });
-    
+
+    // If user wants keepdim=false, squeeze the mean (remove size-1 reduced dims)
+    // No recomputation needed — just reshape the existing tensor
+    Tensor mean = mean_keepdim;
+    if (!keepdim) {
+        // Compute output shape without keepdim
+        auto out_shape = detail::calculate_output_shape(input.shape().dims, normalized_axes, false);
+        mean = mean_keepdim.reshape(out_shape);
+    }
     return std::make_pair(var, mean);
 }
 
