@@ -262,7 +262,7 @@ void multi_tensor_adam_cuda(
     const std::vector<TensorInfo>& ms,
     const std::vector<TensorInfo>& vs,
     float lr, float beta1, float beta2, float eps, float weight_decay,
-    float bias_correction1, float bias_correction2
+    float bias_correction1, float bias_correction2, bool is_adamw
 ) {
     if (params.empty()) return;
     ensure_metadata_buffers();

@@ -28,6 +28,10 @@ public:
     // Move module parameters to device
     virtual void to(DeviceIndex dev);
     
+    // Save/Load state dict (Position-based)
+    void save_state_dict(const std::string& path);
+    void load_state_dict(const std::string& path);
+
     // Operator() alias for forward
     Tensor operator()(const Tensor& input);
     
@@ -50,11 +54,16 @@ public:
     Tensor bias;
     
     Linear(int in_features, int out_features, bool bias = true);
-    
+    Linear() = default;
     Tensor forward(const Tensor& input) override;
 };
 
 class ReLU : public Module {
+public:
+    Tensor forward(const Tensor& input) override;
+};
+
+class GeLU : public Module {
 public:
     Tensor forward(const Tensor& input) override;
 };
@@ -65,7 +74,7 @@ public:
     int padding_idx;
     
     Embedding(int num_embeddings, int embedding_dim, int padding_idx = -1);
-    
+    Embedding() = default;
     Tensor forward(const Tensor& input) override;
 };
 
@@ -76,7 +85,7 @@ public:
     float eps;
     
     LayerNorm(int normalized_shape, float eps = 1e-5);
-    
+    LayerNorm() = default;
     Tensor forward(const Tensor& input) override;
 };
 
@@ -89,7 +98,7 @@ private:
     std::vector<std::shared_ptr<Module>> modules_;
     
 public:
-Sequential()=  default;
+    Sequential()=  default;
     Sequential(std::initializer_list<Module*> modules);
     
     // Templated add for building incrementally?

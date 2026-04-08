@@ -6,6 +6,8 @@
 #include <string>
 #include <mutex>
 #include <atomic>
+#include "core/IntrusivePtr.h"
+#include "autograd/GraphArena.h"
 
 namespace OwnTensor {
 
@@ -139,6 +141,28 @@ public:
           topological_nr_(0),
           thread_id_(0) {
         next_edges_.resize(num_inputs);
+    }
+    
+    // =========================================================================
+    // Custom Memory Management (Arena)
+    // =========================================================================
+    
+    static std::atomic<bool> use_arena_;
+    
+    void* operator new(size_t size) {
+        if (use_arena_.load(std::memory_order_relaxed)) {
+            return autograd::GraphArena::get_thread_local().allocate(size);
+        }
+        return ::operator new(size);
+    }
+    
+    void operator delete(void* ptr) {
+        if (use_arena_.load(std::memory_order_relaxed)) {
+            // No-op: memory is managed by the arena and reclaimed in bulk via reset()
+            (void)ptr;
+        } else {
+            ::operator delete(ptr);
+        }
     }
     
     /// Construct with pre-defined edges (advanced usage)

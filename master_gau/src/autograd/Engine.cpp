@@ -1,17 +1,20 @@
 #include "autograd/Engine.h"
 #include "autograd/Functions.h"
+#include "autograd/GraphRecorder.h"
 #include "core/AutogradMeta.h"
 #include "core/TensorImpl.h"
 #include "ops/TensorOps.h"
 #include "utils/ThreadPool.h"
 #include "utils/Profiler.h"
+#ifdef WITH_CUDA
+#include <cuda_runtime.h>
+#endif
 #include <algorithm>
 #include <unordered_set>
 #include <unordered_map>
 #include <queue>
 #include <deque>
-#include <stdexcept>
-#include <iostream>
+#include <stdexcept>   
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
@@ -38,9 +41,9 @@ void set_execution_mode(ExecutionMode mode) {
     g_execution_mode = mode;
 }
 
-// =============================================================================
+// ====================================================================
 // Gradient Vector Pool
-// =============================================================================
+// ====================================================================
 class GradientVectorPool {
     std::vector<std::vector<Tensor>> pool_;
     std::mutex mutex_;
@@ -123,6 +126,8 @@ std::vector<std::shared_ptr<Node>> topological_sort(const Tensor& root) {
     std::reverse(result.begin(), result.end());
     return result;
 }
+
+
 
 // =============================================================================
 // Backward Engine
@@ -237,7 +242,7 @@ void backward_sequential(const Tensor& root, const Tensor& root_grad) {
     
     // Use deque for stable pointers even when growing
     std::deque<SequentialNodeTask> all_tasks;
-    
+
     std::vector<Node*> bfs_queue;
     bfs_queue.reserve(64);
     
@@ -312,6 +317,17 @@ void backward_sequential(const Tensor& root, const Tensor& root_grad) {
         
         variable_list input_grads;
         if (has_grad) {
+            // Capture input-grad shape for tape annotation before node_inputs is moved.
+            // The string is only built when the recorder AND shape-debug are both active.
+            std::string bwd_shape;
+            if (autograd::g_shape_debug && GraphRecordMode::get_active()) {
+                for (const auto& t : node_inputs) {
+                    if (t.is_valid()) {
+                        bwd_shape = GraphRecordMode::make_shape_info(t.shape(), t.dtype());
+                        break;
+                    }
+                }
+            }
             #ifdef AUTOGRAD_PROFILER_ENABLED
                 bool is_cuda_op = false;
                 for (const auto& t : node_inputs) {
@@ -326,6 +342,9 @@ void backward_sequential(const Tensor& root, const Tensor& root_grad) {
             #else
                 input_grads = (*node)(std::move(node_inputs));
             #endif
+
+            // Record this backward operation (with optional shape annotation)
+            GraphRecordMode::record_backward(node->name(), std::move(bwd_shape));
         }
         
         // Release saved variables and clear engine_data
@@ -358,7 +377,7 @@ void backward_sequential(const Tensor& root, const Tensor& root_grad) {
         }
     }
     
-    // Step 5: Safety cleanup - Clear engine_data for all nodes
+        // Step 5: Safety cleanup - Clear engine_data for all nodes
     for (Node* n : bfs_queue) {
         n->set_engine_data(nullptr);
     }
@@ -481,6 +500,16 @@ void backward_parallel(const Tensor& root, const Tensor& root_grad) {
                 
                 variable_list input_grads;
                 if (has_grad) {
+                    // Capture input-grad shape for tape annotation before node_inputs is moved.
+                    std::string bwd_shape;
+                    if (autograd::g_shape_debug && GraphRecordMode::get_active()) {
+                        for (const auto& t : node_inputs) {
+                            if (t.is_valid()) {
+                                bwd_shape = GraphRecordMode::make_shape_info(t.shape(), t.dtype());
+                                break;
+                            }
+                        }
+                    }
                     #ifdef AUTOGRAD_PROFILER_ENABLED
                         bool is_cuda_op = false;
                         for (const auto& t : node_inputs) {
@@ -496,13 +525,18 @@ void backward_parallel(const Tensor& root, const Tensor& root_grad) {
                         input_grads = (*node)(std::move(node_inputs));
                     #endif
 
+                    // Record this backward operation (with optional shape annotation)
+                    GraphRecordMode::record_backward(node->name(), std::move(bwd_shape));
+
                     // Check for CUDA errors after execution
+                    #ifdef WITH_CUDA
                     cudaError_t err = cudaGetLastError();
                     if (err != cudaSuccess) {
-                        throw std::runtime_error("CUDA error during node evaluation (" + 
-                                                 std::string(node->name()) + "): " + 
+                        throw std::runtime_error("CUDA error during node evaluation (" +
+                                                 std::string(node->name()) + "): " +
                                                  std::string(cudaGetErrorString(err)));
                     }
+                    #endif
                 }
                 
                 // Release saved variables
@@ -596,31 +630,76 @@ void backward_parallel(const Tensor& root, const Tensor& root_grad) {
 // Main Backward Dispatcher
 // =============================================================================
 
-void backward(const Tensor& root, const Tensor* grad_output) {
-    if (!root.requires_grad()) {
-        throw std::runtime_error("backward: tensor does not require gradients");
+void backward(const std::vector<Tensor>& roots, const std::vector<Tensor>& grad_outputs) {
+    if (roots.empty()) return;
+
+    std::vector<Tensor> processed_grads;
+    processed_grads.reserve(roots.size());
+
+    for (size_t i = 0; i < roots.size(); ++i) {
+        const auto& root = roots[i];
+        if (!root.requires_grad()) {
+             throw std::runtime_error("backward: root tensor " + std::to_string(i) + " does not require gradients");
+        }
+
+        if (i < grad_outputs.size() && grad_outputs[i].is_valid()) {
+            processed_grads.push_back(grad_outputs[i]);
+        } else {
+            // Default to ones for scalars, error for non-scalars
+            if (root.ndim() == 0 || root.numel() == 1) {
+                processed_grads.push_back(Tensor::ones(root.shape(), TensorOptions()
+                    .with_dtype(root.dtype())
+                    .with_device(root.device())));
+            } else {
+                throw std::runtime_error("backward: non-scalar root " + std::to_string(i) + " requires explicit grad_output");
+            }
+        }
     }
 
-    // 1. Initialize Root Gradient
-    Tensor root_grad;
-    bool is_scalar = root.ndim() == 0 || root.numel() == 1;
-    if (grad_output) {
-        root_grad = *grad_output;
-    } else if (is_scalar) {
-        root_grad = Tensor::ones(root.shape(), TensorOptions()
-            .with_dtype(root.dtype())
-            .with_device(root.device()));
-    } else {
-        throw std::runtime_error("backward: non-scalar requires grad_output");
-    }
-
-    // 2. Dispatch to sequential or parallel backend based on execution mode
+    // Since our backends currently only support single root, we iterate for now.
+    // However, if they are supposed to be integrated, we should ideally pass vectors.
+    // For now, to fix the compilation error while maintaining existing backend signatures:
     ExecutionMode mode = get_execution_mode();
-    
-    if (mode == ExecutionMode::SEQUENTIAL) {
-        backward_sequential(root, root_grad);
+    for (size_t i = 0; i < roots.size(); ++i) {
+        if (mode == ExecutionMode::SEQUENTIAL) {
+            backward_sequential(roots[i], processed_grads[i]);
+        } else {
+            backward_parallel(roots[i], processed_grads[i]);
+        }
+    }
+}
+
+void backward(const Tensor& root, const Tensor* grad_output) {
+    std::vector<Tensor> roots = {root};
+    std::vector<Tensor> grads;
+    if (grad_output) {
+        grads.push_back(*grad_output);
+    }
+    backward(roots, grads);
+}
+
+static thread_local std::shared_ptr<BackwardContext> g_current_context = nullptr;
+ 
+// Access the global thread pool for the autograd engine
+static utils::ThreadPool& get_engine_pool() {
+    static utils::ThreadPool pool(std::thread::hardware_concurrency());
+    return pool;
+}
+ 
+
+void queue_call_back(std::function<void()> callback) {
+    if (get_execution_mode() == ExecutionMode::SEQUENTIAL) {
+         callback();
     } else {
-        backward_parallel(root, root_grad);
+        auto ctx = g_current_context;
+        if (ctx) {
+            ctx->active_tasks++;
+            get_engine_pool().enqueue_detach([ctx, cb = std::move(callback)]() {
+                g_current_context = ctx; try { cb(); } catch (...) {}
+                if (--ctx->active_tasks == 0) { std::lock_guard<std::mutex> lk(ctx->state_mutex); ctx->cv.notify_all(); }
+                g_current_context = nullptr;
+            });
+        } else get_engine_pool().enqueue_detach(std::move(callback));
     }
 }
 

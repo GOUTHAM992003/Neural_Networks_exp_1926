@@ -3,6 +3,7 @@
 #include "ops/TensorOps.h"
 #include "ops/Kernels.h"
 #include "ops/UnaryOps/Reduction.h"
+#include "device/DeviceCore.h"
 #ifdef WITH_CUDA
 #include "ops/MatmulBackward.cuh"
 #include "ops/LinearKernels.cuh"
@@ -31,11 +32,15 @@ std::vector<Tensor> LinearBackward::apply(std::vector<Tensor>&& grads) {
 #ifdef WITH_CUDA
     // Optimized CUDA path for Linear layer patterns
     if (grad_output.is_cuda() && saved_weight_.ndim() == 2) {
+        // Set device context
+        device::set_cuda_device(grad_output.device().index);
+        cudaStream_t stream = cuda::getCurrentStream();
+
         // Case 1: Pure 2D matmul
         if (saved_input_.ndim() == 2 && grad_output.ndim() == 2) {
-            grad_input = Tensor(saved_input_.shape(), saved_input_.dtype(), saved_input_.device());
-            grad_weight = Tensor(saved_weight_.shape(), saved_weight_.dtype(), saved_weight_.device());
-            cuda_matmul_backward(grad_output, saved_input_, saved_weight_, grad_input, grad_weight, 0);
+            grad_input = Tensor(saved_input_.shape(), saved_input_.opts().with_device(grad_output.device()));
+            grad_weight = Tensor(saved_weight_.shape(), saved_weight_.opts().with_device(grad_output.device()));
+            cuda_matmul_backward(grad_output, saved_input_, saved_weight_, grad_input, grad_weight, stream);
             computed_main_grads = true;
         }
         // Case 2: Linear layer [B,T,Hidden]
@@ -46,10 +51,10 @@ std::vector<Tensor> LinearBackward::apply(std::vector<Tensor>&& grads) {
             Tensor a_flat = saved_input_.reshape(Shape{{-1, hidden_dim}});
             Tensor g_flat = grad_output.reshape(Shape{{-1, output_dim}});
             
-            Tensor grad_input_flat(a_flat.shape(), a_flat.dtype(), a_flat.device());
-            grad_weight = Tensor(saved_weight_.shape(), saved_weight_.dtype(), saved_weight_.device());
+            Tensor grad_input_flat = Tensor(a_flat.shape(), a_flat.opts().with_device(grad_output.device()));
+            Tensor grad_weight = Tensor(saved_weight_.shape(), saved_weight_.opts().with_device(grad_output.device()));
             
-            cuda_matmul_backward(g_flat, a_flat, saved_weight_, grad_input_flat, grad_weight, 0);
+            cuda_matmul_backward(g_flat, a_flat, saved_weight_, grad_input_flat, grad_weight, stream);
             
             grad_input = grad_input_flat.reshape(saved_input_.shape());
             computed_main_grads = true;
@@ -65,7 +70,7 @@ std::vector<Tensor> LinearBackward::apply(std::vector<Tensor>&& grads) {
         if (computed_main_grads) {
             result.push_back(grad_input);
         } else {
-            AUTO_PROFILE_CUDA("Backward::Linear_GradInput_CUDA");
+            // Fallback: may be on different devices if multi-GPU model but using generic matmul
             result.push_back(matmul(grad_output, saved_weight_.t()));
         }
     } else {
@@ -77,7 +82,6 @@ std::vector<Tensor> LinearBackward::apply(std::vector<Tensor>&& grads) {
         if (computed_main_grads) {
             result.push_back(grad_weight);
         } else {
-            AUTO_PROFILE_CUDA("Backward::Linear_GradWeight_CUDA");
             if (grad_output.ndim() == 3) {
                 Tensor flat_input = saved_input_.reshape(Shape{{-1, saved_input_.shape().dims.back()}});
                 Tensor flat_grad = grad_output.reshape(Shape{{-1, grad_output.shape().dims.back()}});
@@ -94,10 +98,13 @@ std::vector<Tensor> LinearBackward::apply(std::vector<Tensor>&& grads) {
     if (next_edges_.size() > 2 && next_edges_[2].is_valid()) {
 #ifdef WITH_CUDA
         if (grad_output.is_cuda()) {
-             AUTO_PROFILE_CUDA("Backward::Linear_GradBias_CUDA");
+             // Set device context
+             device::set_cuda_device(grad_output.device().index);
+             cudaStream_t stream = cuda::getCurrentStream();
+
              // Create output tensor
-             Tensor grad_bias = Tensor(Shape{{grad_output.shape().dims.back()}}, grad_output.dtype(), grad_output.device());
-             cuda_linear_bias_backward(grad_output, grad_bias, 0); // stream 0
+             Tensor grad_bias = Tensor(Shape{{grad_output.shape().dims.back()}}, grad_output.opts());
+             cuda_linear_bias_backward(grad_output, grad_bias, stream);
              result.push_back(grad_bias);
         } else 
 #endif

@@ -7,12 +7,14 @@ namespace OwnTensor {
 namespace autograd {
 
 Tensor square(const Tensor& input) {
+    GraphRecordMode::record_forward("ARITHMETIC: square");
     return make_unary_op<SquareBackward>(input,
         [](const Tensor& x) { return OwnTensor::square(x); },
         input);
 }
 
 Tensor sqrt(const Tensor& input) {
+    GraphRecordMode::record_forward("ARITHMETIC: sqrt");
     Tensor result = make_unary_op<SqrtBackward>(input,
         [](const Tensor& x) { return OwnTensor::sqrt(x); },
         Tensor()); // Placeholder, will fill later
@@ -45,17 +47,20 @@ Tensor sqrt(const Tensor& input) {
 }
 
 Tensor neg(const Tensor& input) {
+    GraphRecordMode::record_forward("ARITHMETIC: neg");
     return make_unary_op<NegBackward>(input,
         [](const Tensor& x) { return OwnTensor::neg(x); });
 }
 
 Tensor abs(const Tensor& input) {
+    GraphRecordMode::record_forward("ARITHMETIC: abs");
     return make_unary_op<AbsBackward>(input,
         [](const Tensor& x) { return OwnTensor::abs(x); },
         input);
 }
 
 Tensor reciprocal(const Tensor& input) {
+    GraphRecordMode::record_forward("ARITHMETIC: reciprocal");
     // Reciprocal backward needs output or input.
     // d(1/x) = -1/x^2 = -y^2.
     // Let's modify ReciprocalBackward to take Input (safer for now).
@@ -67,6 +72,7 @@ Tensor reciprocal(const Tensor& input) {
 }
 
 Tensor pow(const Tensor& input, float exponent) {
+    GraphRecordMode::record_forward("ARITHMETIC: pow");
     return make_unary_op<PowBackward>(input,
         [exponent](const Tensor& x) { return OwnTensor::pow(x, exponent); },
         input, exponent);

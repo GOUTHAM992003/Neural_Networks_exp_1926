@@ -54,9 +54,9 @@ namespace OwnTensor
         // Use std::malloc instead of new for consistency with other allocators
         void* ptr = std::malloc(bytes);
         
-        if (ptr == nullptr && bytes > 0) {
-             throw std::bad_alloc();
-        }
+        // if (ptr == nullptr && bytes > 0) {
+        //      throw std::bad_alloc();
+        // }
 
         {
             auto& stats = get_cpu_stats();

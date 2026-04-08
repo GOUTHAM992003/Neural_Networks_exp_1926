@@ -22,6 +22,19 @@ namespace OwnTensor
 
     CachingCUDAAllocator::~CachingCUDAAllocator()
     {
+
+        // Removed Cache Clear for Allocator Tests - caused errors while working in tandem with libtorch cache clear
+
+        // Intentionally skip empty_cache() here.
+        // At process exit the CUDA context may already be torn down
+        // by another library's atexit handler (e.g. libtorch).
+        // The OS/driver reclaims all GPU memory on process exit.
+
+        // int device_count = 0;
+        // cudaError_t err = cudaGetDeviceCount(&device_count);
+        // if (err == cudaSuccess && device_count > 0) {
+        //     empty_cache();
+        // }
         empty_cache();
     }
 
@@ -146,14 +159,27 @@ namespace OwnTensor
         block->req_size = bytes;
         block->stream = stream;
 
+        size_t current_active = 0;
+        size_t current_reserved = 0;
         {
             std::lock_guard<std::mutex> lock(*device_pools_[device].mtx);
             actual_pool_ptr->allocated_blocks[block->ptr] = block;
+            actual_pool_ptr->total_active_requested += bytes;
+            for (BlockPool* pool : {&device_pools_[device].small_pool, &device_pools_[device].large_pool}) {
+                current_active += pool->total_allocated - pool->total_cached;
+                current_reserved += pool->total_allocated;
+            }
         }
 
         AllocationTracker::instance().on_alloc(block->ptr, bytes, device);
 
-        total_allocs_++;
+        {
+            std::lock_guard<std::mutex> s_lock(stats_mutex_);
+            total_allocs_++;
+            peak_active_ = std::max(peak_active_, current_active);
+            peak_allocated_ = std::max(peak_allocated_, current_reserved);
+            peak_reserved_ = std::max(peak_reserved_, current_reserved);
+        }
         return block->ptr;
     }
 
@@ -161,45 +187,39 @@ namespace OwnTensor
     {
         if (!ptr) return;
 
-        int device;
-        cudaGetDevice(&device);
-
-        Block* block = nullptr;
-        BlockPool* pool_ptr = nullptr;
-
-        {
-            std::lock_guard<std::mutex> lock(*device_pools_[device].mtx);
+        // Search all device pools for this pointer
+        for (int d = 0; d < (int)device_pools_.size(); ++d) {
+            std::lock_guard<std::mutex> lock(*device_pools_[d].mtx);
             for (BlockPool* pool :
-                { &device_pools_[device].small_pool, &device_pools_[device].large_pool })
+                { &device_pools_[d].small_pool, &device_pools_[d].large_pool })
             {
                 auto it = pool->allocated_blocks.find(ptr);
                 if (it != pool->allocated_blocks.end())
                 {
-                    block = it->second;
-                    pool_ptr = pool;
+                    Block* block = it->second;
+                    pool->total_active_requested -= block->req_size;
                     pool->allocated_blocks.erase(it);
-                    break;
+
+                    // Set device context before any CUDA operations related to this block
+                    device::set_cuda_device(d);
+                    AllocationTracker::instance().on_free(ptr, d);
+
+                    block->allocated = false;
+                    block = pool->try_block_merge(block);
+
+                    BlockPool& final_pool = get_pool(block->size, d);
+                    final_pool.free_blocks.insert(block);
+                    final_pool.total_cached += block->size;
+
+                    total_frees_++;
+                    return; // Found and freed!
                 }
             }
-
-            if (!block)
-            {
-                std::cerr << "Warning: deallocate called on unknown pointer" << std::endl;
-                return;
-            }
-
-            AllocationTracker::instance().on_free(ptr, device);
-
-            block->allocated = false;
-            block = pool_ptr->try_block_merge(block);
-
-            BlockPool& final_pool = get_pool(block->size, device);
-
-            final_pool.free_blocks.insert(block);
-            final_pool.total_cached += block->size;
         }
-
-        total_frees_++;
+        
+        // If we get here, the pointer wasn't found in any pool.
+        // It could be from a third-party library or an application bug.
+        // std::cerr << "Warning: deallocate called on unknown pointer " << ptr << std::endl;
     }
 
     Block* CachingCUDAAllocator::cuda_alloc(size_t size, int device, cudaStream_t stream)
@@ -452,9 +472,8 @@ namespace OwnTensor
             size_t pool_active = pool.total_allocated - pool.total_cached;
             
             stats.active_current += pool_active;
-            stats.allocated_current += pool.total_allocated;
-            stats.reserved_current += pool.total_cached;
-            stats.allocated_peak = std::max(stats.allocated_peak, pool.peak_allocated);
+            stats.allocated_current += pool.total_active_requested;
+            stats.reserved_current += pool.total_allocated;
             
             if (is_small) {
                 stats.small_pool_allocated += pool.total_allocated;
@@ -495,6 +514,7 @@ namespace OwnTensor
             stats.num_ooms = num_ooms_;
             stats.num_alloc_retries = num_alloc_retries_;
             stats.active_peak = peak_active_;
+            stats.allocated_peak = peak_active_;
             stats.reserved_peak = peak_reserved_;
         }
         
@@ -512,7 +532,7 @@ namespace OwnTensor
         
         auto mb = [](size_t bytes) { return bytes / 1024.0 / 1024.0; };
 
-        std::cerr << "\n==================== CUDA Caching Allocator Stats ====================\n";
+        std::cerr << "\n==================== OwnTensor - CUDA Caching Allocator Stats ====================\n";
         
         std::cerr << "\n--- Memory Usage ---\n";
         std::cerr << "  Active (in use):     " << mb(stats.active_current) << " MB (peak: " << mb(stats.active_peak) << " MB)\n";
@@ -543,6 +563,21 @@ namespace OwnTensor
         std::cerr << "  Fragmentation:       " << stats.fragmentation_ratio() << "%\n";
         
         std::cerr << "=======================================================================\n\n";
+    }
+
+    std::vector<size_t> CachingCUDAAllocator::get_stats_vector(int device) const {
+        MemoryStats stats = get_stats(device); 
+        std::vector<size_t> stats_vector = {};
+        stats_vector.emplace_back(stats.num_allocs);
+        stats_vector.emplace_back(stats.num_frees);
+        stats_vector.emplace_back(stats.num_ooms);
+        stats_vector.emplace_back(stats.num_alloc_retries);
+        stats_vector.emplace_back(stats.active_peak);
+        stats_vector.emplace_back(stats.active_current);
+        stats_vector.emplace_back(stats.allocated_peak);
+        stats_vector.emplace_back(stats.allocated_current);
+
+        return stats_vector;
     }
 
 }

@@ -15,6 +15,7 @@ namespace OwnTensor {
 namespace autograd {
 
 Tensor matmul(const Tensor& a, const Tensor& b) {
+    GraphRecordMode::record_forward("MATRIX: matmul");
     // If a is [B, T, C] and b is [C, V], flatten a to [B*T, C] for a single giant GEMM
     if (a.ndim() == 3 && b.ndim() == 2 && a.shape().dims[2] == b.shape().dims[0]) {
         Shape original_a_shape = a.shape();
@@ -41,6 +42,7 @@ Tensor matmul(const Tensor& a, const Tensor& b) {
 }
 
 Tensor linear(const Tensor& input, const Tensor& weight, const Tensor& bias) {
+    GraphRecordMode::record_forward("MATRIX: linear");
     // Forward: input @ weight + bias (bias handled by Tensor ops, not autograd ops)
     auto forward_fn = [](const Tensor& x, const Tensor& w, const Tensor& b) {
 #ifdef WITH_CUDA
@@ -81,51 +83,46 @@ Tensor linear(const Tensor& input, const Tensor& weight, const Tensor& bias) {
         auto grad_fn = std::make_shared<LinearBackward>(input, weight);
         
         // Connect edges
-        Tensor& input_mut = const_cast<Tensor&>(input);
-        Tensor& weight_mut = const_cast<Tensor&>(weight);
-        Tensor& bias_mut = const_cast<Tensor&>(bias);
-
         if (input.requires_grad()) {
-            grad_fn->set_next_edge(0, get_grad_edge(input_mut));
+            grad_fn->set_next_edge(0, get_grad_edge(input));
         }
         if (weight.requires_grad()) {
-            grad_fn->set_next_edge(1, get_grad_edge(weight_mut));
+            grad_fn->set_next_edge(1, get_grad_edge(weight));
         }
         if (bias.is_valid() && bias.requires_grad()) {
-            grad_fn->set_next_edge(2, get_grad_edge(bias_mut));
+            grad_fn->set_next_edge(2, get_grad_edge(bias));
         }
         
         result.set_grad_fn(grad_fn);
     }
-    
+
+    if (autograd::g_shape_debug) GraphRecordMode::attach_forward_shape(result.shape(), result.dtype());
     return result;
 }
 
 
 
 Tensor addmm(const Tensor& input, const Tensor& mat1, const Tensor& mat2, float alpha, float beta) {
+    GraphRecordMode::record_forward("MATRIX: addmm");
     Tensor result = OwnTensor::addmm(input, mat1, mat2, alpha, beta);
     
     if (GradMode::is_enabled() && (input.requires_grad() || mat1.requires_grad() || mat2.requires_grad())) {
         auto grad_fn = std::make_shared<AddmmBackward>(input, mat1, mat2, alpha, beta);
         
-        Tensor& input_mut = const_cast<Tensor&>(input);
-        Tensor& mat1_mut = const_cast<Tensor&>(mat1);
-        Tensor& mat2_mut = const_cast<Tensor&>(mat2);
-        
         if (input.requires_grad()) {
-            grad_fn->set_next_edge(0, get_grad_edge(input_mut));
+            grad_fn->set_next_edge(0, get_grad_edge(input));
         }
         if (mat1.requires_grad()) {
-            grad_fn->set_next_edge(1, get_grad_edge(mat1_mut));
+            grad_fn->set_next_edge(1, get_grad_edge(mat1));
         }
         if (mat2.requires_grad()) {
-            grad_fn->set_next_edge(2, get_grad_edge(mat2_mut));
+            grad_fn->set_next_edge(2, get_grad_edge(mat2));
         }
         
         result.set_grad_fn(grad_fn);
     }
-    
+
+    if (autograd::g_shape_debug) GraphRecordMode::attach_forward_shape(result.shape(), result.dtype());
     return result;
 }
 

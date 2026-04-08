@@ -3,6 +3,7 @@
 #include <random>
 #include <vector>
 #include <memory>
+#include <string>
 
 #ifdef WITH_CUDA
 #include <curand.h>
@@ -10,14 +11,36 @@
 
 namespace OwnTensor {
 
+#ifdef WITH_CUDA
+/**
+ * @brief RAII wrapper for curandGenerator_t.
+ *
+ * Ensures curandDestroyGenerator is called on thread exit, preventing the
+ * per-thread handle leak that occurs with a raw thread_local curandGenerator_t.
+ */
+struct CurandGeneratorHandle {
+    curandGenerator_t gen{};
+    bool initialized = false;
+
+    ~CurandGeneratorHandle() {
+        if (initialized) {
+            curandDestroyGenerator(gen);
+            initialized = false;
+        }
+    }
+
+    // No copy
+    CurandGeneratorHandle() = default;
+    CurandGeneratorHandle(const CurandGeneratorHandle&) = delete;
+    CurandGeneratorHandle& operator=(const CurandGeneratorHandle&) = delete;
+};
+#endif
+
 /**
  * @brief Container for RNG states (CPU and GPU).
  */
 struct RNGState {
-    // Fixed size state for std::mt19937 to avoid heap allocation
-    // On this platform, sizeof(std::mt19937) is 5000 bytes, likely due to 64-bit uint_fast32_t.
-    // We use a safe upper bound.
-    uint32_t cpu_state_data[2000]; 
+    std::string cpu_state;   // serialized via std::mt19937's operator<<
 #ifdef WITH_CUDA
     unsigned long long gpu_seed;
     unsigned long long gpu_offset;
@@ -51,10 +74,28 @@ public:
 
 #ifdef WITH_CUDA
     /**
-     * @brief Get the thread-local curand generator.
+     * @brief Get the thread-local curand generator (host-API bulk generation).
      */
     static curandGenerator_t get_gpu_generator();
-    
+
+    /**
+     * @brief Return the current GPU seed for passing directly into device kernels.
+     */
+    static unsigned long long get_gpu_seed();
+
+    /**
+     * @brief Return the current GPU offset and atomically advance it by @p count.
+     *
+     * Device kernels must call this instead of reading gpu_offset_ directly so
+     * that consecutive kernel launches receive non-overlapping Philox counter
+     * ranges and the offset is correctly tracked for checkpoint capture/restore.
+     *
+     * @param count Number of Philox 128-bit output blocks consumed by the kernel
+     *              (typically 1 for kernels that call curand_uniform once per thread).
+     * @return The offset value the kernel should pass to curand_init().
+     */
+    static unsigned long long get_gpu_offset_and_advance(size_t count);
+
     /**
      * @brief Increment the GPU offset counter after generating random numbers.
      * @param count Number of random values generated.
@@ -65,10 +106,12 @@ public:
 private:
     static thread_local std::unique_ptr<std::mt19937> cpu_gen_;
 #ifdef WITH_CUDA
-    static thread_local curandGenerator_t gpu_gen_;
+    // CurandGeneratorHandle owns the curandGenerator_t and calls
+    // curandDestroyGenerator in its destructor, preventing the per-thread leak
+    // that would occur with a raw thread_local curandGenerator_t.
+    static thread_local CurandGeneratorHandle gpu_handle_;
     static thread_local unsigned long long gpu_seed_;
     static thread_local unsigned long long gpu_offset_;
-    static thread_local bool gpu_gen_initialized_;
 #endif
 };
 

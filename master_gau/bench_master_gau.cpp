@@ -31,6 +31,6 @@ int main() {
     std::chrono::duration<double> diff = end - start;
     std::cout << "[master_gau] Average Time over " << iterations << " ops: " 
               << (diff.count() / iterations) << " seconds" << std::endl;
-std::cin.get();
+//std::cin.get();
     return 0;
 }

@@ -4,6 +4,7 @@
 #include "core/Tensor.h"
 #include "core/AutogradMeta.h"
 #include "checkpointing/GradMode.h"
+#include "autograd/GraphRecorder.h"
 #include <memory>
 #include <type_traits>
 #include "utils/Profiler.h"
@@ -16,7 +17,7 @@ namespace autograd {
  * 
  * This is the shared helper for all autograd operations.
  */
-Edge get_grad_edge(Tensor& tensor);
+Edge get_grad_edge(const Tensor& tensor);
 
 // =============================================================================
 // UNARY OPERATION TEMPLATE
@@ -47,14 +48,15 @@ Tensor make_unary_op(const Tensor& x, ForwardOp&& forward_op, Args&&... backward
     // 1. Forward pass
     AUTO_PROFILE("ForwardOp");
     Tensor result = forward_op(x);
-    
+    if (autograd::g_shape_debug)
+        GraphRecordMode::attach_forward_shape(result.shape(), result.dtype());
+
     // 2. Build graph if needed
     if (GradMode::is_enabled() && x.requires_grad()) {
         auto grad_fn = std::make_shared<BackwardNode>(std::forward<Args>(backward_args)...);
         
         // Set up edge to input
-        Tensor& x_mut = const_cast<Tensor&>(x);
-        grad_fn->set_next_edge(0, get_grad_edge(x_mut));
+        grad_fn->set_next_edge(0, get_grad_edge(x));
         
         result.set_grad_fn(grad_fn);
         result.set_requires_grad(true);
@@ -98,20 +100,19 @@ Tensor make_binary_op(const Tensor& a, const Tensor& b, ForwardOp&& forward_op, 
     // 1. Forward pass
     AUTO_PROFILE("ForwardOp");
     Tensor result = forward_op(a, b);
-    
+    if (autograd::g_shape_debug)
+        GraphRecordMode::attach_forward_shape(result.shape(), result.dtype());
+
     // 2. Build graph if needed
     if (GradMode::is_enabled() && (a.requires_grad() || b.requires_grad())) {
         auto grad_fn = std::make_shared<BackwardNode>(std::forward<Args>(backward_args)...);
         
         // Set up edges to inputs
-        Tensor& a_mut = const_cast<Tensor&>(a);
-        Tensor& b_mut = const_cast<Tensor&>(b);
-        
         if (a.requires_grad()) {
-            grad_fn->set_next_edge(0, get_grad_edge(a_mut));
+            grad_fn->set_next_edge(0, get_grad_edge(a));
         }
         if (b.requires_grad()) {
-            grad_fn->set_next_edge(1, get_grad_edge(b_mut));
+            grad_fn->set_next_edge(1, get_grad_edge(b));
         }
         
         result.set_grad_fn(grad_fn);

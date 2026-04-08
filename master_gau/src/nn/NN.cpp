@@ -2,8 +2,10 @@
 #include "autograd/AutogradOps.h"
 #include "ops/ScalarOps.h"  // For operator*(Tensor, float)
 #include "ops/TensorOps.h"
+#include "core/Serialization.h"
+#include "core/Tensor.h"
 #include <cmath>
-
+#include <fstream>
 namespace OwnTensor {
 namespace nn {
 
@@ -59,6 +61,54 @@ void Module::register_parameter(Tensor p) {
     params_.push_back(p);
 }
 
+void Module::save_state_dict(const std::string& path) {
+    std::ofstream os(path, std::ios::binary);
+    if (!os.is_open()) {
+        throw std::runtime_error("Failed to open file for save_state_dict: " + path);
+    }
+
+    auto params = parameters();
+    int count = static_cast<int>(params.size());
+    os.write(reinterpret_cast<const char*>(&count), sizeof(int));
+
+    for (const auto& p : params) {
+        OwnTensor::save_tensor(p, os);
+    }
+    os.close();
+}
+
+void Module::load_state_dict(const std::string& path) {
+    std::ifstream is(path, std::ios::binary);
+    if (!is.is_open()) {
+        throw std::runtime_error("Failed to open file for load_state_dict: " + path);
+    }
+
+    auto params = parameters();
+    int count;
+    is.read(reinterpret_cast<char*>(&count), sizeof(int));
+
+    if (count != static_cast<int>(params.size())) {
+        throw std::runtime_error("Checkpoint parameter count mismatch! Module has " + 
+                                  std::to_string(params.size()) + " but file has " + std::to_string(count));
+    }
+
+    for (auto& p : params) {
+        Tensor loaded = OwnTensor::load_tensor(is);
+        
+        // Validation: check shape and dtype match
+        if (loaded.shape() != p.shape()) {
+             throw std::runtime_error("Parameter shape mismatch during load_state_dict!");
+        }
+        if (loaded.dtype() != p.dtype()) {
+             throw std::runtime_error("Parameter dtype mismatch during load_state_dict!");
+        }
+
+        // Copy data into existing parameter (preserves parameter identity/device)
+        p.copy_(loaded);
+    }
+    is.close();
+}
+
 // ============================================================================
 // Linear
 // ============================================================================
@@ -105,6 +155,10 @@ Tensor ReLU::forward(const Tensor& input) {
     return autograd::relu(input);
 }
 
+Tensor GeLU::forward(const Tensor& input) {
+    return autograd::gelu(input);
+}
+
 // ============================================================================
 // Embedding
 // ============================================================================
@@ -127,7 +181,7 @@ Embedding::Embedding(int num_embeddings, int embedding_dim, int padding_idx)
 }
 
 Tensor Embedding::forward(const Tensor& input) {
-    return autograd::embedding(weight, input);
+    return autograd::embedding(weight, input, padding_idx);
 }
 
 // parameters() and to() are handled by base Module.

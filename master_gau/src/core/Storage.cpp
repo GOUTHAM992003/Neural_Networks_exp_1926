@@ -53,6 +53,11 @@ Storage::Storage(size_t nbytes, Dtype dtype, DeviceIndex device, Allocator* allo
     
     // Allocate memory if nbytes > 0
     if (nbytes_ > 0) {
+#ifdef WITH_CUDA
+        if (device_.is_cuda()) {
+            device::set_cuda_device(device_.index);
+        }
+#endif
         void* raw_ptr = allocator_->allocate(nbytes_);
         if (raw_ptr == nullptr) {
             throw std::runtime_error("Storage: Failed to allocate " + 
@@ -60,7 +65,15 @@ Storage::Storage(size_t nbytes, Dtype dtype, DeviceIndex device, Allocator* allo
         }
         
         // Initialize memory to zero
-        device::set_memory(raw_ptr, device_.device, 0, nbytes_);
+        #ifdef WITH_CUDA
+        if (device_.is_cuda()) {
+            cudaStream_t stream = OwnTensor::cuda::getCurrentStream();
+            // allocator_->memsetAsync(raw_ptr, 0, nbytes_, stream);
+        } else
+        #endif
+        {
+            // allocator_->memset(raw_ptr, 0, nbytes_);
+        }
         
         // Create DataPtr with custom deleter
         data_ptr_ = DataPtr(static_cast<uint8_t*>(raw_ptr), DataPtrDeleter(allocator_));

@@ -1,6 +1,10 @@
 #pragma once
 #include <cstddef>
-
+//✨✨✨
+#ifdef WITH_CUDA
+#include <cuda_runtime.h>
+#include <cuda_runtime_api.h>
+#endif
 namespace OwnTensor
 {
     class Allocator 

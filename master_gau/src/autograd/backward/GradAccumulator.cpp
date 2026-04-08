@@ -2,26 +2,23 @@
 #include "core/AutogradMeta.h"
 #include "ops/TensorOps.h"
 
+
 namespace OwnTensor {
 namespace autograd {
 
-GradAccumulator::GradAccumulator(TensorImpl* impl)
-    : Node(1), leaf_impl_(impl) {}
 
 std::vector<GradAccumulator*> GradAccumulator::pool_;
 std::mutex GradAccumulator::pool_mutex_;
+std::atomic<int> GradAccumulator::global_id_counter_{1};
+
+GradAccumulator::GradAccumulator(TensorImpl* impl)
+    : Node(1), leaf_impl_(impl) {
+    name_ = "GradAccumulator";
+}
 
 void GradAccumulator::reset(TensorImpl* impl) {
     leaf_impl_ = intrusive_ptr<TensorImpl>(impl);
-    // Reset Node state if necessary (clearing edges, hooks etc.)
-    // For now assuming Node state is clean or doesn't matter for new usage as leaf
-    // Important: Node construction increments sequence_nr. Reuse means sequence_nr is stale?
-    // Engine uses topological sort which re-computes dependencies. 
-    // Sequence nr is mostly for debug or deterministic ties.
-    // Ideally we should re-assign a new sequence number.
-    // Accessing protected member in Node? 
-    // We can just leave it. If Engine relies heavily on strict increasing seq number for correctness it might issue.
-    // Engine uses topological sort based on structure, sequence_nr is secondary.
+ 
     clear_edges(); 
     // Reset edge to empty/invalid if any
 }

@@ -11,7 +11,7 @@
 
 #ifdef WITH_CUDA
 #include <cuda_runtime.h>
-#include <nvToolsExt.h>
+#include <nvtx3/nvToolsExt.h>
 #include "device/CachingCudaAllocator.h"
 #endif
 

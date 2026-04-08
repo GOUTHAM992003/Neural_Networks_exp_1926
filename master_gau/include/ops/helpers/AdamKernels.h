@@ -27,7 +27,8 @@ void fused_adam_cuda(
     float eps,              // Epsilon for numerical stability
     float weight_decay,     // Weight decay coefficient
     float bias_correction1, // 1 - beta1^t
-    float bias_correction2  // 1 - beta2^t
+    float bias_correction2, // 1 - beta2^t
+    bool is_adamw  
 );
 
 } // namespace cuda

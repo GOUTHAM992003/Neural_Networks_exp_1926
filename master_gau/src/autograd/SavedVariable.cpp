@@ -24,8 +24,8 @@ SavedVariable::SavedVariable(const Tensor& variable, bool is_output, bool /*is_i
         weak_grad_fn_ = variable.grad_fn();
     }
     
-    // Save the tensor (shallow copy - shares storage)
-    data_ = variable;
+    // Save the tensor (detached - shares storage but breaks graph cycles)
+    data_ = variable.detach();
 }
 
 Tensor SavedVariable::unpack(std::shared_ptr<Node> saved_for) const {

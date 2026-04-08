@@ -1,7 +1,8 @@
 #include "core/Tensor.h"
 #include "core/TensorDispatch.h"
 #include <random>
-#include "device/DeviceCore.h"//✨✨✨
+#include "device/DeviceCore.h"
+#include "device/DeviceTransfer.h"
 
 
 
@@ -83,25 +84,25 @@ namespace OwnTensor
     {
         Tensor tensor(shape, opts);
 
-        if (opts.device.is_cpu())
-        {
-            // CPU implementation - handles all 7 types automatically
-            dispatch_by_dtype(opts.dtype, [&](auto [[maybe_unused]] dummy)
-                {
-                    // using T = decltype(dummy);
-                    // tensor.fill(T(0.0f));
-                });
-        }
-        else
-        {
-            // GPU implementation - optimized with cudaMemset
-#ifdef WITH_CUDA
-            // cudaStream_t stream = OwnTensor::cuda::getCurrentStream();//✨✨✨
-            // cudaMemsetAsync(tensor.data(), 0, tensor.nbytes(), stream);//✨✨✨
-#else
-            throw std::runtime_error("CUDA not available");
-#endif
-        }
+//         if (opts.device.is_cpu())
+//         {
+//             // CPU implementation - handles all 7 types automatically
+//             dispatch_by_dtype(opts.dtype, [&](auto [[maybe_unused]] dummy)
+//                 {
+//                     // using T = decltype(dummy);
+//                     // tensor.fill(T(0.0f));
+//                 });
+//         }
+//         else
+//         {
+//             // GPU implementation - optimized with cudaMemset
+// #ifdef WITH_CUDA
+//             // cudaStream_t stream = OwnTensor::cuda::getCurrentStream();//✨✨✨
+//             // cudaMemsetAsync(tensor.data(), 0, tensor.nbytes(), stream);//✨✨✨
+// #else
+//             throw std::runtime_error("CUDA not available");
+// #endif
+//         }
         return tensor;
     }
 
@@ -146,8 +147,8 @@ namespace OwnTensor
                     else
                     {
                         std::vector<T> ones_data(tensor.numel(), T(1.0f));
-                        cudaMemcpy(tensor.data(), ones_data.data(),
-                            tensor.numel() * sizeof(T), cudaMemcpyHostToDevice);
+                        cudaMemcpyAsync(tensor.data(), ones_data.data(),
+                            tensor.numel() * sizeof(T), cudaMemcpyHostToDevice, stream);
                     }
                 });
 #else
@@ -192,8 +193,8 @@ namespace OwnTensor
                     else
                     {
                         std::vector<T> fill_data(tensor.numel(), static_cast<T>(value));
-                        cudaMemcpy(tensor.data(), fill_data.data(),
-                            tensor.numel() * sizeof(T), cudaMemcpyHostToDevice);
+                        cudaMemcpyAsync(tensor.data(), fill_data.data(),
+                            tensor.numel() * sizeof(T), cudaMemcpyHostToDevice, stream);
                     }
                 });
 #else
@@ -367,5 +368,240 @@ namespace OwnTensor
 
     template Tensor Tensor::randn<float>(Shape shape, TensorOptions opts,unsigned long seed, float sd);
     template Tensor Tensor::randn<double>(Shape shape, TensorOptions opts,unsigned long seed, double sd);
+
+    // ======================================================================
+    // multinomial — sample indices from a probability distribution
+// ======================================================================
+    Tensor Tensor::multinomial(const Tensor& input, int64_t num_samples,
+                               bool replacement, unsigned long seed)
+    {
+        // If seed is 0 (default), use random_device for non-deterministic sampling.
+        // Otherwise use the caller-provided seed (e.g. 42 + ddp_rank for DDP).
+        if (seed == 0) {
+            std::random_device rd;
+            seed = rd();
+        }
+        // --- Validation ---
+        const auto& sh = input.shape();
+        if (sh.dims.size() != 1 && sh.dims.size() != 2) {
+            throw std::runtime_error("multinomial: input must be 1-D or 2-D tensor");
+        }
+
+        bool is_1d   = (sh.dims.size() == 1);
+        int64_t nrows = is_1d ? 1 : sh.dims[0];
+        int64_t ncols = is_1d ? sh.dims[0] : sh.dims[1];
+
+        if (num_samples <= 0) {
+            throw std::runtime_error("multinomial: num_samples must be > 0");
+        }
+
+        // --- Bring input to CPU as float for sampling ---
+        Tensor cpu_input = input;
+        if (cpu_input.device().is_cuda()) {
+            cpu_input = cpu_input.to_cpu();
+        }
+        if (cpu_input.dtype() != Dtype::Float32 && cpu_input.dtype() != Dtype::Float64) {
+            cpu_input = cpu_input.as_type(Dtype::Float32);
+        }
+
+        // --- Allocate output on CPU (Int64) ---
+        Shape out_shape = is_1d ? Shape{{num_samples}} : Shape{{nrows, num_samples}};
+        Tensor output(out_shape, Dtype::Int64, DeviceIndex(Device::CPU), false);
+        int64_t* out_ptr = output.data<int64_t>();
+
+        // --- Sample per row ---
+        std::mt19937 gen(seed);
+
+        for (int64_t row = 0; row < nrows; ++row) {
+            // Build weight vector for this row
+            std::vector<double> weights(ncols);
+
+            dispatch_by_dtype(cpu_input.dtype(), [&](auto dummy) {
+                using T = decltype(dummy);
+                if constexpr (std::is_floating_point_v<T>) {
+                    const T* row_data = cpu_input.data<T>() + row * ncols;
+                    for (int64_t c = 0; c < ncols; ++c) {
+                        double w = static_cast<double>(row_data[c]);
+                        if (w < 0.0 || !std::isfinite(w)) {
+                            throw std::runtime_error(
+                                "multinomial: input must be non-negative and finite");
+                        }
+                        weights[c] = w;
+                    }
+                } else {
+                    throw std::runtime_error(
+                        "multinomial: input must be a floating-point tensor");
+                }
+            });
+
+            // Check non-zero sum
+            double total = 0.0;
+            int64_t non_zero_count = 0;
+            for (int64_t c = 0; c < ncols; ++c) {
+                total += weights[c];
+                if (weights[c] > 0.0) ++non_zero_count;
+            }
+            if (total == 0.0) {
+                throw std::runtime_error(
+                    "multinomial: rows must have a non-zero sum");
+            }
+
+            if (!replacement && num_samples > non_zero_count) {
+                throw std::runtime_error(
+                    "multinomial: cannot sample " + std::to_string(num_samples) +
+                    " without replacement from row with " +
+                    std::to_string(non_zero_count) + " non-zero elements");
+            }
+
+            // Sample indices
+            int64_t* row_out = out_ptr + row * num_samples;
+
+            if (replacement) {
+                // With replacement: single distribution, draw num_samples times
+                std::discrete_distribution<int64_t> dist(weights.begin(), weights.end());
+                for (int64_t s = 0; s < num_samples; ++s) {
+                    row_out[s] = dist(gen);
+                }
+            } else {
+                // Without replacement: draw one, zero-out, rebuild distribution
+                std::vector<double> w_copy = weights;
+                for (int64_t s = 0; s < num_samples; ++s) {
+                    std::discrete_distribution<int64_t> dist(w_copy.begin(), w_copy.end());
+                    int64_t idx = dist(gen);
+                    row_out[s] = idx;
+                    w_copy[idx] = 0.0;  // prevent re-sampling
+                }
+            }
+        }
+
+        // --- Move output to same device as input ---
+        if (input.device().is_cuda()) {
+#ifdef WITH_CUDA
+            output = output.to_cuda(input.device().index);
+#else
+            throw std::runtime_error("CUDA not available");
+#endif
+        }
+
+        return output;
+    }
+
+    Tensor Tensor::cat(const std::vector<Tensor>& tensors, int64_t dim) {
+        if (tensors.empty()) {
+            throw std::runtime_error("Tensor::cat expects a non-empty list of tensors");
+        }
+        
+        // 1. Validate inputs and calculate output shape
+        const Tensor& t0 = tensors[0];
+        int64_t ndim = t0.ndim();
+        
+        if (dim < 0) dim += ndim;
+        if (dim < 0 || dim >= ndim) {
+            throw std::runtime_error("Tensor::cat: invalid dimension " + std::to_string(dim));
+        }
+
+        Shape out_shape = t0.shape();
+        int64_t total_dim_size = 0;
+        
+        for (const auto& t : tensors) {
+            if (t.ndim() != ndim) {
+                throw std::runtime_error("Tensor::cat: all tensors must have same number of dimensions");
+            }
+            if (t.dtype() != t0.dtype()) {
+                throw std::runtime_error("Tensor::cat: all tensors must have same dtype");
+            }
+            if (t.device().device != t0.device().device || t.device().index != t0.device().index) {
+                // strict device check for now
+                throw std::runtime_error("Tensor::cat: all tensors must be on same device");
+            }
+            
+            for (int64_t i = 0; i < ndim; ++i) {
+                if (i != dim && t.shape().dims[i] != t0.shape().dims[i]) {
+                    throw std::runtime_error("Tensor::cat: sizes do not match except at dimension " + std::to_string(dim));
+                }
+            }
+            total_dim_size += t.shape().dims[dim];
+        }
+        
+        out_shape.dims[dim] = total_dim_size;
+        
+        // 2. Allocate output tensor
+        Tensor result(out_shape, t0.dtype(), t0.device(), t0.requires_grad()); 
+        
+        // 3. Copy data
+        // Optimization: If dim=0 and all inputs contiguous, simple memcpy.
+        bool all_contiguous = true;
+        for(const auto& t : tensors) if(!t.is_contiguous()) all_contiguous = false;
+        
+        size_t offset_bytes = 0;
+        size_t element_size = t0.dtype_size(t0.dtype());
+        
+        if (dim == 0 && all_contiguous) {
+             uint8_t* out_ptr = static_cast<uint8_t*>(result.data());
+             
+             for (const auto& t : tensors) {
+                 size_t bytes = t.numel() * element_size;
+                 device::copy_memory(out_ptr + offset_bytes, result.device().device,
+                                     t.data(), t.device().device,
+                                     bytes);
+                 offset_bytes += bytes;
+             }
+        } else {
+            // General case: calculate offsets.
+            int64_t prob_outer_size = 1;
+            for(int64_t i=0; i<dim; ++i) prob_outer_size *= out_shape.dims[i];
+
+            int64_t prob_inner_size = 1;
+            for(int64_t i=dim+1; i<ndim; ++i) prob_inner_size *= out_shape.dims[i];
+
+            size_t inner_bytes = prob_inner_size * element_size;
+            size_t row_pitch_out = total_dim_size * inner_bytes;
+
+            uint8_t* out_ptr = static_cast<uint8_t*>(result.data());
+
+            // Current offset in the 'dim' dimension
+            int64_t dim_offset = 0;
+
+            for(const auto& t : tensors) {
+                // Make contiguous if not
+                Tensor t_cont = t.contiguous();
+                const uint8_t* in_ptr = static_cast<const uint8_t*>(t_cont.data());
+
+                int64_t dim_size = t.shape().dims[dim];
+                size_t chunk_bytes = dim_size * inner_bytes;
+
+#ifdef WITH_CUDA
+                // Use cudaMemcpy2DAsync for GPU cat: one API call per shard
+                // instead of prob_outer_size separate cudaMemcpyAsync calls
+                if (result.device().is_cuda()) {
+                    cudaStream_t stream = 0;
+                    cudaMemcpy2DAsync(
+                        out_ptr + dim_offset * inner_bytes,  // dst
+                        row_pitch_out,                        // dst pitch (bytes per "row")
+                        in_ptr,                               // src
+                        chunk_bytes,                          // src pitch
+                        chunk_bytes,                          // width (bytes to copy per row)
+                        prob_outer_size,                      // height (number of rows)
+                        cudaMemcpyDeviceToDevice,
+                        stream
+                    );
+                } else
+#endif
+                {
+                    for(int64_t i=0; i<prob_outer_size; ++i) {
+                        size_t out_idx_bytes = i * row_pitch_out + (dim_offset * inner_bytes);
+                        size_t in_idx_bytes = i * chunk_bytes;
+                        device::copy_memory(out_ptr + out_idx_bytes, result.device().device,
+                                            in_ptr + in_idx_bytes, t_cont.device().device,
+                                            chunk_bytes);
+                    }
+                }
+
+                dim_offset += dim_size;
+            }
+        }
+        
+        return result;
+    }
 
 }

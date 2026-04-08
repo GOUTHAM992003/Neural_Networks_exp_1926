@@ -177,7 +177,7 @@ namespace OwnTensor
         // ######################################################
         // Device Metadata & Functions
         //#######################################################
-        Tensor to(DeviceIndex evice) const;
+        Tensor to(DeviceIndex device) const;
 
         bool is_cpu() const;
         bool is_cuda() const;
@@ -199,12 +199,16 @@ namespace OwnTensor
         size_t nbytes() const;
         size_t grad_nbytes() const;
         size_t numel() const;
+        // void print_meta() const;
         size_t allocated_bytes() const { return impl_->storage().nbytes(); }
         size_t grad_allocated_bytes() const;
         bool owns_data() const;
         bool owns_grad() const;
         bool is_contiguous() const;
         Tensor contiguous() const;
+        void print_meta() const;
+        static void print_shape(Shape s);
+        static void print_stride(Stride s);
 
         //#######################################################
         // Parallellism Utilities
@@ -212,14 +216,21 @@ namespace OwnTensor
 
         TensorOptions opts();
         Tensor slice(size_t start, size_t length);
-        Tensor flatten_concat(std::vector<Tensor>& tensor_list);
+        Tensor slice(OwnTensor::Tensor& tensor, size_t start, size_t length);
+        Tensor slice_inplace(size_t start, size_t length);
+        static Tensor flatten_concat(const std::vector<Tensor>& tensor_list);
         Tensor narrow(int64_t axis, int64_t start, int64_t length);
+        Tensor narrow_view(int64_t axis, int64_t start, int64_t length);
         std::vector<Tensor> make_shards(size_t num_shards, bool row_major);
-        std::vector<Tensor>make_shards(size_t num_shards, int64_t axis);
+        std::vector<Tensor> make_shards_axis(size_t num_shards, int64_t axis);
         std::vector<Tensor> make_shards_cust(std::vector<Shape> shard_shapes, bool row_major);
         std::vector<Tensor> make_shards_inplace(size_t num_shards, bool row_major);
+        std::vector<Tensor> make_shards_inplace_axis(size_t num_shards, int64_t axis);
         std::vector<Tensor> make_shards_inplace_cust(std::vector<Shape> shard_shapes, bool row_major);
         void shard_into(std::vector<Tensor>& destinations);
+        
+        // Returns the k largest elements of the given input tensor along a given dimension.
+        std::pair<Tensor, Tensor> topk(int64_t k, int64_t dim = -1, bool largest = true, bool sorted = true) const;
 
         //#######################################################
         // Data Manipulation
@@ -256,16 +267,20 @@ namespace OwnTensor
         static Tensor zeros(Shape shape, TensorOptions opts = {});
         static Tensor ones(Shape shape, TensorOptions opts = {});
         static Tensor empty(Shape shape, TensorOptions opts = {});
-        static Tensor slice(OwnTensor::Tensor& tensor, size_t start, size_t length);
-        static Tensor flatten_concat(const std::vector<Tensor>& tensor_list);
+        
+        static Tensor cat(const std::vector<Tensor>& tensors, int64_t dim = 0);
         static Tensor full(Shape shape, TensorOptions, float val);
         // static Tensor rand(Shape shape, TensorOptions opts);
-        template <typename U>
+        template <typename U=float>
         static Tensor rand(Shape shape, TensorOptions opts,unsigned long seed = 42, U lower = U(0), U upper = U(0));
 
         //static Tensor randn(Shape shape, TensorOptions opts);
-        template <typename U>
+        template <typename U=float>
         static Tensor randn(Shape shape, TensorOptions opts,unsigned long seed=42 , U sd = U(1));
+
+        static Tensor multinomial(const Tensor& input, int64_t num_samples,
+                                  bool replacement = false,
+                                  unsigned long seed = 0);
         
         //#######################################################
         // View Operations

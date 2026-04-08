@@ -22,3 +22,6 @@
 #include "autograd/operations/LossOps.h"
 #include "autograd/operations/EmbeddingOps.h"
 #include "autograd/operations/NormalizationOps.h"
+#include "autograd/operations/TrilOps.h"
+#include "autograd/operations/FlashAttentionOps.h"
+#include "autograd/operations/AttentionOps.h"

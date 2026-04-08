@@ -50,7 +50,7 @@ __global__ void k_where_bf16(const CondT* condition, const __nv_bfloat16* input,
 
 inline dim3 pick_grid(size_t n, dim3 b) {
     size_t blocks = (n + b.x - 1) / b.x;
-    if (blocks > 2147483647ULL) blocks = 2147483647ULL;
+    //if (blocks > 2147483647ULL) blocks = 2147483647ULL;
     return dim3(static_cast<unsigned int>(blocks));
 }
 
@@ -151,7 +151,7 @@ void cuda_where_scalar_tensor(const Tensor& condition, T input_scalar,
                                const Tensor& other, Tensor& out) {
     const size_t n = out.numel();
     const dim3 block(256);
-    const dim3 grid = pick_grid(n, block);
+     dim3 grid = pick_grid(n, block);
     
     const bool* cond_ptr = condition.data<bool>();
     
@@ -171,7 +171,7 @@ void cuda_where_scalar_tensor(const Tensor& condition, T input_scalar,
         } else {
             input_val = static_cast<scalar_t>(input_scalar);
         }
-        
+        grid = (static_cast<int>(grid.x) <= 56) ? dim3(56) : grid;
         k_where_scalar_tensor<<<grid, block>>>(cond_ptr, input_val, other_ptr, out_ptr, n);
     });
     

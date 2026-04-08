@@ -5,12 +5,15 @@
 #include "core/TensorImpl.h"
 #include "core/AutogradMeta.h"
 #include "ops/helpers/EmbeddingKernels.h"
+#include "device/DeviceCore.h"
 #include <stdexcept>
+#include <cstring>  // std::memcpy, std::memset
 
 namespace OwnTensor {
 namespace autograd {
 
-Tensor embedding(const Tensor& weight, const Tensor& indices) {
+Tensor embedding(const Tensor& weight, const Tensor& indices, int padding_idx) {
+    GraphRecordMode::record_forward("EMBEDDING: embedding");
     // Get dimensions
     auto weight_shape = weight.shape().dims;
     if (weight_shape.size() != 2) {
@@ -39,93 +42,84 @@ Tensor embedding(const Tensor& weight, const Tensor& indices) {
     int64_t num_indices = indices.numel();
     
     // Forward pass: lookup weight rows by indices
-    if (weight.device().is_cpu()) {
-        const float* weight_data = weight.data<float>();
-        float* output_data = output.data<float>();
-        
+    // CPU: templated scatter lookup; CUDA: dispatch to overloaded kernel
+    auto cpu_scatter_lookup = [&](auto* weight_data, auto* output_data, auto get_idx) {
+        using T = std::remove_pointer_t<decltype(output_data)>;
+        for (int64_t i = 0; i < num_indices; ++i) {
+            int64_t token_id = get_idx(i);
+            T* out_row = output_data + i * embed_dim;
+            if (token_id == (int64_t)padding_idx) {
+                std::memset(out_row, 0, embed_dim * sizeof(T));
+                continue;
+            }
+            if (token_id < 0 || token_id >= vocab_size) {
+                throw std::runtime_error(
+                    "embedding: index out of range: " + std::to_string(token_id));
+            }
+            const T* row = weight_data + token_id * embed_dim;
+            std::memcpy(out_row, row, embed_dim * sizeof(T));
+        }
+    };
+
+    auto cpu_dispatch_indices = [&](auto* weight_data, auto* output_data) {
         if (indices.dtype() == Dtype::Int64) {
-            const int64_t* idx_data = indices.data<int64_t>();
-            for (int64_t i = 0; i < num_indices; ++i) {
-                int64_t token_id = idx_data[i];
-                if (token_id < 0 || token_id >= vocab_size) {
-                    throw std::runtime_error("embedding: index out of range: " + std::to_string(token_id));
-                }
-                const float* row = weight_data + token_id * embed_dim;
-                float* out_row = output_data + i * embed_dim;
-                for (int64_t c = 0; c < embed_dim; ++c) {
-                    out_row[c] = row[c];
-                }
-            }
+            const int64_t* idx = indices.data<int64_t>();
+            cpu_scatter_lookup(weight_data, output_data, [idx](int64_t i) -> int64_t { return idx[i]; });
         } else if (indices.dtype() == Dtype::Int32) {
-            const int32_t* idx_data = indices.data<int32_t>();
-            for (int64_t i = 0; i < num_indices; ++i) {
-                int64_t token_id = static_cast<int64_t>(idx_data[i]);
-                if (token_id < 0 || token_id >= vocab_size) {
-                    throw std::runtime_error("embedding: index out of range");
-                }
-                const float* row = weight_data + token_id * embed_dim;
-                float* out_row = output_data + i * embed_dim;
-                for (int64_t c = 0; c < embed_dim; ++c) {
-                    out_row[c] = row[c];
-                }
-            }
+            const int32_t* idx = indices.data<int32_t>();
+            cpu_scatter_lookup(weight_data, output_data, [idx](int64_t i) -> int64_t { return static_cast<int64_t>(idx[i]); });
         } else if (indices.dtype() == Dtype::UInt16) {
-            const uint16_t* idx_data = indices.data<uint16_t>();
-            for (int64_t i = 0; i < num_indices; ++i) {
-                int64_t token_id = static_cast<int64_t>(idx_data[i]);
-                if (token_id < 0 || token_id >= vocab_size) {
-                    throw std::runtime_error("embedding: index out of range");
-                }
-                const float* row = weight_data + token_id * embed_dim;
-                float* out_row = output_data + i * embed_dim;
-                for (int64_t c = 0; c < embed_dim; ++c) {
-                    out_row[c] = row[c];
-                }
-            }
+            const uint16_t* idx = indices.data<uint16_t>();
+            cpu_scatter_lookup(weight_data, output_data, [idx](int64_t i) -> int64_t { return static_cast<int64_t>(idx[i]); });
         } else {
             throw std::runtime_error("embedding: indices must be Int32, Int64, or UInt16");
         }
-    } else {
-        // CUDA: Use optimized CUDA kernel
-        if (indices.dtype() == Dtype::UInt16) {
-            // Ensure indices are on same device as weight
-            Tensor indices_cuda = indices.device().is_cpu() ? indices.to(weight.device()) : indices;
-            
-            cuda::embedding_forward_cuda(
-                indices_cuda.data<uint16_t>(),
-                weight.data<float>(),
-                output.data<float>(),
-                num_indices, embed_dim, vocab_size, -1,  // padding_idx = -1 (none)
-                weight.stride().strides[0], weight.stride().strides[1]
-            );
+    };
+
+    auto cuda_dispatch = [&](auto* weight_ptr, auto* output_ptr) {
+        Tensor indices_gpu = indices.device().is_cpu() ? indices.to(weight.device()) : indices;
+        Tensor indices_u16 = (indices_gpu.dtype() == Dtype::UInt16)
+            ? indices_gpu : indices_gpu.as_type(Dtype::UInt16);
+
+        device::set_cuda_device(weight.device().index);
+        cuda::embedding_forward_cuda(
+            indices_u16.data<uint16_t>(),
+            weight_ptr, output_ptr,
+            num_indices, embed_dim, vocab_size, padding_idx,
+            weight.stride().strides[0], weight.stride().strides[1]
+        );
+    };
+
+    if (weight.device().is_cpu()) {
+        if (weight.dtype() == Dtype::Float16) {
+            cpu_dispatch_indices(weight.data<float16_t>(), output.data<float16_t>());
+        } else if (weight.dtype() == Dtype::Bfloat16) {
+            cpu_dispatch_indices(weight.data<bfloat16_t>(), output.data<bfloat16_t>());
         } else {
-            // For other index types, convert to UInt16 on device
-            Tensor indices_u16 = indices.as_type(Dtype::UInt16);
-            if (indices_u16.device().is_cpu()) {
-                indices_u16 = indices_u16.to(weight.device());
-            }
-            
-            cuda::embedding_forward_cuda(
-                indices_u16.data<uint16_t>(),
-                weight.data<float>(),
-                output.data<float>(),
-                num_indices, embed_dim, vocab_size, -1,
-                weight.stride().strides[0], weight.stride().strides[1]
-            );
+            cpu_dispatch_indices(weight.data<float>(), output.data<float>());
+        }
+    } else {
+        if (weight.dtype() == Dtype::Float16) {
+            cuda_dispatch(weight.data<float16_t>(), output.data<float16_t>());
+        } else if (weight.dtype() == Dtype::Bfloat16) {
+            cuda_dispatch(weight.data<bfloat16_t>(), output.data<bfloat16_t>());
+        } else {
+            cuda_dispatch(weight.data<float>(), output.data<float>());
         }
     }
     
     // Set up autograd if needed
-    if (weight.requires_grad()) {
-        auto grad_fn = std::make_shared<EmbeddingBackward>(indices, vocab_size, embed_dim);
+    if (GradMode::is_enabled() && weight.requires_grad()) {
+        auto grad_fn = std::make_shared<EmbeddingBackward>(indices, vocab_size, embed_dim, padding_idx);
         
-        Tensor& weight_mut = const_cast<Tensor&>(weight);
-        grad_fn->set_next_edge(0, get_grad_edge(weight_mut));
+        grad_fn->set_next_edge(0, get_grad_edge(weight));
         
         output.set_grad_fn(grad_fn);
         output.set_requires_grad(true);
     }
-    
+
+    if (autograd::g_shape_debug)
+        GraphRecordMode::attach_forward_shape(output.shape(), output.dtype());
     return output;
 }
 

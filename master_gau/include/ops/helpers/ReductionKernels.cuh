@@ -13,6 +13,29 @@
 #include <cstdint>
 #include <algorithm>
 
+#if defined(__CUDACC__) || defined(__HIPCC__)
+// Constants for occupancy calculation based on architecture limits
+// sm_75 (Turing): 1024 threads/SM
+// sm_86/87/89 (Ampere): 1536 threads/SM
+// sm_70/80 (Volta/A100): 2048 threads/SM
+#if __CUDA_ARCH__ == 750
+  #define CUDA_MAX_THREADS_PER_SM 1024
+#elif __CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 870 || __CUDA_ARCH__ == 890 || __CUDA_ARCH__ == 1200
+  #define CUDA_MAX_THREADS_PER_SM 1536
+#else
+  #define CUDA_MAX_THREADS_PER_SM 2048
+#endif
+
+#define GAU_MAX_THREADS_PER_BLOCK 1024
+
+// Clipping macro to ensure (threads * blocks) <= hardware limit
+#define GAU_MIN_BLOCKS_PER_SM(threads_per_block, blocks_per_sm)        \
+  ((((threads_per_block) * (blocks_per_sm) <= CUDA_MAX_THREADS_PER_SM) \
+        ? (blocks_per_sm)                                              \
+        : ((CUDA_MAX_THREADS_PER_SM + (threads_per_block) - 1) /       \
+           (threads_per_block))))
+#endif
+
 // gpu_isnan, gpu_add, gpu_mul, gpu_lt, gpu_gt are ALL defined in ReductionOps.h
 // under #ifdef __CUDA_ARCH__ — no need to re-declare them here.
 #include "ReductionOps.h"
@@ -296,9 +319,11 @@ struct alignas(sizeof(T) * N) VecLoad {
 // Capped at 4 to avoid ptxas spilling registers trying to satisfy
 // an unreachable occupancy target for complex functors (WelfordOps, etc).
 // The compiler will still achieve higher occupancy when registers allow.
+// Capped at hardware limit to ensure valid occupancy and avoid warnings (sm_86: 1536 threads/SM).
 template<int NT>
 struct MinBlocksPerSM {
-    static constexpr int VALUE = (NT >= 256) ? (2048 / NT) : 4;
+    static constexpr int requested = (NT >= 256) ? (2048 / NT) : 4;
+    static constexpr int VALUE = GAU_MIN_BLOCKS_PER_SM(NT, requested);
 };
 
 template<typename scalar_t, typename out_scalar_t, typename ops_t, typename index_t,

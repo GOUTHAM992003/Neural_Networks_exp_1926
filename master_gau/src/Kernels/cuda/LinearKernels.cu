@@ -1,9 +1,13 @@
 #include "ops/LinearKernels.cuh"
 #include "ops/MatmulBackward.cuh" // For reuse of cuda_matmul_backward if needed, or helpers
-#include "ops/Kernels.h" 
+#include "ops/Kernels.h"
 #include "core/Tensor.h"
+#include "core/TensorDispatch.h"
+#include "dtype/CudaTraits.h"
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
 // Helper to get cuBLAS handle (assuming a global or thread-local one exists, or creating one)
 // For this environment, we might need to rely on the one in DeviceCore/Context or similar.
@@ -42,23 +46,36 @@ __global__ void add_bias_kernel(T* output, const T* bias, int64_t accumulated_di
 
 void cuda_add_bias(Tensor& output, const Tensor& bias, cudaStream_t stream) {
     if (!bias.is_valid()) return;
-    
+
     int64_t bias_size = bias.numel();
     int64_t output_size = output.numel();
     int64_t flatten_batch = output_size / bias_size; // e.g. B*T
-    
+
     int threads = 256;
     int blocks = (output_size + threads - 1) / threads;
-    
+
     if (output.dtype() == Dtype::Float32) {
         add_bias_kernel<float><<<blocks, threads, 0, stream>>>(
-            output.data<float>(), 
-            bias.data<float>(), 
-            flatten_batch, 
+            output.data<float>(),
+            bias.data<float>(),
+            flatten_batch,
+            bias_size
+        );
+    } else if (output.dtype() == Dtype::Float16) {
+        add_bias_kernel<__half><<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<__half*>(output.data<float16_t>()),
+            reinterpret_cast<const __half*>(bias.data<float16_t>()),
+            flatten_batch,
+            bias_size
+        );
+    } else if (output.dtype() == Dtype::Bfloat16) {
+        add_bias_kernel<__nv_bfloat16><<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<__nv_bfloat16*>(output.data<bfloat16_t>()),
+            reinterpret_cast<const __nv_bfloat16*>(bias.data<bfloat16_t>()),
+            flatten_batch,
             bias_size
         );
     }
-    // Add other types if needed
 }
 
 // ======================================================================================
@@ -166,59 +183,35 @@ __global__ void reduce_bias_kernel(const T* grad_output, T* grad_bias, int64_t b
     }
 }
 
-// Optimized reduction: Parallelize over batch dimension too if batch is large
-// For GPT2: B=8, T=1024 -> Batch=8192. Bias=768 or 3072.
-// Simple loop over 8192 items per thread might be okay (8k adds).
-// Better: Block reduction.
-// Let's implement a decent kernel: 
-// Each block handles one 'channel' (bias element)? No, too many blocks if bias is large?
-// Or tiling.
-// Given 8k batch, 1 thread summing 8k is efficient enough (sequential memory access? No, stride `bias_size`).
-// Stride is `bias_size`. So `grad_output[b * bias_size + c]`. 
-// This is strided access. BAD.
-// grad_output is RowMajor [Batch, BiasDim].
-// We want to sum columns.
-// Column sum is efficient if we load rows and reduce.
-
+// Accumulate-in-float reduction for half-precision types
+// Each thread handles one bias column, loops over batch rows, accumulates in fp32
 template<typename T>
-__global__ void reduce_bias_kernel_optimized(const T* __restrict__ input, T* __restrict__ output, int rows, int cols) {
-    // input: [rows, cols]. match sum over rows.
-    // We want output[c] = sum_r input[r, c]
-    
-    // Grid: (cols / 32, rows / 32)? 
-    // Standard approach: Assign one block to a chunk of columns.
-    // Threads in block load row-major data, accumulate in shared mem or registers.
-    
-    // Let's use a simpler approach for now to ensure correctness, then optimize.
-    // Stided access is bad on GPU.
-    // But fixing it means complex transpose-like read.
-    // CuBLAS `gemv` with ones vector?
-    // sum(A, dim=0) -> output. 
-    // 1.T @ A = [1, Batch] @ [Batch, Bias] = [1, Bias].
-    // This is exactly `gemv` (if A is column major) or `gemm`.
-    // Since we are RowMajor (C-style), A is distinct. 
-    // 1_vec [1, Batch] @ A [Batch, Bias].
-    // This is Vector-Matrix multiplication. output = vec * mat.
-    // CuBLAS `cublasSgemv`: y = alpha * op(A) * x + beta * y.
-    // A is [M, N]. x is [N]. y is [M].
-    // Here we want result [Bias]. A is [Batch, Bias].
-    // We need `op(A)` to be transpose?
-    // If call gemv(A_transpose), we need A to be accessed effectively.
-    // Since A is RowMajor:
-    // A [Batch, Bias] in memory.
-    // CuBLAS assumes ColumnMajor. So in Fortran, A is [Bias, Batch].
-    // So "RowMajor [Batch, Bias]" == "ColMajor [Bias, Batch]".
-    // So we treat A as matrix [Bias, Batch].
-    // We want to sum over Batch (the columns in ColMajor view).
-    // result[i] = sum_j A[i, j]. 
-    // This is multiplying matrix [Bias, Batch] by vector [Batch] of 1s.
-    // y = A_colmaj * ones_vec.
-    // Result y is [Bias].
-    // PERFECT.
-    // So we can use `cublasSgemv` with a vector of 1s.
-    
-    // BUT we need a connector for that.
-    
+__global__ void reduce_bias_kernel_half(const T* __restrict__ grad_output, T* __restrict__ grad_bias,
+                                        int64_t batch_size, int64_t bias_size) {
+    int64_t c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c < bias_size) {
+        float sum = 0.0f;
+        #pragma unroll 4
+        for (int64_t b = 0; b < batch_size; ++b) {
+            sum += __half2float(grad_output[b * bias_size + c]);
+        }
+        grad_bias[c] = __float2half(sum);
+    }
+}
+
+// BF16 specialization
+__global__ void reduce_bias_kernel_bf16(const __nv_bfloat16* __restrict__ grad_output,
+                                        __nv_bfloat16* __restrict__ grad_bias,
+                                        int64_t batch_size, int64_t bias_size) {
+    int64_t c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c < bias_size) {
+        float sum = 0.0f;
+        #pragma unroll 4
+        for (int64_t b = 0; b < batch_size; ++b) {
+            sum += __bfloat162float(grad_output[b * bias_size + c]);
+        }
+        grad_bias[c] = __float2bfloat16(sum);
+    }
 }
 
 void cuda_linear_bias_backward(const Tensor& grad_output, Tensor& grad_bias, cudaStream_t stream) {
@@ -262,6 +255,20 @@ void cuda_linear_bias_backward(const Tensor& grad_output, Tensor& grad_bias, cud
         reduce_bias_kernel<float><<<blocks, threads, 0, stream>>>(
             grad_output.data<float>(),
             grad_bias.data<float>(),
+            height,
+            width
+        );
+    } else if (grad_bias.dtype() == Dtype::Float16) {
+        reduce_bias_kernel_half<__half><<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<const __half*>(grad_output.data<float16_t>()),
+            reinterpret_cast<__half*>(grad_bias.data<float16_t>()),
+            height,
+            width
+        );
+    } else if (grad_bias.dtype() == Dtype::Bfloat16) {
+        reduce_bias_kernel_bf16<<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(grad_output.data<bfloat16_t>()),
+            reinterpret_cast<__nv_bfloat16*>(grad_bias.data<bfloat16_t>()),
             height,
             width
         );

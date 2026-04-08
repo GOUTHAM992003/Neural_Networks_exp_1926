@@ -16,6 +16,7 @@ namespace autograd {
 class GradAccumulator : public Node {
 private:
     intrusive_ptr<TensorImpl> leaf_impl_;  // Owning pointer to keep leaf alive during backward
+    std::string name_; // Cached name with metadata
     
 public:
     explicit GradAccumulator(TensorImpl* impl);
@@ -23,7 +24,7 @@ public:
     // Pool factory method
     static std::shared_ptr<GradAccumulator> make(TensorImpl* impl);
     
-    const char* name() const override { return "GradAccumulator"; }
+    const char* name() const override { return name_.c_str(); }
     std::vector<Tensor> apply(std::vector<Tensor>&& grads) override;
     
     // Reset state for pooling
@@ -33,6 +34,7 @@ private:
    // Thread-safe pool
    static std::vector<GradAccumulator*> pool_;
    static std::mutex pool_mutex_;
+   static std::atomic<int> global_id_counter_;
 };
 
 } // namespace autograd

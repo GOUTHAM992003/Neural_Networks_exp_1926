@@ -56,6 +56,15 @@ ExecutionMode get_execution_mode();
 void set_execution_mode(ExecutionMode mode);
 
 /**
+ * @brief Set the threshold for automatic mode switching.
+ * 
+ * Graphs with fewer nodes than this threshold will always execute 
+ * in SEQUENTIAL mode even if PARALLEL mode is requested.
+ * Default is 50.
+ */
+void set_parallel_threshold(size_t threshold);
+
+/**
  * @brief Perform topological sort on computational graph.
  * 
  * @param root Root tensor to start from
@@ -71,5 +80,21 @@ std::vector<std::shared_ptr<Node>> topological_sort(const Tensor& root);
  */
 void backward(const Tensor& root, const Tensor* grad_output = nullptr);
 
+/**
+ * @brief Queue a callback to be executed by the autograd engine.
+ * 
+ * In SEQUENTIAL mode, executes immediately on the current thread.
+ * In PARALLEL mode, enqueues to the engine's thread pool.
+ * If called during a backward pass, the engine will wait for completion.
+ */
+void queue_call_back(std::function<void()> callback);
+
+/**
+* @brief Execute backward pass from multiple root tensors.
+*
+* @param roots List of tensors to compute gradients for (must start the backward pass)
+* @param grad_outputs Initial gradients for each root (default: ones like root if empty/null)
+*/
+void backward(const std::vector<Tensor>& roots, const std::vector<Tensor>& grad_outputs = {});
 } // namespace autograd
 } // namespace OwnTensor

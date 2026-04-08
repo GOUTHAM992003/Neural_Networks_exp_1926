@@ -75,15 +75,25 @@ std::vector<Tensor> MulBackward::apply(std::vector<Tensor>&& grads) {
     if (grads.empty()) {
         throw std::runtime_error("MulBackward: no gradients provided");
     }
-    
+
     const Tensor& grad_output = grads[0];
-    
-    // grad_a = grad_output * b, grad_b = grad_output * a
-    Tensor grad_a = grad_output * saved_b_;
-    Tensor grad_b = grad_output * saved_a_;
-    
-    return {reduce_to_shape(grad_a, saved_a_.shape()), 
-            reduce_to_shape(grad_b, saved_b_.shape())};
+
+    if (!grad_output.is_valid()) throw std::runtime_error("MulBackward: grad_output is invalid");
+
+    const auto& edges = next_edges();
+    bool need_grad_a = (edges.size() > 0 && edges[0].is_valid());
+    bool need_grad_b = (edges.size() > 1 && edges[1].is_valid());
+
+    Tensor grad_a, grad_b;
+
+    if (need_grad_a) {
+        grad_a = reduce_to_shape(grad_output * saved_b_, saved_a_.shape());
+    }
+    if (need_grad_b) {
+        grad_b = reduce_to_shape(grad_output * saved_a_, saved_b_.shape());
+    }
+
+    return {grad_a, grad_b};
 }
 
 // ============================================================================

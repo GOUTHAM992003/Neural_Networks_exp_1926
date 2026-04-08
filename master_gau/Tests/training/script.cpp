@@ -25,7 +25,6 @@
 #include "autograd/AutogradOps.h"
 #include "autograd/operations/LossOps.h"
 #include "nn/optimizer/Optim.h"
-#include "mlp/activation.h"
 #include "autograd/operations/EmbeddingOps.h"
 #include "nn/NN.h"
 

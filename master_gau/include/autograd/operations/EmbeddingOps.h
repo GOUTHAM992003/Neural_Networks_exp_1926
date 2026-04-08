@@ -14,7 +14,7 @@ namespace autograd {
  * @param indices Token indices [B, T] (int32 or int64)
  * @return Embeddings [B, T, embed_dim]
  */
-Tensor embedding(const Tensor& weight, const Tensor& indices);
+Tensor embedding(const Tensor& weight, const Tensor& indices, int padding_idx = -1);
 
 } // namespace autograd
 } // namespace OwnTensor

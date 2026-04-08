@@ -7,6 +7,7 @@
 #include "dtype/DtypeTraits.h" // For is_same_type in TensorDataManip.h
 #include "dtype/Types.h"
 #include "core/TensorDataManip.h" // For data access
+#include "device/DeviceCore.h"
 
 namespace OwnTensor {
 namespace autograd {
@@ -18,6 +19,7 @@ Tensor layer_norm(
     int normalized_shape, 
     float eps)
 {
+    GraphRecordMode::record_forward("NORMALIZATION: layer_norm");
     // 1. Prepare Output Tensors
     Shape x_shape = input.shape();
     Tensor output = Tensor(x_shape, input.opts());
@@ -34,25 +36,40 @@ Tensor layer_norm(
         throw std::runtime_error("LayerNorm: Last dimension of input must match normalized_shape");
     }
     
-    Tensor mean = Tensor(Shape{{rows}}, input.opts().with_req_grad(false));
-    Tensor rstd = Tensor(Shape{{rows}}, input.opts().with_req_grad(false));
-    
+    // mean/rstd always float32 (statistics accumulate in fp32)
+    TensorOptions stat_opts = TensorOptions()
+        .with_dtype(Dtype::Float32)
+        .with_device(input.device())
+        .with_req_grad(false);
+    Tensor mean = Tensor(Shape{{rows}}, stat_opts);
+    Tensor rstd = Tensor(Shape{{rows}}, stat_opts);
+
     // 2. Dispatch
     if (input.device().is_cuda()) {
-        const float* gamma_ptr = (weight.is_valid()) ? weight.data<float>() : nullptr;
-        const float* beta_ptr = (bias.is_valid()) ? bias.data<float>() : nullptr;
-        
-        cuda::layer_norm_forward_cuda(
-            input.data<float>(),
-            gamma_ptr,
-            beta_ptr,
-            output.data<float>(),
-            mean.data<float>(),
-            rstd.data<float>(),
-            rows,
-            cols,
-            eps
-        );
+        device::set_cuda_device(input.device().index);
+
+        if (input.dtype() == Dtype::Float16) {
+            const float16_t* gamma_ptr = (weight.is_valid()) ? weight.data<float16_t>() : nullptr;
+            const float16_t* beta_ptr = (bias.is_valid()) ? bias.data<float16_t>() : nullptr;
+            cuda::layer_norm_forward_cuda(
+                input.data<float16_t>(), gamma_ptr, beta_ptr,
+                output.data<float16_t>(), mean.data<float>(), rstd.data<float>(),
+                rows, cols, eps);
+        } else if (input.dtype() == Dtype::Bfloat16) {
+            const bfloat16_t* gamma_ptr = (weight.is_valid()) ? weight.data<bfloat16_t>() : nullptr;
+            const bfloat16_t* beta_ptr = (bias.is_valid()) ? bias.data<bfloat16_t>() : nullptr;
+            cuda::layer_norm_forward_cuda(
+                input.data<bfloat16_t>(), gamma_ptr, beta_ptr,
+                output.data<bfloat16_t>(), mean.data<float>(), rstd.data<float>(),
+                rows, cols, eps);
+        } else {
+            const float* gamma_ptr = (weight.is_valid()) ? weight.data<float>() : nullptr;
+            const float* beta_ptr = (bias.is_valid()) ? bias.data<float>() : nullptr;
+            cuda::layer_norm_forward_cuda(
+                input.data<float>(), gamma_ptr, beta_ptr,
+                output.data<float>(), mean.data<float>(), rstd.data<float>(),
+                rows, cols, eps);
+        }
     } else {
         // CUDA Bridge: Connection to run on CUDA if available
 #ifdef WITH_CUDA
@@ -72,72 +89,79 @@ Tensor layer_norm(
             // Fallback to CPU execution if CUDA fails
         }
 #endif
-        // CPU Fallback (OpenMP) 
+        // CPU Fallback (OpenMP) — templated lambda, always computes in float
+        auto cpu_layer_norm_forward = [&](auto* x_ptr, auto* y_ptr, auto* gamma_ptr, auto* beta_ptr) {
+            using T = std::remove_const_t<std::remove_pointer_t<decltype(x_ptr)>>;
+            float* mean_ptr = mean.data<float>();
+            float* rstd_ptr = rstd.data<float>();
 
-        const float* x_ptr = input.data<float>();
-        const float* gamma_ptr = (weight.is_valid()) ? weight.data<float>() : nullptr;
-        const float* beta_ptr = (bias.is_valid()) ? bias.data<float>() : nullptr;
-        float* y_ptr = output.data<float>();
-        float* mean_ptr = mean.data<float>();
-        float* rstd_ptr = rstd.data<float>();
-        
-        #pragma omp parallel for
-        for (int64_t i = 0; i < rows; ++i) {
-            const float* row_x = x_ptr + i * cols;
-            float* row_y = y_ptr + i * cols;
-            
-            // Mean
-            float sum = 0.0f;
-            for (int64_t j = 0; j < cols; ++j) sum += row_x[j];
-            float mu = sum / cols;
-            mean_ptr[i] = mu;
-            
-            // Var
-            float sum_sq = 0.0f;
-            for (int64_t j = 0; j < cols; ++j) {
-                float diff = row_x[j] - mu;
-                sum_sq += diff * diff;
+            #pragma omp parallel for
+            for (int64_t i = 0; i < rows; ++i) {
+                const T* row_x = x_ptr + i * cols;
+                T* row_y = y_ptr + i * cols;
+
+                float sum = 0.0f;
+                for (int64_t j = 0; j < cols; ++j) sum += static_cast<float>(row_x[j]);
+                float mu = sum / cols;
+                mean_ptr[i] = mu;
+
+                float sum_sq = 0.0f;
+                for (int64_t j = 0; j < cols; ++j) {
+                    float diff = static_cast<float>(row_x[j]) - mu;
+                    sum_sq += diff * diff;
+                }
+                float var = sum_sq / cols;
+                float rs = 1.0f / std::sqrt(var + eps);
+                rstd_ptr[i] = rs;
+
+                for (int64_t j = 0; j < cols; ++j) {
+                    float val = (static_cast<float>(row_x[j]) - mu) * rs;
+                    float g = gamma_ptr ? static_cast<float>(gamma_ptr[j]) : 1.0f;
+                    float b = beta_ptr ? static_cast<float>(beta_ptr[j]) : 0.0f;
+                    row_y[j] = static_cast<T>(val * g + b);
+                }
             }
-            float var = sum_sq / cols;
-            float rs = 1.0f / std::sqrt(var + eps);
-            rstd_ptr[i] = rs;
-            
-            // Normalize
-            for (int64_t j = 0; j < cols; ++j) {
-                float val = (row_x[j] - mu) * rs;
-                float g = (gamma_ptr) ? gamma_ptr[j] : 1.0f;
-                float b = (beta_ptr) ? beta_ptr[j] : 0.0f;
-                row_y[j] = val * g + b;
-            }
+        };
+
+        if (input.dtype() == Dtype::Float16) {
+            const float16_t* gp = weight.is_valid() ? weight.data<float16_t>() : nullptr;
+            const float16_t* bp = bias.is_valid() ? bias.data<float16_t>() : nullptr;
+            cpu_layer_norm_forward(input.data<float16_t>(), output.data<float16_t>(), gp, bp);
+        } else if (input.dtype() == Dtype::Bfloat16) {
+            const bfloat16_t* gp = weight.is_valid() ? weight.data<bfloat16_t>() : nullptr;
+            const bfloat16_t* bp = bias.is_valid() ? bias.data<bfloat16_t>() : nullptr;
+            cpu_layer_norm_forward(input.data<bfloat16_t>(), output.data<bfloat16_t>(), gp, bp);
+        } else {
+            const float* gp = weight.is_valid() ? weight.data<float>() : nullptr;
+            const float* bp = bias.is_valid() ? bias.data<float>() : nullptr;
+            cpu_layer_norm_forward(input.data<float>(), output.data<float>(), gp, bp);
         }
     }
     
-// Construct Autograd Graph
-    if (input.requires_grad() || (weight.is_valid() && weight.requires_grad()) || (bias.is_valid() && bias.requires_grad())) {
+    // Construct Autograd Graph
+    if (GradMode::is_enabled() && (input.requires_grad() || (weight.is_valid() && weight.requires_grad()) || (bias.is_valid() && bias.requires_grad()))) {
         
         auto grad_fn = std::make_shared<LayerNormBackward>(
             input, mean, rstd, weight, normalized_shape, eps
         );
         
-        Tensor& input_mut = const_cast<Tensor&>(input);
         if (input.requires_grad()) {
-            grad_fn->set_next_edge(0, get_grad_edge(input_mut));
+            grad_fn->set_next_edge(0, get_grad_edge(input));
         }
-        
+
         if (weight.is_valid() && weight.requires_grad()) {
-            Tensor& weight_mut = const_cast<Tensor&>(weight);
-            grad_fn->set_next_edge(1, get_grad_edge(weight_mut));
+            grad_fn->set_next_edge(1, get_grad_edge(weight));
         }
-        
+
         if (bias.is_valid() && bias.requires_grad()) {
-            Tensor& bias_mut = const_cast<Tensor&>(bias);
-            grad_fn->set_next_edge(2, get_grad_edge(bias_mut));
+            grad_fn->set_next_edge(2, get_grad_edge(bias));
         }
         
         output.set_grad_fn(grad_fn);
         output.set_requires_grad(true);
     }
-    
+
+    if (autograd::g_shape_debug) GraphRecordMode::attach_forward_shape(output.shape(), output.dtype());
     return output;
 }
 

@@ -10,5 +10,7 @@ namespace OwnTensor
     {
         void copy_memory(void* dst, Device dst_device,
                             const void* src, Device src_device, size_t bytes);
+        void copy_memory(void* dst, DeviceIndex dst_device, 
+                        const void* src, DeviceIndex src_device, size_t bytes);
     }
 }

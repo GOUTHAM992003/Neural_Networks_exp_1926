@@ -35,7 +35,7 @@ namespace autograd {
 variable_list checkpoint(
     std::function<variable_list(const variable_list&)> fn,
     const variable_list& inputs,
-    bool offload_to_cpu = true);
+    bool offload_to_cpu = false);
 
 /**
  * @brief Checkpoint a sequential model by splitting it into segments.
@@ -53,7 +53,7 @@ variable_list checkpoint_sequential(
     std::shared_ptr<nn::Sequential> model,
     int segments,
     const variable_list& inputs,
-    bool offload_to_cpu = true);
+    bool offload_to_cpu = false);
 
 } // namespace autograd
 } // namespace OwnTensor

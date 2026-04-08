@@ -62,6 +62,16 @@ public:
         return res;
     }
 
+    void enqueue_detach(std::function<void()> task) {
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex_);
+            if(stop_)
+                throw std::runtime_error("enqueue_detach on stopped ThreadPool");
+            tasks_.emplace(std::move(task));
+        }
+        condition_.notify_one();
+    }
+
     ~ThreadPool() {
         {
             std::unique_lock<std::mutex> lock(queue_mutex_);

@@ -33,6 +33,7 @@ namespace OwnTensor
         if (this->is_cuda()) {
             #ifdef WITH_CUDA
                 // Launch GPU kernel
+                device::set_cuda_device(this->device().index);
                 cudaStream_t stream = OwnTensor::cuda::getCurrentStream();
                 convert_type_cuda_generic(this->data(), this->dtype(), new_tensor.data(), new_dtype, n, stream);
             #else

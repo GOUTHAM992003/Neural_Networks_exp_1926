@@ -6,6 +6,8 @@
 #include "autograd/backward/TransposeBackward.h"
 #include "autograd/backward/ReshapeBackward.h"
 #include "autograd/ops_template.h"
+#include "checkpointing/GradMode.h"
+#include "autograd/GraphRecorder.h"
 #include <stdexcept>
 #include <numeric>
 
@@ -46,8 +48,7 @@ Tensor Tensor::view(Shape new_shape) const {
 
     if (requires_grad()) {
         auto grad_fn = std::make_shared<autograd::ReshapeBackward>(shape());
-        Tensor& self_mut = const_cast<Tensor&>(*this);
-        grad_fn->set_next_edge(0, autograd::get_grad_edge(self_mut));
+        grad_fn->set_next_edge(0, autograd::get_grad_edge(*this));
         result.set_grad_fn(grad_fn);
         result.set_requires_grad(true);
     }
@@ -55,7 +56,9 @@ Tensor Tensor::view(Shape new_shape) const {
 }
 
 Tensor Tensor::reshape(Shape new_shape) const {
+    autograd::GraphRecordMode::record_forward("View: reshape");
     if (!impl_) {
+
         throw std::runtime_error("reshape: tensor is not initialized");
     }
     
@@ -78,37 +81,31 @@ Tensor Tensor::reshape(Shape new_shape) const {
             result.set_grad_fn(grad_fn);
             result.set_requires_grad(true);
         }
+        if (autograd::g_shape_debug)
+            autograd::GraphRecordMode::attach_forward_shape(result.shape(), result.dtype());
         return result;
     }
-    
+
     // materialize contiguous copy on same device then view it
     Tensor base = contiguous();
     Stride new_stride = ViewUtils::compute_strides(new_shape);
     Tensor result(base.impl_, new_shape, new_stride, base.storage_offset());
-    
-    // Note: contiguous() creates a copy, but autograd should track the "reshape" logical op.
-    // If contiguous() is called, base is a new leaf unless tracked? 
-    // contiguous() usually copies data but doesn't record "Contiguous" backward unless implemented.
-    // However, reshape acts on base. 
-    // If the original tensor required grad, the reshaped one should too.
-    // But if base breaks graph...
-    // Actually, ReshapeBackward handles reshape logic.
-    // We should connect result to this (original).
-    // input_shape_ for backward should be this->shape().
-    
+
     if (requires_grad()) {
         auto grad_fn = std::make_shared<autograd::ReshapeBackward>(shape());
-        Tensor& self_mut = const_cast<Tensor&>(*this);
-        grad_fn->set_next_edge(0, autograd::get_grad_edge(self_mut));
+        grad_fn->set_next_edge(0, autograd::get_grad_edge(*this));
         result.set_grad_fn(grad_fn);
         result.set_requires_grad(true);
     }
-    
+
+    if (autograd::g_shape_debug)
+        autograd::GraphRecordMode::attach_forward_shape(result.shape(), result.dtype());
     return result;
 }
 
 Tensor Tensor::transpose(int dim0, int dim1) const
 {
+    autograd::GraphRecordMode::record_forward("View: transpose");
     if (!impl_) {
         throw std::runtime_error("transpose: tensor is not initialized");
     }
@@ -119,7 +116,10 @@ Tensor Tensor::transpose(int dim0, int dim1) const
     
     if (dim0 == dim1) {
         // No-op: return a view with identical metadata
-        return Tensor(impl_, impl_->sizes(), impl_->strides(), storage_offset());
+        Tensor noop(impl_, impl_->sizes(), impl_->strides(), storage_offset());
+        if (autograd::g_shape_debug)
+            autograd::GraphRecordMode::attach_forward_shape(noop.shape(), noop.dtype());
+        return noop;
     }
 
     Shape new_shape = impl_->sizes();
@@ -128,19 +128,18 @@ Tensor Tensor::transpose(int dim0, int dim1) const
 
     Tensor result(impl_, new_shape, new_stride, storage_offset());
 
-    // Autograd support
-    if (requires_grad()) {
+    // Autograd support — only when grad tracking is active (respects NoGradGuard)
+    if (requires_grad() && autograd::GradMode::is_enabled()) {
         auto grad_fn = std::make_shared<autograd::TransposeBackward>(dim0, dim1);
         
-        // Connect to input (this)
-        // We need to cast away const because get_grad_edge might create AccumulateGrad
-        Tensor& self_mut = const_cast<Tensor&>(*this);
-        grad_fn->set_next_edge(0, autograd::get_grad_edge(self_mut));
+        grad_fn->set_next_edge(0, autograd::get_grad_edge(*this));
         
         result.set_grad_fn(grad_fn);
         result.set_requires_grad(true);
     }
 
+    if (autograd::g_shape_debug)
+        autograd::GraphRecordMode::attach_forward_shape(result.shape(), result.dtype());
     return result;
 }
 
@@ -194,33 +193,5 @@ Tensor Tensor::unflatten(int dim, Shape sizes) const
     return Tensor(impl_, new_shape, new_stride, storage_offset());
 }
 
-Tensor Tensor::flatten_concat(const std::vector<Tensor>& tensor_list) {
-    if (tensor_list.empty()) {
-        return Tensor();
-    }
-
-    int64_t total_elements = std::accumulate(
-        tensor_list.begin(),
-        tensor_list.end(),
-        int64_t(0),
-        [](int64_t sum, const auto& tensor) {
-            return sum + tensor.numel();
-        }
-    );
-
-    Tensor result = Tensor({{1, total_elements}}, tensor_list[0].opts());
-    void* result_ptr = result.data();
-    int64_t running_pointer = 0;
-
-    for (const auto& tensor : tensor_list) {
-        dispatch_by_dtype(tensor.dtype(), [&](auto dummy) {
-            using T = decltype(dummy);
-            void* new_ptr = (static_cast<T*>(result_ptr) + running_pointer);
-            device::copy_memory(new_ptr, result.device().device, tensor.data(), tensor.device().device, tensor.nbytes());
-            running_pointer += tensor.numel();
-        });
-    }
-    return result;
-}
 
 } // namespace OwnTensor

@@ -10,6 +10,14 @@
 namespace OwnTensor{
     namespace device 
     {
+        void set_cuda_device(int device_index)
+        {
+            #ifdef WITH_CUDA
+                cudaSetDevice(device_index);
+            #else
+                return;
+            #endif
+        }
         bool cuda_available() 
         {
             #ifdef WITH_CUDA

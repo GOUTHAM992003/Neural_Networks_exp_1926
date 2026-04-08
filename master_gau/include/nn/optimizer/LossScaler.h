@@ -15,11 +15,14 @@ public:
     // Scales the loss value
     Tensor scale_loss(Tensor loss);
 
-    // Unscales gradients and checks for overflow (inf/nan)
-    bool unscale_gradients(const std::vector<Tensor>& params);
+    // Checks gradients for overflow (inf/nan) — does NOT mutate gradients
+    bool check_overflow(const std::vector<Tensor>& params);
 
     // Updates the scale factor based on whether overflow was detected
     void update(bool overflow);
+
+    // Check a single gradient tensor for inf/nan
+    bool has_overflow(const Tensor& grad);
 
 private:
     float current_scale_;
@@ -27,8 +30,6 @@ private:
     int growth_factor_;
     int growth_interval_;
     int steps_since_last_overflow_;
-
-    bool has_overflow(const Tensor& grad);
 };
 
 } // namespace nn

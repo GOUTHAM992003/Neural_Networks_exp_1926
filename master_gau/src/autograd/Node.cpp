@@ -2,6 +2,8 @@
 #include "core/Tensor.h"
 
 namespace OwnTensor {
+    
+std::atomic<bool> Node::use_arena_{true};
 
 variable_list Node::operator()(variable_list&& inputs) {
     // Execute pre-hooks (can modify inputs)

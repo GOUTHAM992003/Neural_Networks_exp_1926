@@ -34,8 +34,8 @@ namespace OwnTensor {
         }
 
         // Use device-aware copy for standard types
-        device::copy_memory(data(), device().device,
-                           source_data, Device::CPU,
+        device::copy_memory(data(), device(),
+                           source_data, DeviceIndex(Device::CPU),
                            count * sizeof(T));
     }
 
@@ -53,8 +53,8 @@ namespace OwnTensor {
         }
 
         // Use device-aware copy for standard types
-        device::copy_memory(grad(), device().device,
-                           source_data, Device::CPU,
+        device::copy_memory(grad(), device(),
+                           source_data, DeviceIndex(Device::CPU),
                            count * sizeof(T));
     }
 
@@ -149,8 +149,8 @@ namespace OwnTensor {
 
         // Copy the raw 16-bit integers (uint16_t) to the tensor's memory
         // This ensures the memory layout is correct (2 bytes per element).
-        device::copy_memory(data(), device().device,
-                           raw_data.data(), Device::CPU,
+        device::copy_memory(data(), device(),
+                           raw_data.data(), DeviceIndex(Device::CPU),
                            count * sizeof(uint16_t));
     }
 
@@ -171,8 +171,8 @@ namespace OwnTensor {
         }
 
         // CRITICAL FIX: Use grad_ptr_ instead of data_ptr_
-        device::copy_memory(grad(), device().device,
-                        raw_data.data(), Device::CPU,
+        device::copy_memory(grad(), device(),
+                        raw_data.data(), DeviceIndex(Device::CPU),
                         count * sizeof(uint16_t));
     }
 
@@ -207,8 +207,8 @@ namespace OwnTensor {
         }
 
         // Copy the raw 16-bit integers (uint16_t) to the tensor's memory
-        device::copy_memory(data(), device().device,
-                           raw_data.data(), Device::CPU,
+        device::copy_memory(data(), device(),
+                           raw_data.data(), DeviceIndex(Device::CPU),
                            count * sizeof(uint16_t));
     }
 
@@ -227,8 +227,8 @@ namespace OwnTensor {
             raw_data[i] = source_data[i].raw_bits;
         }
 
-        device::copy_memory(grad(), device().device,
-                           raw_data.data(), Device::CPU,
+        device::copy_memory(grad(), device(),
+                           raw_data.data(), DeviceIndex(Device::CPU),
                            count * sizeof(uint16_t));
     }
 
@@ -271,8 +271,8 @@ namespace OwnTensor {
             for (size_t i = 0; i < count; ++i) {
                 temp_data[i] = source_data[i] ? 1 : 0;
             }
-            device::copy_memory(data(), device().device,
-            temp_data.data(), Device::CPU,
+            device::copy_memory(data(), device(),
+            temp_data.data(), DeviceIndex(Device::CPU),
             count * sizeof(uint8_t));
         }
     }
@@ -298,8 +298,8 @@ namespace OwnTensor {
             uint8_t* dest = reinterpret_cast<uint8_t*>(data());
             std::memcpy(dest, temp_buffer.data(), temp_buffer.size());
         } else {
-            device::copy_memory(data(), device().device,
-            temp_buffer.data(), Device::CPU,
+            device::copy_memory(data(), device(),
+            temp_buffer.data(), DeviceIndex(Device::CPU),
             temp_buffer.size() * sizeof(uint8_t));
         }
     }
@@ -327,8 +327,8 @@ namespace OwnTensor {
             uint8_t* dest = reinterpret_cast<uint8_t*>(grad());
             std::memcpy(dest, temp_buffer.data(), temp_buffer.size());
         } else {
-            device::copy_memory(grad(), device().device,
-            temp_buffer.data(), Device::CPU,
+            device::copy_memory(grad(), device(),
+            temp_buffer.data(), DeviceIndex(Device::CPU),
             temp_buffer.size() * sizeof(uint8_t));
         }
     }
@@ -358,7 +358,7 @@ namespace OwnTensor {
             raw_data[i] = source_data[i].raw_bits;
         }
 
-        device::copy_memory(data(), device().device, raw_data.data(), Device::CPU, count * sizeof(uint8_t));
+        device::copy_memory(data(), device(), raw_data.data(), DeviceIndex(Device::CPU), count * sizeof(uint8_t));
     }
 
     template <>
@@ -386,7 +386,7 @@ namespace OwnTensor {
             raw_data[i] = source_data[i].raw_bits;
         }
 
-        device::copy_memory(data(), device().device, raw_data.data(), Device::CPU, count * sizeof(uint8_t));
+        device::copy_memory(data(), device(), raw_data.data(), DeviceIndex(Device::CPU), count * sizeof(uint8_t));
     }
 
     template <>
@@ -414,7 +414,7 @@ namespace OwnTensor {
             raw_data[i] = source_data[i].raw_bits;
         }
 
-        device::copy_memory(grad(), device().device, raw_data.data(), Device::CPU, count * sizeof(uint8_t));
+        device::copy_memory(grad(), device(), raw_data.data(), DeviceIndex(Device::CPU), count * sizeof(uint8_t));
     }
 
     template <>

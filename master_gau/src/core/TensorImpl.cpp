@@ -30,6 +30,14 @@ TensorImpl::TensorImpl(intrusive_ptr<Storage> storage,
       storage_offset_(offset),
       dtype_(dtype),
       device_(device) {
+    
+    // Share version counter with base if possible, otherwise create new
+    if (base_impl_) {
+        version_counter_ = base_impl_->version_counter_ptr();
+    } else {
+        version_counter_ = std::make_shared<VariableVersion>();
+    }
+
     // autograd_meta_ is nullptr - lazy allocation
     active_tensor_count_++;
 }
@@ -43,6 +51,9 @@ TensorImpl::TensorImpl(const Shape& shape,
       storage_offset_(0),
       dtype_(dtype),
       device_(device) {
+    
+    // Create new version counter for new tensor
+    version_counter_ = std::make_shared<VariableVersion>();
 
         // AllocationTracker::set_thread_name("TensorImpl", AllocationTracker::get_current_lifetime());
     

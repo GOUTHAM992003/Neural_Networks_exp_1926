@@ -29,9 +29,75 @@ void sparse_cross_entropy_forward_cuda(
     cudaStream_t stream
 );
 
+template<typename T, typename T_idx>
+void sparse_cross_entropy_forward_cuda_impl(
+    const T* logits,
+    const T_idx* targets,
+    T* loss_output,
+    int64_t batch_size,
+    int64_t vocab_size,
+    cudaStream_t stream
+);
+
+template<typename T, typename T_idx>
+void sparse_cross_entropy_forward_cuda_impl_vec(
+    const T* logits,
+    const T_idx* targets,
+    T* loss_output,
+    int64_t batch_size,
+    int64_t vocab_size,
+    cudaStream_t stream
+);
+
+/**
+ * @brief Vectorized sparse CE forward (cp.async 128-bit loads, per-thread staging).
+ * Safe for any vocab_size — has runtime alignment check with scalar fallback.
+ * Output is the sum of per-sample losses (same as sparse_cross_entropy_forward_cuda).
+ */
+template<typename T, typename T_idx>
+void sparse_cross_entropy_forward_cuda_vec(
+    const T* logits,
+    const T_idx* targets,
+    T* loss_output,
+    int64_t batch_size,
+    int64_t vocab_size,
+    cudaStream_t stream
+);
+
+/**
+ * @brief Two-kernel sparse CE backward — vectorized (cp.async + float4 stores).
+ * Requires vocab_size % 4 == 0.
+ */
+template<typename T, typename Tidx>
+void sparse_ce_backward_cuda_vec(
+    const T* logits,
+    const Tidx* targets,
+    T* grad_logits,
+    int64_t batch_size,
+    int64_t vocab_size,
+    const T* grad_output,
+    float host_scale,
+    cudaStream_t stream
+);
+
+/**
+ * @brief Two-kernel sparse CE backward (partial online-softmax reduction + normalize).
+ */
+template<typename T, typename Tidx>
+void sparse_ce_backward_cuda(
+    const T* logits,
+    const Tidx* targets,
+    T* grad_logits,
+    int64_t batch_size,
+    int64_t vocab_size,
+    const T* grad_output,
+    float host_scale,
+    cudaStream_t stream
+);
+
 /**
  * @brief Compute gradient for Sparse Cross Entropy with Logits.
- * 
+ *
  * grad = (softmax(logits) - targets_one_hot) * scale
  */
 template<typename T, typename T_idx>

@@ -21,6 +21,7 @@ namespace OwnTensor
             size_t total_allocated = 0;
             size_t total_cached = 0;
             size_t peak_allocated = 0;
+            size_t total_active_requested = 0;
 
 
             // to find best fit block at least size bytes

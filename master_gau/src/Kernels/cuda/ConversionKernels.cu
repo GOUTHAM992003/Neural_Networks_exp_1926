@@ -155,7 +155,7 @@ void convert_type_cuda(const Src* input, Dst* output, int64_t n, cudaStream_t st
     if (n == 0) return;
     
     int threads = 256;
-    int blocks = (n + threads - 1) / threads;
+    int blocks = std::max(((n + threads - 1) / threads),(long)112);
     
     convert_type_kernel<Src, Dst><<<blocks, threads, 0, stream>>>(input, output, n);
     

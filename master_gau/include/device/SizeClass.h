@@ -8,19 +8,22 @@ namespace OwnTensor
         public:
             // rounding upto appropriate size grp
             static size_t round_size(size_t size) {
-                if (size < kSmallSize) {
-                   // Rounding to 512 byte allocations for small allocations
+                if (size < 512) return 512;
+                if (size <= kSmallSize) {
                     return ((size + 511) / 512) * 512;
-                } else if (size < kSmallBuffer) {
-                    // Round to 2Mb for medium allocations
-                    return kSmallBuffer;
-                } else if (size < kLargeBuffer) {
-                    // Round to 20MB for large allocations
-                    return kLargeBuffer;
-                } else {
-                    // Round to 2MB alignment for very large allocations
-                    return ((size + kRoundLarge - 1) / kRoundLarge) * kRoundLarge;
                 }
+                
+                size_t rounded = 1;
+                while (rounded < size) rounded <<= 1;
+                
+                // If it's a power of 2, we are done
+                if (rounded == size) return size;
+                
+                // Otherwise, divide the range [rounded/2, rounded] into 8 parts
+                size_t prev_pow2 = rounded >> 1;
+                size_t step = (rounded - prev_pow2) / 8;
+                
+                return prev_pow2 + ((size - prev_pow2 + step - 1) / step) * step;
             }
 
             /**

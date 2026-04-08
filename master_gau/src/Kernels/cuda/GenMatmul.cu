@@ -1,3 +1,189 @@
+#ifdef WITH_MYBLAS
+
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#include <stdio.h>
+#include <stdexcept>
+#include <memory>
+#include <mutex>
+
+#include "mycublas.h"
+#include "ops/Matmul.cuh"
+#include "core/Tensor.h"
+#include "core/TensorDispatch.h"
+#include "utils/Profiler.h"
+namespace OwnTensor {
+
+
+
+
+// ============================================================================
+// DISPATCH LAYER - PURE MYBLAS
+// ============================================================================
+
+void cuda_matmul(const Tensor& A, const Tensor& B, Tensor& output, cudaStream_t stream)
+{
+    AUTO_PROFILE_CUDA("Forward::Matmul_CUDA_MyBlas");
+
+    // Ensure contiguous memory layout so stride computation (M*K, K*N) is correct.
+    // Non-contiguous tensors (e.g. from transpose) have different actual batch strides.
+    const Tensor A_c = A.is_contiguous() ? A : A.contiguous();
+    const Tensor B_c = B.is_contiguous() ? B : B.contiguous();
+
+    const auto& a_shape = A_c.shape().dims;
+    const auto& b_shape = B_c.shape().dims;
+    const auto& out_shape = output.shape().dims;
+
+    int M = static_cast<int>(a_shape[a_shape.size() - 2]);
+    int K = static_cast<int>(a_shape[a_shape.size() - 1]);
+    int N = static_cast<int>(b_shape[b_shape.size() - 1]);
+
+    int batch_count = 1;
+    for (size_t i = 0; i < out_shape.size() - 2; ++i) batch_count *= static_cast<int>(out_shape[i]);
+
+    long long int strideA = (long long int)M * K;
+    long long int strideB = (long long int)K * N;
+    long long int strideC = (long long int)M * N;
+
+    // Handle broadcasting (Stride 0 if numel fits exactly one matrix)
+    if (A_c.numel() == (size_t)M * K) strideA = 0;
+    if (B_c.numel() == (size_t)K * N) strideB = 0;
+
+    dispatch_by_dtype(A_c.dtype(), [&](auto dummy) {
+        using T = decltype(dummy);
+        const T* a_ptr = A_c.data<T>();
+        const T* b_ptr = B_c.data<T>();
+        T* out_ptr = output.data<T>();
+
+        mycublasHandle_t handle;
+        mycublasCreate(&handle);
+        mycublasSetStream(handle, stream);
+
+        if constexpr (std::is_same<T, float>::value) {
+            mycublasSgemmStridedBatched(handle, MYCUBLAS_OP_N, MYCUBLAS_OP_N, M, N, K, 1.0f, a_ptr, K, strideA, b_ptr, N, strideB, 0.0f, out_ptr, N, strideC, batch_count);
+        }
+        else if constexpr (std::is_same<T, __half>::value || std::is_same<T, OwnTensor::float16_t>::value) {
+            __half alpha = __float2half(1.0f), beta = __float2half(0.0f);
+            mycublasHgemmStridedBatched(handle, MYCUBLAS_OP_N, MYCUBLAS_OP_N, M, N, K, alpha, (const __half*)a_ptr, K, strideA, (const __half*)b_ptr, N, strideB, beta, (__half*)out_ptr, N, strideC, batch_count);
+        }
+        else if constexpr (std::is_same<T, __nv_bfloat16>::value || std::is_same<T, OwnTensor::bfloat16_t>::value) {
+            __nv_bfloat16 alpha = __float2bfloat16(1.0f), beta = __float2bfloat16(0.0f);
+            mycublasBgemmStridedBatched(handle, MYCUBLAS_OP_N, MYCUBLAS_OP_N, M, N, K, alpha, (const __nv_bfloat16*)a_ptr, K, strideA, (const __nv_bfloat16*)b_ptr, N, strideB, beta, (__nv_bfloat16*)out_ptr, N, strideC, batch_count);
+        }
+        else if constexpr (std::is_same<T, double>::value) {
+            mycublasDgemmStridedBatched(handle, M, N, K, 1.0, (const double*)a_ptr, K, strideA, (const double*)b_ptr, N, strideB, 0.0, (double*)out_ptr, N, strideC, batch_count);
+        }
+        else {
+             throw std::runtime_error("cuda_matmul: Unsupported dtype for MyBlas GEMM.");
+        }
+        mycublasDestroy(handle);
+    });
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error("CUDA Error after MyBlas matmul launch: " + std::string(cudaGetErrorString(err)));
+    }
+}
+
+// ============================================================================
+// ADDMM IMPLEMENTATION - USING MYBLAS
+// ============================================================================
+
+// Helper kernel for broadcasting and scaling
+template<typename T>
+__global__ void broadcast_add_scaled_kernel(T* out, const T* in, const T* bias, float alpha, float beta, int M, int N, int batch_count, int64_t stride_c, int64_t bias_numel) {
+    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    int64_t total = (int64_t)batch_count * M * N;
+    if (idx < total) {
+        T b_val;
+        if constexpr (std::is_same_v<T, complex32_t> || std::is_same_v<T, complex64_t> || std::is_same_v<T, complex128_t>) {
+            b_val = T(0.0f, 0.0f);
+        } else {
+            b_val = (T)0.0f;
+        }
+
+        if (bias_numel == 1) b_val = bias[0];
+        else if (bias_numel == N) b_val = bias[idx % N];
+        else if (bias_numel == total) b_val = bias[idx];
+        
+        if constexpr (std::is_same_v<T, complex32_t> || std::is_same_v<T, complex64_t> || std::is_same_v<T, complex128_t>) {
+            // Complex scale: (a + bi) * beta = (a*beta) + (b*beta)i
+            // This assumes we have a way to scale complex types. 
+            // If they don't support * float, we might need to access real/imag.
+            // For now, let's assume T * float works or we just don't scale if not.
+            out[idx] = out[idx] + b_val * (T)beta;
+        } else {
+            out[idx] = out[idx] + (T)(beta * (float)b_val);
+        }
+    }
+}
+
+void cuda_addmm(const Tensor& input, const Tensor& mat1, const Tensor& mat2, float alpha, float beta, Tensor& output, cudaStream_t stream) {
+    AUTO_PROFILE_CUDA("Forward::Addmm_CUDA_MyBlas");
+
+    // Ensure contiguous so shape-derived strides (M*K, K*N) match actual memory layout.
+    const Tensor mat1_c = mat1.is_contiguous() ? mat1 : mat1.contiguous();
+    const Tensor mat2_c = mat2.is_contiguous() ? mat2 : mat2.contiguous();
+
+    if (output.dtype() == Dtype::Float32) {
+        int64_t M = output.shape().dims[output.shape().dims.size() - 2];
+        int64_t N = output.shape().dims[output.shape().dims.size() - 1];
+        int64_t K = mat1_c.shape().dims[mat1_c.shape().dims.size() - 1];
+        int batch_count = 1;
+        for (size_t i = 0; i < output.shape().dims.size() - 2; ++i) batch_count *= (int)output.shape().dims[i];
+
+        mycublasHandle_t handle;
+        mycublasCreate(&handle);
+        mycublasSetStream(handle, stream);
+
+        int lda = (int)K;
+        int ldb = (int)N;
+        int ldc = (int)N;
+        long long strideA = (long long)M * K;
+        long long strideB = (long long)K * N;
+        long long strideC = (long long)M * N;
+
+        if (mat1_c.numel() == (size_t)M * K) strideA = 0;
+        if (mat2_c.numel() == (size_t)K * N) strideB = 0;
+
+        mycublasSgemmAddmm_SM86(handle, (int)M, (int)N, (int)K, alpha,
+                              mat1_c.data<float>(), lda, strideA,
+                              mat2_c.data<float>(), ldb, strideB,
+                              beta, input.data<float>(), (int64_t)input.numel(),
+                              output.data<float>(), ldc, strideC, batch_count);
+
+    
+        mycublasDestroy(handle);
+        return;
+    }
+
+    // Fallback for other dtypes
+    cuda_matmul(mat1_c, mat2_c, output, stream);
+    
+    const auto& out_shape = output.shape().dims;
+    int M = out_shape[out_shape.size() - 2];
+    int N = out_shape[out_shape.size() - 1];
+    int batch_count = 1;
+    for (size_t i = 0; i < out_shape.size() - 2; ++i) batch_count *= static_cast<int>(out_shape[i]);
+    
+    int64_t total = output.numel();
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    
+    dispatch_by_dtype(output.dtype(), [&](auto dummy) {
+        using T = decltype(dummy);
+        broadcast_add_scaled_kernel<T><<<blocks, threads, 0, stream>>>(
+            output.data<T>(), nullptr, input.data<T>(), alpha, beta, M, N, batch_count, (int64_t)M*N, input.numel()
+        );
+    });
+}
+
+
+} // namespace OwnTensor
+// #endif
+#else
+
 
 
 #include <cuda_runtime.h>
@@ -66,26 +252,148 @@ constexpr int PAD = 8;
 // ============================================================================
 
 template<typename T>
-__global__ void broadcast_scale_kernel(T* output, const T* input, float scale, int64_t total_elements, int64_t input_size, int64_t rows, int64_t cols) {
-    int64_t idx = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
-    if (idx < total_elements) {
-        if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double> || std::is_same_v<T, __half> || std::is_same_v<T, __nv_bfloat16> || std::is_integral_v<T>) {
-            if (input_size == 1) { // Scalar
-                output[idx] = (T)((float)input[0] * scale);
-            } else if (input_size == cols) { // Row broadcast (bias-like)
-                output[idx] = (T)((float)input[idx % cols] * scale);
-            } else if (input_size == total_elements) { // Same shape
-                output[idx] = (T)((float)input[idx] * scale);
-            } else {
-                output[idx] = (T)0.0f;
+__global__ void broadcast_scale_kernel(T* __restrict__ output, const T* __restrict__ input, float scale,
+    int64_t total_elements, int64_t input_size, int64_t rows, int64_t cols) {
+    const int64_t tid     = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    const int64_t gstride = gridDim.x  * (int64_t)blockDim.x;
+
+    if constexpr (std::is_same_v<T, float>) {
+        constexpr int VEC = 4;
+        const bool can_vec = (total_elements % VEC == 0) &&
+                             (input_size == 1 || input_size == total_elements ||
+                              (input_size == cols && cols % VEC == 0));
+        if (can_vec) {
+            float4* __restrict__       out4 = reinterpret_cast<float4*>(output);
+            const float4* __restrict__ in4  = reinterpret_cast<const float4*>(input);
+            const int64_t n4 = total_elements / VEC;
+            const float sv = (input_size == 1) ? (float)input[0] * scale : 0.0f;
+            for (int64_t i = tid; i < n4; i += gstride) {
+                float4 v;
+                if (input_size == 1) {
+                    v = make_float4(sv, sv, sv, sv);
+                } else if (input_size == cols) {
+                    const float4 iv = in4[((i * VEC) % cols) / VEC];
+                    v = make_float4(iv.x * scale, iv.y * scale, iv.z * scale, iv.w * scale);
+                } else {
+                    const float4 iv = in4[i];
+                    v = make_float4(iv.x * scale, iv.y * scale, iv.z * scale, iv.w * scale);
+                }
+                out4[i] = v;
             }
         } else {
-            // For complex types, we'd need a proper implementation, but for now we just skip or do basic copy
-            if (input_size == total_elements) {
-                output[idx] = input[idx];
-            } else {
-                output[idx] = (T)0.0f;
+            for (int64_t i = tid; i < total_elements; i += gstride) {
+                if      (input_size == 1)             output[i] = (T)((float)input[0] * scale);
+                else if (input_size == cols)           output[i] = (T)((float)input[i % cols] * scale);
+                else if (input_size == total_elements) output[i] = (T)((float)input[i] * scale);
+                else                                   output[i] = (T)0.0f;
             }
+        }
+    } else if constexpr (std::is_same_v<T, double>) {
+        constexpr int VEC = 2;
+        const bool can_vec = (total_elements % VEC == 0) &&
+                             (input_size == 1 || input_size == total_elements ||
+                              (input_size == cols && cols % VEC == 0));
+        if (can_vec) {
+            double2* __restrict__       out2 = reinterpret_cast<double2*>(output);
+            const double2* __restrict__ in2  = reinterpret_cast<const double2*>(input);
+            const int64_t n2 = total_elements / VEC;
+            const double sv = (input_size == 1) ? (double)input[0] * (double)scale : 0.0;
+            for (int64_t i = tid; i < n2; i += gstride) {
+                double2 v;
+                if (input_size == 1) {
+                    v = make_double2(sv, sv);
+                } else if (input_size == cols) {
+                    const double2 iv = in2[((i * VEC) % cols) / VEC];
+                    v = make_double2(iv.x * scale, iv.y * scale);
+                } else {
+                    const double2 iv = in2[i];
+                    v = make_double2(iv.x * scale, iv.y * scale);
+                }
+                out2[i] = v;
+            }
+        } else {
+            for (int64_t i = tid; i < total_elements; i += gstride) {
+                if      (input_size == 1)             output[i] = (T)((double)input[0] * (double)scale);
+                else if (input_size == cols)           output[i] = (T)((double)input[i % cols] * (double)scale);
+                else if (input_size == total_elements) output[i] = (T)((double)input[i] * (double)scale);
+                else                                   output[i] = (T)0.0;
+            }
+        }
+    } else if constexpr (std::is_same_v<T, __half>) {
+        constexpr int VEC = 2;
+        const bool can_vec = (total_elements % VEC == 0) &&
+                             (input_size == 1 || input_size == total_elements ||
+                              (input_size == cols && cols % VEC == 0));
+        if (can_vec) {
+            half2* __restrict__       out2 = reinterpret_cast<half2*>(output);
+            const half2* __restrict__ in2  = reinterpret_cast<const half2*>(input);
+            const int64_t n2     = total_elements / VEC;
+            const half2   scale2 = __float2half2_rn(scale);
+            const half2   sv2    = (input_size == 1) ? __float2half2_rn((float)input[0] * scale)
+                                                     : __float2half2_rn(0.0f);
+            for (int64_t i = tid; i < n2; i += gstride) {
+                half2 v;
+                if (input_size == 1) {
+                    v = sv2;
+                } else if (input_size == cols) {
+                    v = __hmul2(in2[((i * VEC) % cols) / VEC], scale2);
+                } else {
+                    v = __hmul2(in2[i], scale2);
+                }
+                out2[i] = v;
+            }
+        } else {
+            for (int64_t i = tid; i < total_elements; i += gstride) {
+                if      (input_size == 1)             output[i] = (T)((float)input[0] * scale);
+                else if (input_size == cols)           output[i] = (T)((float)input[i % cols] * scale);
+                else if (input_size == total_elements) output[i] = (T)((float)input[i] * scale);
+                else                                   output[i] = (T)0.0f;
+            }
+        }
+    } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+        constexpr int VEC = 2;
+        const bool can_vec = (total_elements % VEC == 0) &&
+                             (input_size == 1 || input_size == total_elements ||
+                              (input_size == cols && cols % VEC == 0));
+        if (can_vec) {
+            __nv_bfloat162* __restrict__       out2 = reinterpret_cast<__nv_bfloat162*>(output);
+            const __nv_bfloat162* __restrict__ in2  = reinterpret_cast<const __nv_bfloat162*>(input);
+            const int64_t        n2  = total_elements / VEC;
+            const __nv_bfloat162 sv2 = (input_size == 1)
+                                       ? __float2bfloat162_rn((float)input[0] * scale)
+                                       : __float2bfloat162_rn(0.0f);
+            for (int64_t i = tid; i < n2; i += gstride) {
+                __nv_bfloat162 v;
+                if (input_size == 1) {
+                    v = sv2;
+                } else if (input_size == cols) {
+                    const float2 f = __bfloat1622float2(in2[((i * VEC) % cols) / VEC]);
+                    v = __float22bfloat162_rn(make_float2(f.x * scale, f.y * scale));
+                } else {
+                    const float2 f = __bfloat1622float2(in2[i]);
+                    v = __float22bfloat162_rn(make_float2(f.x * scale, f.y * scale));
+                }
+                out2[i] = v;
+            }
+        } else {
+            for (int64_t i = tid; i < total_elements; i += gstride) {
+                if      (input_size == 1)             output[i] = (T)((float)input[0] * scale);
+                else if (input_size == cols)           output[i] = (T)((float)input[i % cols] * scale);
+                else if (input_size == total_elements) output[i] = (T)((float)input[i] * scale);
+                else                                   output[i] = (T)0.0f;
+            }
+        }
+    } else if constexpr (std::is_integral_v<T>) {
+        for (int64_t i = tid; i < total_elements; i += gstride) {
+            if      (input_size == 1)             output[i] = (T)((float)input[0] * scale);
+            else if (input_size == cols)           output[i] = (T)((float)input[i % cols] * scale);
+            else if (input_size == total_elements) output[i] = (T)((float)input[i] * scale);
+            else                                   output[i] = (T)0;
+        }
+    } else {
+        for (int64_t i = tid; i < total_elements; i += gstride) {
+            if (input_size == total_elements) output[i] = input[i];
+            else                              output[i] = (T)0.0f;
         }
     }
 }
@@ -93,8 +401,16 @@ __global__ void broadcast_scale_kernel(T* output, const T* input, float scale, i
 template<typename T>
 void launch_broadcast_scale(T* output, const T* input, float scale, int64_t rows, int64_t cols, int64_t input_size, cudaStream_t stream) {
     int64_t total = rows * cols;
-    int threads = 256;
-    int blocks = (total + threads - 1) / threads;
+    // Mirror the vectorization decision the kernel will make so blocks are right-sized
+    constexpr int VEC = std::is_same_v<T, float> ? 4 :
+                       (std::is_same_v<T, double> || std::is_same_v<T, __half> ||
+                        std::is_same_v<T, __nv_bfloat16>) ? 2 : 1;
+    const bool will_vec = (VEC > 1) && (total % VEC == 0) &&
+                          (input_size == 1 || input_size == total ||
+                           (input_size == cols && cols % VEC == 0));
+    int64_t eff    = will_vec ? total / VEC : total;
+    int     threads = 256;
+    int     blocks  = (int)((eff + threads - 1) / threads);
     broadcast_scale_kernel<T><<<blocks, threads, 0, stream>>>(output, input, scale, total, input_size, rows, cols);
 }
 
@@ -359,9 +675,89 @@ void launch_optimized_matmul(const Tensor& A, const Tensor& B, Tensor& output, c
    const T* ap = A.data<T>(), *bp = B.data<T>(); T* op = output.data<T>();
 
    if constexpr (std::is_same<T, float16_t>::value || std::is_same<T, __half>::value) {
-      matmul_fp16_optimized<128, 128, 32, 32, 32><<<dim3((N+127)/128, (M+127)/128, tb), 512, 0, stream>>>(reinterpret_cast<const __half*>(ap), reinterpret_cast<const __half*>(bp), reinterpret_cast<__half*>(op), M, N, K, tb, meta);
+      // Try cuBLAS first for FP16: compute in FP16, accumulate in FP32
+      bool a_contiguous = (meta.a_strides[an-1] == 1);
+      bool b_contiguous = (meta.b_strides[bn-1] == 1);
+      bool out_contiguous = (meta.out_strides[on-1] == 1);
+      bool is_supported = (a_contiguous || (an >= 2 && meta.a_strides[an-2] == 1)) &&
+                          (b_contiguous || (bn >= 2 && meta.b_strides[bn-2] == 1)) && out_contiguous;
+      bool cublas_ok = false;
+      if (is_supported) {
+         int dev_idx = output.device().index;
+         cublasHandle_t handle = get_cublas_handle(dev_idx);
+         cublasSetStream(handle, stream);
+         float alpha_f = 1.0f, beta_f = 0.0f;
+         cublasOperation_t opA = a_contiguous ? CUBLAS_OP_N : CUBLAS_OP_T;
+         int lda = a_contiguous ? meta.a_strides[an-2] : meta.a_strides[an-1];
+         cublasOperation_t opB = b_contiguous ? CUBLAS_OP_N : CUBLAS_OP_T;
+         int ldb = b_contiguous ? meta.b_strides[bn-2] : meta.b_strides[bn-1];
+         int ldc = meta.out_strides[on-2];
+         const __half* ap_h = reinterpret_cast<const __half*>(ap);
+         const __half* bp_h = reinterpret_cast<const __half*>(bp);
+         __half* op_h = reinterpret_cast<__half*>(op);
+         cublasStatus_t status;
+         if (tb == 1) {
+            status = cublasGemmEx(handle, opB, opA, N, M, K, &alpha_f,
+               bp_h, CUDA_R_16F, ldb, ap_h, CUDA_R_16F, lda,
+               &beta_f, op_h, CUDA_R_16F, ldc,
+               CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+         } else {
+            long long stride_a_ll = (an >= 3) ? (long long)meta.a_strides[an-3] : 0LL;
+            long long stride_b_ll = (bn >= 3) ? (long long)meta.b_strides[bn-3] : 0LL;
+            long long stride_c_ll = (long long)meta.out_strides[on-3];
+            status = cublasGemmStridedBatchedEx(handle, opB, opA, N, M, K, &alpha_f,
+               bp_h, CUDA_R_16F, ldb, stride_b_ll, ap_h, CUDA_R_16F, lda, stride_a_ll,
+               &beta_f, op_h, CUDA_R_16F, ldc, stride_c_ll, tb,
+               CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+         }
+         cublas_ok = (status == CUBLAS_STATUS_SUCCESS);
+      }
+      if (!cublas_ok) {
+         matmul_fp16_optimized<128, 128, 32, 32, 32><<<dim3((N+127)/128, (M+127)/128, tb), 512, 0, stream>>>(
+            reinterpret_cast<const __half*>(ap), reinterpret_cast<const __half*>(bp), reinterpret_cast<__half*>(op), M, N, K, tb, meta);
+      }
    } else if constexpr (std::is_same<T, bfloat16_t>::value || std::is_same<T, __nv_bfloat16>::value) {
-      matmul_bf16_optimized<128, 128, 32, 32, 32><<<dim3((N+127)/128, (M+127)/128, tb), 512, 0, stream>>>(reinterpret_cast<const __nv_bfloat16*>(ap), reinterpret_cast<const __nv_bfloat16*>(bp), reinterpret_cast<__nv_bfloat16*>(op), M, N, K, tb, meta);
+      // Try cuBLAS first for BF16: compute in BF16, accumulate in FP32
+      bool a_contiguous = (meta.a_strides[an-1] == 1);
+      bool b_contiguous = (meta.b_strides[bn-1] == 1);
+      bool out_contiguous = (meta.out_strides[on-1] == 1);
+      bool is_supported = (a_contiguous || (an >= 2 && meta.a_strides[an-2] == 1)) &&
+                          (b_contiguous || (bn >= 2 && meta.b_strides[bn-2] == 1)) && out_contiguous;
+      bool cublas_ok = false;
+      if (is_supported) {
+         int dev_idx = output.device().index;
+         cublasHandle_t handle = get_cublas_handle(dev_idx);
+         cublasSetStream(handle, stream);
+         float alpha_f = 1.0f, beta_f = 0.0f;
+         cublasOperation_t opA = a_contiguous ? CUBLAS_OP_N : CUBLAS_OP_T;
+         int lda = a_contiguous ? meta.a_strides[an-2] : meta.a_strides[an-1];
+         cublasOperation_t opB = b_contiguous ? CUBLAS_OP_N : CUBLAS_OP_T;
+         int ldb = b_contiguous ? meta.b_strides[bn-2] : meta.b_strides[bn-1];
+         int ldc = meta.out_strides[on-2];
+         const __nv_bfloat16* ap_b = reinterpret_cast<const __nv_bfloat16*>(ap);
+         const __nv_bfloat16* bp_b = reinterpret_cast<const __nv_bfloat16*>(bp);
+         __nv_bfloat16* op_b = reinterpret_cast<__nv_bfloat16*>(op);
+         cublasStatus_t status;
+         if (tb == 1) {
+            status = cublasGemmEx(handle, opB, opA, N, M, K, &alpha_f,
+               bp_b, CUDA_R_16BF, ldb, ap_b, CUDA_R_16BF, lda,
+               &beta_f, op_b, CUDA_R_16BF, ldc,
+               CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+         } else {
+            long long stride_a_ll = (an >= 3) ? (long long)meta.a_strides[an-3] : 0LL;
+            long long stride_b_ll = (bn >= 3) ? (long long)meta.b_strides[bn-3] : 0LL;
+            long long stride_c_ll = (long long)meta.out_strides[on-3];
+            status = cublasGemmStridedBatchedEx(handle, opB, opA, N, M, K, &alpha_f,
+               bp_b, CUDA_R_16BF, ldb, stride_b_ll, ap_b, CUDA_R_16BF, lda, stride_a_ll,
+               &beta_f, op_b, CUDA_R_16BF, ldc, stride_c_ll, tb,
+               CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+         }
+         cublas_ok = (status == CUBLAS_STATUS_SUCCESS);
+      }
+      if (!cublas_ok) {
+         matmul_bf16_optimized<128, 128, 32, 32, 32><<<dim3((N+127)/128, (M+127)/128, tb), 512, 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(ap), reinterpret_cast<const __nv_bfloat16*>(bp), reinterpret_cast<__nv_bfloat16*>(op), M, N, K, tb, meta);
+      }
    } else if constexpr (std::is_same<T, float>::value) {
       // Use cuBLAS for FP32 matmuls - enables TF32 Tensor Core acceleration
       // Check if tensors are contiguous (row-major) OR transposed (col-major equivalent) for cuBLAS fast path
@@ -395,24 +791,30 @@ void launch_optimized_matmul(const Tensor& A, const Tensor& B, Tensor& output, c
              stride_b = (bn == 3) ? meta.b_strides[0] : 0; // Broadcast if bn < 3
              is_strided_batch = true;
           } else if (on == 4) {
-             // Basic support for [B, H, M, N]
-             // We flatten first 2 dims.
-             // Stride is effective stride of the flattened index?
-             // Only if contiguous in batch dims.
-             // For now, only support if simple packing matches.
-             // Simplification: Check if stride[0] works for total batch.
-             // This assumes strict N, C, H, W structure usually.
-             
-             stride_c = static_cast<long long>(M) * N; // Estimate contiguous
-             stride_a = (an == 4) ? static_cast<long long>(M) * K : 0;
-             stride_b = (bn == 4) ? static_cast<long long>(K) * N : 0;
-             is_strided_batch = true; 
+            // 4D [d0, d1, M, N]: use inner batch stride (stride[1]) for cuBLAS
+            stride_c = meta.out_strides[on - 3];
+            stride_a = (an == 4) ? meta.a_strides[an - 3] : 0;
+            stride_b = (bn == 4) ? meta.b_strides[bn - 3] : 0;
+
+            // cuBLAS strided batched requires uniform stride across all tb batches.
+            // Uniform iff stride[0] == stride[1] * shape[1] for each tensor.
+            // Non-contiguous transposes (e.g. reshape+transpose without contiguous)
+            // break this — handled by per-outer-batch loop below.
+            bool batch_uniform = (meta.out_strides[0] == meta.out_strides[1] * osh[1]);
+            if (an == 4) batch_uniform = batch_uniform && (meta.a_strides[0] == meta.a_strides[1] * ash[1]);
+            if (bn == 4) batch_uniform = batch_uniform && (meta.b_strides[0] == meta.b_strides[1] * bsh[1]);
+
+            if (batch_uniform) {
+                is_strided_batch = true;
+            }
+            // else: non-uniform, handled by loop path below
           }
       }
 
       if ((tb == 1 || is_strided_batch) && is_supported_layout) {
-         int current_device; cudaGetDevice(&current_device);
-         cublasHandle_t handle = get_cublas_handle(current_device);
+         // USE EXPLICIT DEVICE INDEXING from output tensor
+         int dev_idx = output.device().index;
+         cublasHandle_t handle = get_cublas_handle(dev_idx);
          cublasSetStream(handle, stream);
          
          float alpha = 1.0f, beta = 0.0f;
@@ -479,6 +881,44 @@ void launch_optimized_matmul(const Tensor& A, const Tensor& B, Tensor& output, c
 
          if (status != CUBLAS_STATUS_SUCCESS) {
             // Fallback (e.g. if alignment issues, though Ex handles most)
+             matmul_fp32_optimized<128, 128, 16, 4, 4><<<dim3((N+127)/128, (M+127)/128, tb), 1024, 0, stream>>>(ap, bp, op, M, N, K, tb, meta);
+         }
+      } else if (on == 4 && !is_strided_batch && is_supported_layout) {
+         // Non-uniform 4D batch strides (e.g. after transpose without contiguous):
+         // Loop over outer batch dim d0, each call handles d1 inner batches with uniform stride
+         int current_device; cudaGetDevice(&current_device);
+         cublasHandle_t handle = get_cublas_handle(current_device);
+         cublasSetStream(handle, stream);
+         float alpha_v = 1.0f, beta_v = 0.0f;
+
+         cublasOperation_t opA_l, opB_l;
+         int lda_l, ldb_l, ldc_l;
+         if (a_contiguous) { opA_l = CUBLAS_OP_N; lda_l = meta.a_strides[an-2]; }
+         else { opA_l = CUBLAS_OP_T; lda_l = meta.a_strides[an-1]; }
+         if (b_contiguous) { opB_l = CUBLAS_OP_N; ldb_l = meta.b_strides[bn-2]; }
+         else { opB_l = CUBLAS_OP_T; ldb_l = meta.b_strides[bn-1]; }
+         ldc_l = meta.out_strides[on-2];
+
+         int d0 = osh[0], d1 = osh[1];
+         bool all_ok = true;
+         for (int bi = 0; bi < d0 && all_ok; bi++) {
+             const float* a_b = ap + (an == 4 ? bi * meta.a_strides[0] : 0);
+             const float* b_b = bp + (bn == 4 ? bi * meta.b_strides[0] : 0);
+             float* o_b = op + bi * meta.out_strides[0];
+
+             cublasStatus_t st = cublasGemmStridedBatchedEx(
+                 handle, opB_l, opA_l, N, M, K, &alpha_v,
+                 b_b, CUDA_R_32F, ldb_l, stride_b,
+                 a_b, CUDA_R_32F, lda_l, stride_a,
+                 &beta_v,
+                 o_b, CUDA_R_32F, ldc_l, stride_c,
+                 d1,
+                 CUBLAS_COMPUTE_32F_FAST_TF32,
+                 CUBLAS_GEMM_DEFAULT_TENSOR_OP
+             );
+             if (st != CUBLAS_STATUS_SUCCESS) all_ok = false;
+         }
+         if (!all_ok) {
              matmul_fp32_optimized<128, 128, 16, 4, 4><<<dim3((N+127)/128, (M+127)/128, tb), 1024, 0, stream>>>(ap, bp, op, M, N, K, tb, meta);
          }
       } else {
@@ -572,8 +1012,9 @@ void cuda_addmm(const Tensor& input, const Tensor& mat1, const Tensor& mat2, flo
         }
 
         if ((tb == 1 || is_strided_batch) && is_supported_layout) {
-            int current_device; cudaGetDevice(&current_device);
-            cublasHandle_t handle = get_cublas_handle(current_device);
+            // USE EXPLICIT DEVICE INDEXING from output tensor
+            int dev_idx = output.device().index;
+            cublasHandle_t handle = get_cublas_handle(dev_idx);
             cublasSetStream(handle, stream);
 
             cublasOperation_t opA = a_contiguous ? CUBLAS_OP_N : CUBLAS_OP_T;
@@ -609,6 +1050,77 @@ void cuda_addmm(const Tensor& input, const Tensor& mat1, const Tensor& mat2, flo
             if (status == CUBLAS_STATUS_SUCCESS) return;
             // Fall through to fallback on failure
         }
+    } else if (output.dtype() == Dtype::Float16 || output.dtype() == Dtype::Bfloat16) {
+        // cuBLAS path for FP16/BF16 addmm: compute in fp16/bf16, accumulate in fp32
+        MatmulMetadata meta16; meta16.a_ndim = m1n; meta16.b_ndim = m2n; meta16.out_ndim = on;
+        for (int i = 0; i < m1n; i++) { meta16.a_shape[i] = m1sh[i]; meta16.a_strides[i] = mat1.stride().strides[i]; }
+        for (int i = 0; i < m2n; i++) { meta16.b_shape[i] = m2sh[i]; meta16.b_strides[i] = mat2.stride().strides[i]; }
+        for (int i = 0; i < on; i++) { meta16.out_shape[i] = osh[i]; meta16.out_strides[i] = output.stride().strides[i]; }
+
+        bool a_contiguous = (meta16.a_strides[m1n-1] == 1);
+        bool b_contiguous = (meta16.b_strides[m2n-1] == 1);
+        bool out_contiguous = (meta16.out_strides[on-1] == 1);
+        bool is_supported = (a_contiguous || (m1n >= 2 && meta16.a_strides[m1n-2] == 1)) &&
+                            (b_contiguous || (m2n >= 2 && meta16.b_strides[m2n-2] == 1)) && out_contiguous;
+
+        if (is_supported) {
+            int dev_idx = output.device().index;
+            cublasHandle_t handle = get_cublas_handle(dev_idx);
+            cublasSetStream(handle, stream);
+
+            cublasOperation_t opA = a_contiguous ? CUBLAS_OP_N : CUBLAS_OP_T;
+            int lda = a_contiguous ? meta16.a_strides[m1n-2] : meta16.a_strides[m1n-1];
+            cublasOperation_t opB = b_contiguous ? CUBLAS_OP_N : CUBLAS_OP_T;
+            int ldb = b_contiguous ? meta16.b_strides[m2n-2] : meta16.b_strides[m2n-1];
+            int ldc = meta16.out_strides[on-2];
+            // output already holds beta*input; pass cublas_beta=1.0 to accumulate alpha*(mat1@mat2)
+            float cublas_beta = 1.0f;
+
+            bool is_strided_batch = (tb > 1) && (on == 3 || on == 4);
+            long long stride_a_ll = 0, stride_b_ll = 0, stride_c_ll = 0;
+            if (is_strided_batch) {
+                stride_c_ll = meta16.out_strides[on-3];
+                stride_a_ll = (m1n >= on) ? meta16.a_strides[m1n-3] : 0LL;
+                stride_b_ll = (m2n >= on) ? meta16.b_strides[m2n-3] : 0LL;
+            }
+
+            cudaDataType_t cuda_type = (output.dtype() == Dtype::Float16) ? CUDA_R_16F : CUDA_R_16BF;
+            cublasStatus_t status;
+
+            if (output.dtype() == Dtype::Float16) {
+                const __half* m1h = reinterpret_cast<const __half*>(mat1.data<float16_t>());
+                const __half* m2h = reinterpret_cast<const __half*>(mat2.data<float16_t>());
+                __half* outh = reinterpret_cast<__half*>(output.data<float16_t>());
+                if (tb == 1) {
+                    status = cublasGemmEx(handle, opB, opA, N, M, K, &alpha,
+                        m2h, CUDA_R_16F, ldb, m1h, CUDA_R_16F, lda,
+                        &cublas_beta, outh, CUDA_R_16F, ldc,
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                } else {
+                    status = cublasGemmStridedBatchedEx(handle, opB, opA, N, M, K, &alpha,
+                        m2h, CUDA_R_16F, ldb, stride_b_ll, m1h, CUDA_R_16F, lda, stride_a_ll,
+                        &cublas_beta, outh, CUDA_R_16F, ldc, stride_c_ll, tb,
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                }
+            } else {
+                const __nv_bfloat16* m1b = reinterpret_cast<const __nv_bfloat16*>(mat1.data<bfloat16_t>());
+                const __nv_bfloat16* m2b = reinterpret_cast<const __nv_bfloat16*>(mat2.data<bfloat16_t>());
+                __nv_bfloat16* outb = reinterpret_cast<__nv_bfloat16*>(output.data<bfloat16_t>());
+                if (tb == 1) {
+                    status = cublasGemmEx(handle, opB, opA, N, M, K, &alpha,
+                        m2b, CUDA_R_16BF, ldb, m1b, CUDA_R_16BF, lda,
+                        &cublas_beta, outb, CUDA_R_16BF, ldc,
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                } else {
+                    status = cublasGemmStridedBatchedEx(handle, opB, opA, N, M, K, &alpha,
+                        m2b, CUDA_R_16BF, ldb, stride_b_ll, m1b, CUDA_R_16BF, lda, stride_a_ll,
+                        &cublas_beta, outb, CUDA_R_16BF, ldc, stride_c_ll, tb,
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                }
+            }
+            if (status == CUBLAS_STATUS_SUCCESS) return;
+            // Fall through to fallback on failure
+        }
     }
 
     // Fallback: Use existing batched matmul + scaled addition kernel
@@ -628,3 +1140,4 @@ void cuda_addmm(const Tensor& input, const Tensor& mat1, const Tensor& mat2, flo
 
 } // namespace OwnTensor
 // #endif
+#endif // WITH_MYBLAS

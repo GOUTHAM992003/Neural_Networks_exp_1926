@@ -65,7 +65,7 @@ class TensorImpl : public intrusive_ptr_target {
 private:
     intrusive_ptr<Storage> storage_;                       // Shared storage
     std::unique_ptr<AutogradMetaInterface> autograd_meta_; // Autograd metadata (lazy)
-    VariableVersion version_counter_;                      // Version for in-place ops
+    std::shared_ptr<VariableVersion> version_counter_;      // Version for in-place ops
     intrusive_ptr<TensorImpl> base_impl_;                  // Original tensor if this is a view
     
     // Tensor metadata
@@ -252,11 +252,19 @@ public:
     // ========================================================================
     
     void bump_version() {
-        version_counter_.bump();
+        if (version_counter_) version_counter_->bump();
     }
     
     uint32_t version() const {
-        return version_counter_.current_version();
+        return version_counter_ ? version_counter_->current_version() : 0;
+    }
+
+    std::shared_ptr<VariableVersion> version_counter_ptr() const {
+        return version_counter_;
+    }
+
+    void set_version_counter(std::shared_ptr<VariableVersion> counter) {
+        version_counter_ = std::move(counter);
     }
     
     // ========================================================================

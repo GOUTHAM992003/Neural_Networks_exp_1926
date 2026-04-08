@@ -497,7 +497,7 @@ namespace OwnTensor {
         // ---- Constructors ----
         __device__ __host__ complex32_t() : real_(0.0f), imag_(0.0f) {}
         
-        __device__ __host__ complex32_t(float16_t r, float16_t i) 
+        __device__ __host__ explicit complex32_t(float16_t r, float16_t i = float16_t(0.0f))
             : real_(r), imag_(i) {}
         
         __device__ __host__ complex32_t(const complex32_t& other) 
@@ -510,25 +510,25 @@ namespace OwnTensor {
         //       imag_(float16_t(static_cast<float>(imag_val))) {}
 
         // Constructor from std::complex<float> for convenience
-        __device__ __host__ explicit complex32_t(const std::complex<float>& c)
+        __host__ explicit complex32_t(const std::complex<float>& c) 
             : real_(float16_t(c.real())), imag_(float16_t(c.imag())) {}
 
         // Constructor from std::complex<double> for convenience
-        __device__ __host__ explicit complex32_t(const std::complex<double>& c)
-            : real_(float16_t(static_cast<float>(c.real()))),
+        __host__ explicit complex32_t(const std::complex<double>& c) 
+            : real_(float16_t(static_cast<float>(c.real()))), 
               imag_(float16_t(static_cast<float>(c.imag()))) {}
     
-        // Conversion from other custom complex types
-        // Forward declaration for complex64_t and complex128_t needed if not defined yet
-        // __device__ __host__ explicit complex32_t(const complex64_t& c)
-        //     : real_(float16_t(c.real())), imag_(float16_t(c.imag())) {}
-        // __device__ __host__ explicit complex32_t(const complex128_t& c)
-        //     : real_(float16_t(static_cast<float>(c.real()))), imag_(float16_t(static_cast<float>(c.imag()))) {}
+        // Conversion from other custom complex types (defined out-of-line after complex64_t/complex128_t)
+        __device__ __host__ explicit complex32_t(const struct complex64_t& c);
+        __device__ __host__ explicit complex32_t(const struct complex128_t& c);
 
-        // Basic scalar constructors to resolve ambiguity
-        __device__ __host__ explicit complex32_t(float r, float i = 0.0f)
-            : real_(float16_t(r)), imag_(float16_t(i)) {}
-        __device__ __host__ explicit complex32_t(double r, double i = 0.0)
+        // Generic scalar constructors for any type convertible to float (resolves ambiguity)
+        template <typename T, typename = std::enable_if_t<std::is_convertible_v<T, float> && !std::is_same_v<std::decay_t<T>, float16_t> && !std::is_same_v<std::decay_t<T>, complex32_t>>>
+        __device__ __host__ explicit complex32_t(T r)
+            : real_(float16_t(static_cast<float>(r))), imag_(float16_t(0.0f)) {}
+
+        template <typename T, typename U, typename = std::enable_if_t<std::is_convertible_v<T, float> && std::is_convertible_v<U, float> && !(std::is_same_v<std::decay_t<T>, float16_t> && std::is_same_v<std::decay_t<U>, float16_t>)>>
+        __device__ __host__ explicit complex32_t(T r, U i)
             : real_(float16_t(static_cast<float>(r))), imag_(float16_t(static_cast<float>(i))) {}
 
         // ---- Accessor Methods ----
@@ -664,11 +664,12 @@ struct complex64_t {
 
     // Constructors
     __device__ __host__ complex64_t() : real_(0.0f), imag_(0.0f) {}
-    __device__ __host__ complex64_t(float r, float i = 0.0f) : real_(r), imag_(i) {}
-    
-    // Scalar constructors for common types
-    __device__ __host__ explicit complex64_t(double r, double i = 0.0)
-        : real_(static_cast<float>(r)), imag_(static_cast<float>(i)) {}
+    __device__ __host__ explicit complex64_t(float r, float i = 0.0f) : real_(r), imag_(i) {}
+
+    // Generic scalar constructor for any type convertible to float (resolves ambiguity)
+    template <typename T, typename = std::enable_if_t<std::is_convertible_v<T, float> && !std::is_same_v<std::decay_t<T>, float> && !std::is_same_v<std::decay_t<T>, complex64_t>>>
+    __device__ __host__ explicit complex64_t(T r)
+        : real_(static_cast<float>(r)), imag_(0.0f) {}
     
     __host__ explicit complex64_t(const std::complex<float>& c)
         : real_(c.real()), imag_(c.imag()) {}
@@ -699,25 +700,27 @@ struct complex64_t {
     __device__ __host__ explicit complex64_t(const complex32_t& c)
         : real_(static_cast<float>(c.real())), imag_(static_cast<float>(c.imag())) {}
 
+    // Conversion from complex128_t (defined out-of-line after complex128_t)
+    __device__ __host__ explicit complex64_t(const struct complex128_t& c);
 
     // Arithmetic operators
     __device__ __host__ complex64_t operator+(const complex64_t& o) const {
-        return {real_ + o.real_, imag_ + o.imag_};
+        return complex64_t(real_ + o.real_, imag_ + o.imag_);
     }
     __device__ __host__ complex64_t operator-(const complex64_t& o) const {
-        return {real_ - o.real_, imag_ - o.imag_};
+        return complex64_t(real_ - o.real_, imag_ - o.imag_);
     }
     __device__ __host__ complex64_t operator*(const complex64_t& o) const {
-        return {real_ * o.real_ - imag_ * o.imag_,
-                real_ * o.imag_ + imag_ * o.real_};
+        return complex64_t(real_ * o.real_ - imag_ * o.imag_,
+                real_ * o.imag_ + imag_ * o.real_);
     }
     __device__ __host__ complex64_t operator/(const complex64_t& o) const {
         float denom = o.real_ * o.real_ + o.imag_ * o.imag_;
-        return {(real_ * o.real_ + imag_ * o.imag_) / denom,
-                (imag_ * o.real_ - real_ * o.imag_) / denom};
+        return complex64_t((real_ * o.real_ + imag_ * o.imag_) / denom,
+                (imag_ * o.real_ - real_ * o.imag_) / denom);
     }
     __device__ __host__ complex64_t operator-() const {
-        return {-real_, -imag_};
+        return complex64_t(-real_, -imag_);
     }
 
     // Compound assignment
@@ -777,9 +780,13 @@ struct complex128_t {
 
     // Constructors
     __device__ __host__ complex128_t() : real_(0.0), imag_(0.0) {}
-    __device__ __host__ complex128_t(double r, double i = 0.0) : real_(r), imag_(i) {}
+    __device__ __host__ explicit complex128_t(double r, double i = 0.0) : real_(r), imag_(i) {}
     
-    // Scalar constructor for int
+    // Generic scalar constructor for any type convertible to double
+    template <typename T, typename = std::enable_if_t<std::is_convertible_v<T, double> && !std::is_same_v<std::decay_t<T>, double> && !std::is_same_v<std::decay_t<T>, complex128_t>>>
+    __device__ __host__ explicit complex128_t(T r)
+        : real_(static_cast<double>(r)), imag_(0.0) {}
+
     __host__ explicit complex128_t(const std::complex<double>& c)
         : real_(c.real()), imag_(c.imag()) {}
     __device__ __host__ complex128_t(const complex128_t& other)
@@ -814,22 +821,22 @@ struct complex128_t {
 
     // Arithmetic operators
     __device__ __host__ complex128_t operator+(const complex128_t& o) const {
-        return {real_ + o.real_, imag_ + o.imag_};
+        return complex128_t(real_ + o.real_, imag_ + o.imag_);
     }
     __device__ __host__ complex128_t operator-(const complex128_t& o) const {
-        return {real_ - o.real_, imag_ - o.imag_};
+        return complex128_t(real_ - o.real_, imag_ - o.imag_);
     }
     __device__ __host__ complex128_t operator*(const complex128_t& o) const {
-        return {real_ * o.real_ - imag_ * o.imag_,
-                real_ * o.imag_ + imag_ * o.real_};
+        return complex128_t(real_ * o.real_ - imag_ * o.imag_,
+                real_ * o.imag_ + imag_ * o.real_);
     }
     __device__ __host__ complex128_t operator/(const complex128_t& o) const {
         double denom = o.real_ * o.real_ + o.imag_ * o.imag_;
-        return {(real_ * o.real_ + imag_ * o.imag_) / denom,
-                (imag_ * o.real_ - real_ * o.imag_) / denom};
+        return complex128_t((real_ * o.real_ + imag_ * o.imag_) / denom,
+                (imag_ * o.real_ - real_ * o.imag_) / denom);
     }
     __device__ __host__ complex128_t operator-() const {
-        return {-real_, -imag_};
+        return complex128_t(-real_, -imag_);
     }
 
     // Compound assignment
@@ -881,15 +888,24 @@ inline complex128_t polar(double rho, double theta) {
 }
 
 // ------------------------------------------------------------------
-// Cross-type conversions (defined after both types are declared)
+// Cross-type conversions (defined after all three complex types are declared)
 // ------------------------------------------------------------------
 
-// Allow complex64_t to be constructed from complex128_t
+// Out-of-line constructor definitions for cross-complex conversions
+inline __device__ __host__ complex32_t::complex32_t(const complex64_t& c)
+    : real_(float16_t(c.real())), imag_(float16_t(c.imag())) {}
+
+inline __device__ __host__ complex32_t::complex32_t(const complex128_t& c)
+    : real_(float16_t(static_cast<float>(c.real()))), imag_(float16_t(static_cast<float>(c.imag()))) {}
+
+inline __device__ __host__ complex64_t::complex64_t(const complex128_t& c)
+    : real_(static_cast<float>(c.real())), imag_(static_cast<float>(c.imag())) {}
+
+// Helper conversion functions
 inline complex64_t to_complex64(const complex128_t& c) {
     return complex64_t(static_cast<float>(c.real()), static_cast<float>(c.imag()));
 }
 
-// Allow complex128_t to be constructed from complex64_t  
 inline complex128_t to_complex128(const complex64_t& c) {
     return complex128_t(static_cast<double>(c.real()), static_cast<double>(c.imag()));
 }
@@ -918,6 +934,24 @@ inline complex128_t to_complex128(const complex64_t& c) {
     __device__ __host__ inline complex32_t operator/(double s, const complex32_t& c) { return complex32_t(s) / c; }
     __device__ __host__ inline complex32_t operator/(const complex32_t& c, double s) { return c / complex32_t(s); }
 
+    // integer overloads for complex32_t
+    template<typename T, typename = typename std::enable_if<std::is_integral<T>::value>::type>
+    __device__ __host__ inline complex32_t operator+(T s, const complex32_t& c) { return complex32_t(static_cast<float>(s)) + c; }
+    template<typename T, typename = typename std::enable_if<std::is_integral<T>::value>::type>
+    __device__ __host__ inline complex32_t operator+(const complex32_t& c, T s) { return c + complex32_t(static_cast<float>(s)); }
+    template<typename T, typename = typename std::enable_if<std::is_integral<T>::value>::type>
+    __device__ __host__ inline complex32_t operator-(T s, const complex32_t& c) { return complex32_t(static_cast<float>(s)) - c; }
+    template<typename T, typename = typename std::enable_if<std::is_integral<T>::value>::type>
+    __device__ __host__ inline complex32_t operator-(const complex32_t& c, T s) { return c - complex32_t(static_cast<float>(s)); }
+    template<typename T, typename = typename std::enable_if<std::is_integral<T>::value>::type>
+    __device__ __host__ inline complex32_t operator*(T s, const complex32_t& c) { return complex32_t(static_cast<float>(s)) * c; }
+    template<typename T, typename = typename std::enable_if<std::is_integral<T>::value>::type>
+    __device__ __host__ inline complex32_t operator*(const complex32_t& c, T s) { return c * complex32_t(static_cast<float>(s)); }
+    template<typename T, typename = typename std::enable_if<std::is_integral<T>::value>::type>
+    __device__ __host__ inline complex32_t operator/(T s, const complex32_t& c) { return complex32_t(static_cast<float>(s)) / c; }
+    template<typename T, typename = typename std::enable_if<std::is_integral<T>::value>::type>
+    __device__ __host__ inline complex32_t operator/(const complex32_t& c, T s) { return c / complex32_t(static_cast<float>(s)); }
+
     // ---- complex64_t ----
     __device__ __host__ inline complex64_t operator+(float s, const complex64_t& c) { return complex64_t(s) + c; }
     __device__ __host__ inline complex64_t operator+(const complex64_t& c, float s) { return c + complex64_t(s); }
@@ -937,6 +971,24 @@ inline complex128_t to_complex128(const complex64_t& c) {
     __device__ __host__ inline complex64_t operator/(double s, const complex64_t& c) { return complex64_t(s) / c; }
     __device__ __host__ inline complex64_t operator/(const complex64_t& c, double s) { return c / complex64_t(s); }
 
+    // integer overloads for complex64_t
+    template<typename T, typename = typename std::enable_if<std::is_integral<T>::value>::type>
+    __device__ __host__ inline complex64_t operator+(T s, const complex64_t& c) { return complex64_t(static_cast<float>(s)) + c; }
+    template<typename T, typename = typename std::enable_if<std::is_integral<T>::value>::type>
+    __device__ __host__ inline complex64_t operator+(const complex64_t& c, T s) { return c + complex64_t(static_cast<float>(s)); }
+    template<typename T, typename = typename std::enable_if<std::is_integral<T>::value>::type>
+    __device__ __host__ inline complex64_t operator-(T s, const complex64_t& c) { return complex64_t(static_cast<float>(s)) - c; }
+    template<typename T, typename = typename std::enable_if<std::is_integral<T>::value>::type>
+    __device__ __host__ inline complex64_t operator-(const complex64_t& c, T s) { return c - complex64_t(static_cast<float>(s)); }
+    template<typename T, typename = typename std::enable_if<std::is_integral<T>::value>::type>
+    __device__ __host__ inline complex64_t operator*(T s, const complex64_t& c) { return complex64_t(static_cast<float>(s)) * c; }
+    template<typename T, typename = typename std::enable_if<std::is_integral<T>::value>::type>
+    __device__ __host__ inline complex64_t operator*(const complex64_t& c, T s) { return c * complex64_t(static_cast<float>(s)); }
+    template<typename T, typename = typename std::enable_if<std::is_integral<T>::value>::type>
+    __device__ __host__ inline complex64_t operator/(T s, const complex64_t& c) { return complex64_t(static_cast<float>(s)) / c; }
+    template<typename T, typename = typename std::enable_if<std::is_integral<T>::value>::type>
+    __device__ __host__ inline complex64_t operator/(const complex64_t& c, T s) { return c / complex64_t(static_cast<float>(s)); }
+
     // ---- complex128_t ----
     __device__ __host__ inline complex128_t operator+(float s, const complex128_t& c) { return complex128_t(s) + c; }
     __device__ __host__ inline complex128_t operator+(const complex128_t& c, float s) { return c + complex128_t(s); }
@@ -954,7 +1006,27 @@ inline complex128_t to_complex128(const complex64_t& c) {
     __device__ __host__ inline complex128_t operator*(double s, const complex128_t& c) { return complex128_t(s) * c; }
     __device__ __host__ inline complex128_t operator*(const complex128_t& c, double s) { return c * complex128_t(s); }
     __device__ __host__ inline complex128_t operator/(double s, const complex128_t& c) { return complex128_t(s) / c; }
-    __device__ __host__ inline complex128_t operator/(const complex128_t& c, double s) { return c / complex128_t(s); }   // ==================================================================================
+    __device__ __host__ inline complex128_t operator/(const complex128_t& c, double s) { return c / complex128_t(s); }
+
+    // integer overloads for complex128_t
+    template<typename T, typename = typename std::enable_if<std::is_integral<T>::value>::type>
+    __device__ __host__ inline complex128_t operator+(T s, const complex128_t& c) { return complex128_t(static_cast<double>(s)) + c; }
+    template<typename T, typename = typename std::enable_if<std::is_integral<T>::value>::type>
+    __device__ __host__ inline complex128_t operator+(const complex128_t& c, T s) { return c + complex128_t(static_cast<double>(s)); }
+    template<typename T, typename = typename std::enable_if<std::is_integral<T>::value>::type>
+    __device__ __host__ inline complex128_t operator-(T s, const complex128_t& c) { return complex128_t(static_cast<double>(s)) - c; }
+    template<typename T, typename = typename std::enable_if<std::is_integral<T>::value>::type>
+    __device__ __host__ inline complex128_t operator-(const complex128_t& c, T s) { return c - complex128_t(static_cast<double>(s)); }
+    template<typename T, typename = typename std::enable_if<std::is_integral<T>::value>::type>
+    __device__ __host__ inline complex128_t operator*(T s, const complex128_t& c) { return complex128_t(static_cast<double>(s)) * c; }
+    template<typename T, typename = typename std::enable_if<std::is_integral<T>::value>::type>
+    __device__ __host__ inline complex128_t operator*(const complex128_t& c, T s) { return c * complex128_t(static_cast<double>(s)); }
+    template<typename T, typename = typename std::enable_if<std::is_integral<T>::value>::type>
+    __device__ __host__ inline complex128_t operator/(T s, const complex128_t& c) { return complex128_t(static_cast<double>(s)) / c; }
+    template<typename T, typename = typename std::enable_if<std::is_integral<T>::value>::type>
+    __device__ __host__ inline complex128_t operator/(const complex128_t& c, T s) { return c / complex128_t(static_cast<double>(s)); }
+
+    // ==================================================================================
     // GLOBAL COMPARISON OPERATORS FOR MIXED SCALAR-COMPLEX TYPES
     // ==================================================================================
 

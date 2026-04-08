@@ -74,10 +74,34 @@ private:
     /// Whether to offload inputs to CPU during forward pass.
     bool offload_to_cpu_;
 
+    /// Set to true after release_saved_variables() fires; prevents double-release.
+    bool released_ = false;
+
     /**
      * @brief Release saved variables to break reference cycles and free memory.
      */
     void release_saved_variables() override;
+
+    /**
+     * @brief Self-contained local backward pass over the recomputed graph.
+     *
+     * Runs a sequential BFS + execution loop using only local data structures.
+     * No global singletons (NodeTaskPool, BackwardContext) are touched, which
+     * eliminates the re-entrant engine call that caused BUG-4.
+     *
+     * @param outputs         Recomputed outputs of forward_fn_ (roots of local graph).
+     * @param grads           Incoming gradients from the outer engine (one per output).
+     * @param local_seq_floor Minimum sequence number of any GradAccumulator created for
+     *                        the recompute_input leaf tensors. Any Node whose sequence_nr()
+     *                        is strictly less than this value was created during the outer
+     *                        forward pass and belongs to the outer computation graph.
+     *                        The BFS will not traverse into those nodes, preventing
+     *                        LocalCleanupGuard from releasing outer-engine saved state.
+     */
+    static void run_local_backward(
+        const variable_list& outputs,
+        const variable_list& grads,
+        uint64_t local_seq_floor);
 };
 
 } // namespace autograd

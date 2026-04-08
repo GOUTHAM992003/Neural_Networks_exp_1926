@@ -34,7 +34,8 @@ __global__ void fused_adam_kernel_optimized(
     float eps,
     float weight_decay,
     float bias_correction1,
-    float bias_correction2
+    float bias_correction2,
+    bool is_adamw
 ) {
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     int64_t stride = blockDim.x * gridDim.x;
@@ -69,9 +70,15 @@ __global__ void fused_adam_kernel_optimized(
                 float* m_ptr = &m_val.x + j;
                 float* v_ptr = &v_val.x + j;
 
-                // AdamW weight decay
+                // Weight decay handling
                 if (weight_decay > 0.0f) {
-                    *p_ptr -= lr * weight_decay * *p_ptr;
+                    if (is_adamw) {
+                       // AdamW: Decoupled weight decay (directly on params)
+                        *p_ptr *= (1.0f - lr * weight_decay);
+                    } else {
+                       // Adam: Coupled L2 regularization (add to gradient)
+                        g_val += weight_decay * *p_ptr;
+                    }
                 }
 
                 // Update moments
@@ -100,8 +107,15 @@ __global__ void fused_adam_kernel_optimized(
             float g = grad[i];
             float p = param[i];
 
+            // Weight decay handling
             if (weight_decay > 0.0f) {
-                p -= lr * weight_decay * p;
+                if (is_adamw) {
+                   // AdamW: Decoupled weight decay
+                    p *= (1.0f - lr * weight_decay);
+                } else {
+                   // Adam: Coupled L2 regularization
+                    g += weight_decay * p;
+                }
             }
 
             float m_new = beta1 * m[i] + (1.0f - beta1) * g;
@@ -122,8 +136,15 @@ __global__ void fused_adam_kernel_optimized(
             float g = grad[i];
             float p = param[i];
 
+            // Weight decay handling
             if (weight_decay > 0.0f) {
-                p -= lr * weight_decay * p;
+                if (is_adamw) {
+                   // AdamW: Decoupled weight decay
+                    p *= (1.0f - lr * weight_decay);
+                } else {
+                   // Adam: Coupled L2 regularization
+                    g += weight_decay * p;
+               }
             }
 
             float m_new = beta1 * m[i] + (1.0f - beta1) * g;
@@ -153,7 +174,8 @@ void fused_adam_cuda(
     float eps,
     float weight_decay,
     float bias_correction1,
-    float bias_correction2
+    float bias_correction2,
+    bool is_adamw
 ) {
     if (numel == 0) return;
 
@@ -174,7 +196,7 @@ void fused_adam_cuda(
     fused_adam_kernel_optimized<4><<<num_blocks, threads_per_block>>>(
         param, grad, m, v, numel,
         lr, beta1, beta2, eps, weight_decay,
-        bias_correction1, bias_correction2
+        bias_correction1, bias_correction2, is_adamw
     );
 }
 

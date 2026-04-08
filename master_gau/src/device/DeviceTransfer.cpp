@@ -24,10 +24,9 @@ namespace OwnTensor
             }
             
     #ifdef WITH_CUDA
-            cudaStream_t stream = OwnTensor::cuda::getCurrentStream();
-
             // GPU → GPU: cudaMemcpyAsync (async, stream-ordered)
             if (dst_device == Device::CUDA && src_device == Device::CUDA) {
+                cudaStream_t stream = OwnTensor::cuda::getCurrentStream();
                 cudaError_t err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream);
                 if (err != cudaSuccess) {
                     throw std::runtime_error(std::string("GPU→GPU transfer failed: ") + 
@@ -38,6 +37,7 @@ namespace OwnTensor
 
             // CPU → GPU: cudaMemcpyAsync (async, stream-ordered)
             if (dst_device == Device::CUDA && src_device == Device::CPU) {
+                cudaStream_t stream = OwnTensor::cuda::getCurrentStream();
                 cudaError_t err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream);
                 if (err != cudaSuccess) {
                     throw std::runtime_error(std::string("CPU→GPU transfer failed: ") + 
@@ -48,6 +48,7 @@ namespace OwnTensor
 
             // GPU → CPU: cudaMemcpyAsync (async, stream-ordered)
             if (dst_device == Device::CPU && src_device == Device::CUDA) {
+                cudaStream_t stream = OwnTensor::cuda::getCurrentStream();
                 cudaError_t err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, stream);
                 if (err != cudaSuccess) {
                     throw std::runtime_error(std::string("GPU→CPU transfer failed: ") + 
@@ -56,6 +57,72 @@ namespace OwnTensor
                 return;
             }
     #endif
+            
+            throw std::runtime_error("Unsupported device transfer");
+        }
+        void copy_memory(void* dst, DeviceIndex dst_device, 
+            const void* src, DeviceIndex src_device, 
+                        size_t bytes) {
+            
+                            if (bytes == 0) {
+                                return;
+                            }
+                            
+                            // CPU → CPU: std::memcpy (inherently synchronous, no CUDA involved)
+                            if (dst_device.device == Device::CPU && src_device.device == Device::CPU) {
+                                std::memcpy(dst, src, bytes);
+                                return;
+                            }
+                            
+                            #ifdef WITH_CUDA
+                            // GPU → GPU: cudaMemcpyAsync (async, stream-ordered)
+                            if (dst_device.device == Device::CUDA && src_device.device == Device::CUDA) {
+                                if (dst_device.index == src_device.index) {
+                                    OwnTensor::device::set_cuda_device(dst_device.index);
+                                    cudaStream_t stream = OwnTensor::cuda::getCurrentStream();
+                                    cudaError_t err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream);
+                                    if (err != cudaSuccess) {
+                                        throw std::runtime_error(std::string("GPU→GPU transfer failed: ") + 
+                                        cudaGetErrorString(err));
+                                    }
+                                } else {
+                                    // Cross-device transfer
+                                    OwnTensor::device::set_cuda_device(dst_device.index);
+                                    cudaStream_t stream = OwnTensor::cuda::getCurrentStream();
+                                    cudaError_t err = cudaMemcpyPeerAsync(dst, dst_device.index, src, src_device.index, bytes, stream);
+                                    if (err != cudaSuccess) {
+                                        throw std::runtime_error(std::string("Cross-GPU transfer failed: ") + 
+                                        cudaGetErrorString(err));
+                                    }
+                                }
+                                return;
+                            }
+                            
+                            // CPU → GPU: cudaMemcpyAsync (async, stream-ordered)
+                            if (dst_device.device == Device::CUDA && src_device.device == Device::CPU) {
+                                OwnTensor::device::set_cuda_device(dst_device.index);
+                                cudaStream_t stream = OwnTensor::cuda::getCurrentStream();
+                                cudaError_t err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream);
+                                if (err != cudaSuccess) {
+                                    throw std::runtime_error(std::string("CPU→GPU transfer failed: ") + 
+                                    cudaGetErrorString(err));
+                                }
+                                return;
+                            }
+                            
+                            // GPU → CPU: cudaMemcpyAsync (async, stream-ordered)
+                            if (dst_device.device == Device::CPU && src_device.device == Device::CUDA) {
+                                // For D2H, we must set to the source GPU device
+                                OwnTensor::device::set_cuda_device(src_device.index);
+                                cudaStream_t stream = OwnTensor::cuda::getCurrentStream();
+                                cudaError_t err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, stream);
+                                if (err != cudaSuccess) {
+                                    throw std::runtime_error(std::string("GPU→CPU transfer failed: ") + 
+                                    cudaGetErrorString(err));
+                                }
+                                return;
+                            }
+                            #endif
             
             throw std::runtime_error("Unsupported device transfer");
         }

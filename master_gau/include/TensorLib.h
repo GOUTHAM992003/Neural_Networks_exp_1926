@@ -25,7 +25,8 @@
 #include "ops/ScalarOps.h"
 #include "ops/TensorOps.h"
 #include "ops/Kernels.h"
-// #include "ops/TensorOpUtils.h"
+#include "ops/helpers/TensorOpUtils.h"
+#include "ops/IndexingOps.h"
 
 // ConditionalOps.h
 #include "ops/helpers/ConditionalOps.h"
@@ -36,6 +37,7 @@
 
 // Neural Network and Optimizer
 #include "nn/NN.h"
+#include "nn/MultiHeadAttention.h"
 #include "nn/optimizer/Optim.h"
 #include "nn/optimizer/LossScaler.h"
 

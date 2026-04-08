@@ -68,9 +68,7 @@ public:
              // It is a tensor
              const Tensor& t = arg;
              if (t.requires_grad()) {
-                 // We need mutable reference for get_grad_edge
-                 Tensor& t_mut = const_cast<Tensor&>(t);
-                 node->set_next_edge(index, get_grad_edge(t_mut));
+                 node->set_next_edge(index, get_grad_edge(t));
              }
         }
         index++;

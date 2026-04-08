@@ -20,5 +20,8 @@ Tensor view(const Tensor& input, Shape new_shape);
  */
 Tensor transpose(const Tensor& input, int dim0, int dim1);
 
+
+Tensor contiguous(const Tensor& input);
+
 } // namespace autograd
 } // namespace OwnTensor

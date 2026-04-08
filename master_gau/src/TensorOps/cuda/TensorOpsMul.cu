@@ -43,134 +43,115 @@ __global__ void mul_kernel<__nv_bfloat16>(const __nv_bfloat16* a, const __nv_bfl
     }
 }
 
+// Scalar multiply: one operand has numel==1, reads scalar from device ptr
+template<typename T>
+__global__ void mul_kernel_scalar(const T* a, const T* scalar_ptr, T* output, size_t n)
+{
+    T scalar = *scalar_ptr;  // Broadcast from L2 cache
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = a[idx] * scalar;
+    }
+}
+
+// Broadcast metadata passed by value (no device malloc needed)
+struct BroadcastMeta {
+    size_t a_bcast_strides[8];
+    size_t b_bcast_strides[8];
+    size_t out_shape[8];
+    size_t out_ndim;
+};
+
 template<typename T>
 __global__ void mul_kernel_nd_broadcast(const T* a, const T* b, T* output,
-                                      const size_t* a_shape, const size_t* b_shape, const size_t* out_shape,
-                                      const size_t* a_strides, const size_t* b_strides, const size_t* out_strides,
-                                      size_t a_ndim, size_t b_ndim, size_t out_ndim,
+                                      BroadcastMeta meta,
                                       size_t total_elems)
 {
     size_t linear_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (linear_idx >= total_elems) return;
 
-    size_t a_bcast_strides[8] = {0};
-    size_t b_bcast_strides[8] = {0};
-
-    // Pre-calculate broadcast strides
-    for (size_t i = 0; i < out_ndim; ++i) {
-        size_t a_dim_idx = a_ndim > i ? a_ndim - 1 - i : 0;
-        size_t b_dim_idx = b_ndim > i ? b_ndim - 1 - i : 0;
-        size_t out_dim_idx = out_ndim - 1 - i;
-
-        if (a_ndim > i && a_shape[a_dim_idx] == out_shape[out_dim_idx]) {
-            a_bcast_strides[out_dim_idx] = a_strides[a_dim_idx];
-        }
-
-        if (b_ndim > i && b_shape[b_dim_idx] == out_shape[out_dim_idx]) {
-            b_bcast_strides[out_dim_idx] = b_strides[b_dim_idx];
-        }
-    }
-
     size_t coords[8];
     size_t temp_idx = linear_idx;
-    for (int dim = out_ndim - 1; dim >= 0; --dim) {
-        coords[dim] = temp_idx % out_shape[dim];
-        temp_idx /= out_shape[dim];
+    for (int dim = meta.out_ndim - 1; dim >= 0; --dim) {
+        coords[dim] = temp_idx % meta.out_shape[dim];
+        temp_idx /= meta.out_shape[dim];
     }
 
     size_t a_idx = 0;
     size_t b_idx = 0;
-    for (size_t dim = 0; dim < out_ndim; ++dim) {
-        a_idx += coords[dim] * a_bcast_strides[dim];
-        b_idx += coords[dim] * b_bcast_strides[dim];
+    for (size_t dim = 0; dim < meta.out_ndim; ++dim) {
+        a_idx += coords[dim] * meta.a_bcast_strides[dim];
+        b_idx += coords[dim] * meta.b_bcast_strides[dim];
     }
 
     output[linear_idx] = a[a_idx] * b[b_idx];
 }
 
 template<>
+__global__ void mul_kernel_scalar<__half>(const __half* a, const __half* scalar_ptr, __half* output, size_t n)
+{
+    __half scalar = *scalar_ptr;
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = __hmul(a[idx], scalar);
+    }
+}
+
+template<>
 __global__ void mul_kernel_nd_broadcast<__half>(const __half* a, const __half* b, __half* output,
-                                              const size_t* a_shape, const size_t* b_shape, const size_t* out_shape,
-                                              const size_t* a_strides, const size_t* b_strides, const size_t* out_strides,
-                                              size_t a_ndim, size_t b_ndim, size_t out_ndim,
+                                              BroadcastMeta meta,
                                               size_t total_elems)
 {
     size_t linear_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (linear_idx >= total_elems) return;
 
-    size_t a_bcast_strides[8] = {0};
-    size_t b_bcast_strides[8] = {0};
-
-    for (size_t i = 0; i < out_ndim; ++i) {
-        size_t a_dim_idx = a_ndim > i ? a_ndim - 1 - i : 0;
-        size_t b_dim_idx = b_ndim > i ? b_ndim - 1 - i : 0;
-        size_t out_dim_idx = out_ndim - 1 - i;
-
-        if (a_ndim > i && a_shape[a_dim_idx] == out_shape[out_dim_idx]) {
-            a_bcast_strides[out_dim_idx] = a_strides[a_dim_idx];
-        }
-
-        if (b_ndim > i && b_shape[b_dim_idx] == out_shape[out_dim_idx]) {
-            b_bcast_strides[out_dim_idx] = b_strides[b_dim_idx];
-        }
-    }
-
     size_t coords[8];
     size_t temp_idx = linear_idx;
-    for (int dim = out_ndim - 1; dim >= 0; --dim) {
-        coords[dim] = temp_idx % out_shape[dim];
-        temp_idx /= out_shape[dim];
+    for (int dim = meta.out_ndim - 1; dim >= 0; --dim) {
+        coords[dim] = temp_idx % meta.out_shape[dim];
+        temp_idx /= meta.out_shape[dim];
     }
 
     size_t a_idx = 0;
     size_t b_idx = 0;
-    for (size_t dim = 0; dim < out_ndim; ++dim) {
-        a_idx += coords[dim] * a_bcast_strides[dim];
-        b_idx += coords[dim] * b_bcast_strides[dim];
+    for (size_t dim = 0; dim < meta.out_ndim; ++dim) {
+        a_idx += coords[dim] * meta.a_bcast_strides[dim];
+        b_idx += coords[dim] * meta.b_bcast_strides[dim];
     }
 
     output[linear_idx] = __hmul(a[a_idx], b[b_idx]);
 }
 
 template<>
+__global__ void mul_kernel_scalar<__nv_bfloat16>(const __nv_bfloat16* a, const __nv_bfloat16* scalar_ptr, __nv_bfloat16* output, size_t n)
+{
+    __nv_bfloat16 scalar = *scalar_ptr;
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = __hmul(a[idx], scalar);
+    }
+}
+
+template<>
 __global__ void mul_kernel_nd_broadcast<__nv_bfloat16>(const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_bfloat16* output,
-                                                    const size_t* a_shape, const size_t* b_shape, const size_t* out_shape,
-                                                    const size_t* a_strides, const size_t* b_strides, const size_t* out_strides,
-                                                    size_t a_ndim, size_t b_ndim, size_t out_ndim,
+                                                    BroadcastMeta meta,
                                                     size_t total_elems)
 {
     size_t linear_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (linear_idx >= total_elems) return;
 
-    size_t a_bcast_strides[8] = {0};
-    size_t b_bcast_strides[8] = {0};
-
-    for (size_t i = 0; i < out_ndim; ++i) {
-        size_t a_dim_idx = a_ndim > i ? a_ndim - 1 - i : 0;
-        size_t b_dim_idx = b_ndim > i ? b_ndim - 1 - i : 0;
-        size_t out_dim_idx = out_ndim - 1 - i;
-
-        if (a_ndim > i && a_shape[a_dim_idx] == out_shape[out_dim_idx]) {
-            a_bcast_strides[out_dim_idx] = a_strides[a_dim_idx];
-        }
-
-        if (b_ndim > i && b_shape[b_dim_idx] == out_shape[out_dim_idx]) {
-            b_bcast_strides[out_dim_idx] = b_strides[b_dim_idx];
-        }
-    }
-
     size_t coords[8];
     size_t temp_idx = linear_idx;
-    for (int dim = out_ndim - 1; dim >= 0; --dim) {
-        coords[dim] = temp_idx % out_shape[dim];
-        temp_idx /= out_shape[dim];
+    for (int dim = meta.out_ndim - 1; dim >= 0; --dim) {
+        coords[dim] = temp_idx % meta.out_shape[dim];
+        temp_idx /= meta.out_shape[dim];
     }
 
     size_t a_idx = 0;
     size_t b_idx = 0;
-    for (size_t dim = 0; dim < out_ndim; ++dim) {
-        a_idx += coords[dim] * a_bcast_strides[dim];
-        b_idx += coords[dim] * b_bcast_strides[dim];
+    for (size_t dim = 0; dim < meta.out_ndim; ++dim) {
+        a_idx += coords[dim] * meta.a_bcast_strides[dim];
+        b_idx += coords[dim] * meta.b_bcast_strides[dim];
     }
 
     output[linear_idx] = __hmul(a[a_idx], b[b_idx]);
@@ -182,55 +163,56 @@ void cuda_mul_tensor(const Tensor& A, const Tensor& B, Tensor& output, cudaStrea
     size_t total_elems = output.numel();
     size_t block_size = 256;
     size_t grid_size = (total_elems + block_size - 1) / block_size;
-    
+
     dispatch_by_dtype(A.dtype(), [&](auto dummy)
     {
         using T = decltype(dummy);
         const T* a_ptr = A.data<T>();
         const T* b_ptr = B.data<T>();
         T* output_ptr = output.data<T>();
-        
-        if (!needs_broadcasting) {
+
+        if (!needs_broadcasting && A.is_contiguous() && B.is_contiguous()) {
             mul_kernel<<<grid_size, block_size, 0, stream>>>(a_ptr, b_ptr, output_ptr, total_elems);
+        } else if (B.numel() == 1 && A.is_contiguous()) {
+            // Fast path: scalar multiply — only safe when A is contiguous
+            mul_kernel_scalar<<<grid_size, block_size, 0, stream>>>(a_ptr, b_ptr, output_ptr, total_elems);
+        } else if (A.numel() == 1 && B.is_contiguous()) {
+            // Fast path: scalar multiply (A is scalar) — only safe when B is contiguous
+            mul_kernel_scalar<<<grid_size, block_size, 0, stream>>>(b_ptr, a_ptr, output_ptr, total_elems);
         } else {
+            // General broadcast: pass metadata by value (no device malloc)
             const auto& a_shape = A.shape().dims;
             const auto& b_shape = B.shape().dims;
             const auto& out_shape = output.shape().dims;
-            
+
             size_t a_ndim = a_shape.size();
             size_t b_ndim = b_shape.size();
             size_t out_ndim = out_shape.size();
-            
-            size_t *d_a_shape, *d_b_shape, *d_out_shape;
-            size_t *d_a_strides, *d_b_strides, *d_out_strides;
-            
-            cudaMallocAsync(&d_a_shape, a_ndim * sizeof(size_t), stream);
-            cudaMallocAsync(&d_b_shape, b_ndim * sizeof(size_t), stream);
-            cudaMallocAsync(&d_out_shape, out_ndim * sizeof(size_t), stream);
-            cudaMallocAsync(&d_a_strides, a_ndim * sizeof(size_t), stream);
-            cudaMallocAsync(&d_b_strides, b_ndim * sizeof(size_t), stream);
-            cudaMallocAsync(&d_out_strides, out_ndim * sizeof(size_t), stream);
-            
-            cudaMemcpyAsync(d_a_shape, a_shape.data(), a_ndim * sizeof(size_t), cudaMemcpyHostToDevice, stream);
-            cudaMemcpyAsync(d_b_shape, b_shape.data(), b_ndim * sizeof(size_t), cudaMemcpyHostToDevice, stream);
-            cudaMemcpyAsync(d_out_shape, out_shape.data(), out_ndim * sizeof(size_t), cudaMemcpyHostToDevice, stream);
-            cudaMemcpyAsync(d_a_strides, A.stride().strides.data(), a_ndim * sizeof(size_t), cudaMemcpyHostToDevice, stream);
-            cudaMemcpyAsync(d_b_strides, B.stride().strides.data(), b_ndim * sizeof(size_t), cudaMemcpyHostToDevice, stream);
-            cudaMemcpyAsync(d_out_strides, output.stride().strides.data(), out_ndim * sizeof(size_t), cudaMemcpyHostToDevice, stream);
-            
+
+            BroadcastMeta meta = {};
+            meta.out_ndim = out_ndim;
+
+            for (size_t i = 0; i < out_ndim; ++i) {
+                meta.out_shape[i] = out_shape[i];
+            }
+
+            // Pre-compute broadcast strides on CPU
+            for (size_t i = 0; i < out_ndim; ++i) {
+                size_t a_dim_idx = a_ndim > i ? a_ndim - 1 - i : 0;
+                size_t b_dim_idx = b_ndim > i ? b_ndim - 1 - i : 0;
+                size_t out_dim_idx = out_ndim - 1 - i;
+
+                if (a_ndim > i && a_shape[a_dim_idx] == out_shape[out_dim_idx]) {
+                    meta.a_bcast_strides[out_dim_idx] = A.stride().strides[a_dim_idx];
+                }
+                if (b_ndim > i && b_shape[b_dim_idx] == out_shape[out_dim_idx]) {
+                    meta.b_bcast_strides[out_dim_idx] = B.stride().strides[b_dim_idx];
+                }
+            }
+
             mul_kernel_nd_broadcast<<<grid_size, block_size, 0, stream>>>(
-                a_ptr, b_ptr, output_ptr,
-                d_a_shape, d_b_shape, d_out_shape,
-                d_a_strides, d_b_strides, d_out_strides,
-                a_ndim, b_ndim, out_ndim, total_elems
+                a_ptr, b_ptr, output_ptr, meta, total_elems
             );
-            
-            cudaFreeAsync(d_a_shape, stream);
-            cudaFreeAsync(d_b_shape, stream);
-            cudaFreeAsync(d_out_shape, stream);
-            cudaFreeAsync(d_a_strides, stream);
-            cudaFreeAsync(d_b_strides, stream);
-            cudaFreeAsync(d_out_strides, stream);
         }
     });
 }

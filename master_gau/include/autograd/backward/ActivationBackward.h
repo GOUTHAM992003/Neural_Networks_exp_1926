@@ -11,7 +11,7 @@ namespace autograd {
  * 
  * Forward: out = max(0, x)
  * Backward: grad_x = grad_out * (x > 0)
- */
+ */  
 class ReluBackward : public Node {
 private:
     Tensor saved_input_;
@@ -77,6 +77,68 @@ public:
     const char* name() const override { return "SoftmaxBackward"; }
     std::vector<Tensor> apply(std::vector<Tensor>&& grads) override;
     void release_saved_variables() override { saved_output_ = Tensor(); }
+};
+
+/**
+ * @brief Backward function for dropout
+ *
+ * Forward: output = input * mask * scale, where mask is binary, scale = 1/(1-p)
+ * Backward: grad_input = grad_output * mask * scale (same mask from forward)
+ */
+class DropoutBackward : public Node {
+private:
+    Tensor saved_mask_;
+    float scale_;
+
+public:
+    DropoutBackward(const Tensor& mask, float scale);
+
+    const char* name() const override { return "DropoutBackward"; }
+    std::vector<Tensor> apply(std::vector<Tensor>&& grads) override;
+    void release_saved_variables() override { saved_mask_ = Tensor(); }
+};
+
+
+/**
+ * @brief Backward function for SwiGLU
+ * 
+ * Forward: swish(A) * B
+ * Backward: 
+ *      Y = swish(A) * B
+ *      σ = sigmoid(A)
+ *      swish(A) = A * σ
+ * Gradients:   
+ *      dY/dB = swish(A)
+ *      dY/dA = B * ( σ + A * σ * (1 - σ) )
+ */
+
+ class SwiGLUBackward : public Node {
+    private:
+        Tensor saved_input_;
+
+    public:
+        SwiGLUBackward(const Tensor& input);
+        std::vector<Tensor> apply(std::vector<Tensor>&& grads) override;
+        void release_saved_variables() override { saved_input_ = Tensor(); }
+};
+
+/**
+ * @brief Backward for fused bias + GELU: output = gelu(input + bias)
+ *
+ * Produces two gradients: grad_input and grad_bias.
+ * CUDA float32 only (matches the forward kernel).
+ */
+class FusedBiasGeLUBackward : public Node {
+private:
+    Tensor saved_input_;
+    Tensor saved_bias_;
+
+public:
+    FusedBiasGeLUBackward(const Tensor& input, const Tensor& bias);
+
+    const char* name() const override { return "FusedBiasGeLUBackward"; }
+    std::vector<Tensor> apply(std::vector<Tensor>&& grads) override;
+    void release_saved_variables() override { saved_input_ = Tensor(); saved_bias_ = Tensor(); }
 };
 
 } // namespace autograd

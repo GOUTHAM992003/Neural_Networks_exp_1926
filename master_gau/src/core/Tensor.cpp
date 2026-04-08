@@ -15,8 +15,10 @@
 #include "dtype/DtypeTraits.h"
 #include "core/TensorDispatch.h"
 #include "core/TensorDataManip.h"
+#include "autograd/GraphRecorder.h"
 #include <iostream>
 #include <cstring>
+#include <algorithm>
 
 #ifdef WITH_CUDA
 #include <cuda_runtime.h>
@@ -101,6 +103,21 @@ namespace OwnTensor
             return;
         }
 
+        // == CUDA DEVICE SETTING AND CHECK == //
+        if (opts.device.is_cuda()) {
+            #ifdef WITH_CUDA
+            if (!device::cuda_available()) {
+                throw std::runtime_error("CUDA is not available but CUDA device requested");
+            }
+            cudaError_t err = cudaSetDevice(opts.device.index);
+            if (err != cudaSuccess) {
+                throw std::runtime_error(std::string("Failed to set CUDA device: ") + cudaGetErrorString(err));
+            }
+            #else   
+            throw std::runtime_error("CUDA support not compiled");        
+            #endif
+        }
+
         // Check for negative/zero dims
         for (size_t i = 0; i < shape.dims.size(); ++i) {
              if (shape.dims[i] <= 0) { // simplified check
@@ -142,7 +159,6 @@ namespace OwnTensor
     // ========================================================================
     // Utility Methods - Delegate to TensorImpl
     // ========================================================================
-    
     size_t Tensor::numel() const {
         if (!impl_) return 0;
         return impl_->numel();
@@ -212,6 +228,47 @@ namespace OwnTensor
         return true;
     }
 
+    void Tensor::print_meta() const {
+        
+        // Shape
+        std::cout << "Shape: [ ";
+        for (auto i : this->shape().dims) {
+            std::cout << i << " ";
+        }
+        std::cout << "]" << std::endl;
+
+        std::cout << "Stride: [ ";
+        for (auto i : this->stride().strides) {
+            std::cout << i << " ";
+        }
+        std::cout << "]" << std::endl;
+
+        // Dtype
+        std::cout << "Dtype: " << get_dtype_name(this->dtype()) << std::endl;
+
+        // Size
+        std::cout << "Tensor Size: " << this->nbytes() << " bytes - " << this->nbytes() / (1024 * 1024) << " mb" << std::endl; 
+        std::cout << "Grad Size: " << this->grad_nbytes() << " bytes - " << this->grad_nbytes() / (1024 * 1024) << " mb" << std::endl; 
+
+        std::cout << "Storage Offset: " << this->storage_offset() << std::endl; 
+
+    }
+
+    void Tensor::print_shape(Shape s) {
+        std::cout << "Shape: [ ";
+        for (auto i : s.dims) {
+            std::cout << i << " ";
+        }
+        std::cout << "]" << std::endl;
+    }
+
+    void Tensor::print_stride(Stride s) {
+        std::cout << "Stride: [ ";
+        for (auto i : s.strides) {
+            std::cout << i << " ";
+        }
+        std::cout << "]" << std::endl;
+    }
     
     // ========================================================================
     // Contiguous Method
@@ -222,10 +279,11 @@ namespace OwnTensor
             throw std::runtime_error("contiguous: tensor is not initialized");
         }
         
-        // If already contiguous with zero offset, return a copy
+        // If already contiguous with zero offset, return self (no copy needed)
+        // If already contiguous with zero offset, return self (no copy needed)
         if (is_contiguous() && storage_offset() == 0) {
             Tensor out(impl_->sizes(), dtype(), device(), requires_grad());
-            device::copy_memory(out.data(), impl_->device().device, data(), impl_->device().device, nbytes());
+            device::copy_memory(out.data(), impl_->device(), data(), impl_->device(), nbytes());
             return out;
         }
 
@@ -273,38 +331,23 @@ namespace OwnTensor
         #ifdef WITH_CUDA
             else if (is_cuda()) {
                 cudaStream_t stream = 0;
-                
-                // Copy dims and strides to GPU memory
-                int64_t* d_dims = nullptr;
-                int64_t* d_strides = nullptr;
-                
-                cudaMallocAsync(&d_dims, D * sizeof(int64_t), stream);
-                cudaMallocAsync(&d_strides, D * sizeof(int64_t), stream);
-                
-                cudaMemcpyAsync(d_dims, impl_->sizes().dims.data(), D * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
-                cudaMemcpyAsync(d_strides, impl_->strides().strides.data(), D * sizeof(int64_t), cudaMemcpyHostToDevice, stream);
-                
+
+                // Pass dims/strides as host arrays — kernel receives them by value
+                // (no cudaMallocAsync overhead)
+
+                // Pass dims/strides as host arrays — kernel receives them by value
+                // (no cudaMallocAsync overhead)
                 contiguous_strided_copy_cuda(
                     data(), out.data(), total_elems,
-                    d_dims,
-                    d_strides,
+                    impl_->sizes().dims.data(),
+                    impl_->strides().strides.data(),
                     static_cast<int32_t>(D),
                     0,
                     static_cast<int32_t>(bytes_per_elem),
                     stream
                 );
 
-                cudaError_t err = cudaGetLastError();
-                if (err != cudaSuccess) {
-                    cudaFreeAsync(d_dims, stream);
-                    cudaFreeAsync(d_strides, stream);
-                    throw std::runtime_error(std::string("contiguous kernel launch failed: ")
-                                            + cudaGetErrorString(err));
-                }
-                
-                cudaFreeAsync(d_dims, stream);
-                cudaFreeAsync(d_strides, stream);
-                
+
                 return out;
             }
             #endif
@@ -333,7 +376,7 @@ namespace OwnTensor
             try {
                 Tensor src_contig = contiguous();
                 Tensor result(src_contig.shape(), dtype(), device(), requires_grad());
-                device::copy_memory(result.data(), impl_->device().device, src_contig.data(), impl_->device().device, src_contig.nbytes());
+                device::copy_memory(result.data(), impl_->device(), src_contig.data(), impl_->device(), src_contig.nbytes());
 
                 return result;
             } catch (const std::exception& e) {
@@ -344,7 +387,7 @@ namespace OwnTensor
         // Contiguous path: direct clone
         try {
             Tensor result(impl_->sizes(), dtype(), device(), requires_grad());
-            device::copy_memory(result.data(), impl_->device().device, data(), impl_->device().device, nbytes());
+            device::copy_memory(result.data(), impl_->device(), data(), impl_->device(), nbytes());
             
             return result;
         } catch (const std::exception& e) {
@@ -369,6 +412,9 @@ namespace OwnTensor
             impl_->device()
             // base_impl defaults to empty
         );
+        
+        // Propagate version counter to detached tensor
+        new_impl->set_version_counter(impl_->version_counter_ptr());
         
         return Tensor(std::move(new_impl));
     }
@@ -415,8 +461,8 @@ namespace OwnTensor
         
         try {
             device::copy_memory(
-                this->data(), this->device().device,
-                src_ptr->data(), src_ptr->device().device,
+                this->data(), this->device(),
+                src_ptr->data(), src_ptr->device(),
                 src_ptr->nbytes()
             );
         } catch (const std::exception& e) {
@@ -502,8 +548,8 @@ namespace OwnTensor
         
         // Copy data between devices
         device::copy_memory(
-            result.data(), device.device,
-            data(), impl_->device().device,
+            result.data(), device,
+            data(), impl_->device(),
             nbytes()
         );
         
@@ -534,7 +580,7 @@ namespace OwnTensor
         }
 
         try {
-            device::copy_memory(new_ptr, Device::CPU, this->data(), this->device().device, this->nbytes());
+            device::copy_memory(new_ptr, DeviceIndex(Device::CPU), this->data(), this->device(), this->nbytes());
         } catch (...) {
             cpu_alloc->deallocate(new_ptr);
             throw;
@@ -578,12 +624,13 @@ namespace OwnTensor
             throw std::runtime_error("CUDA is not available");
         }
 
+        // Ensure we are on the right device for allocation/copy if needed
+        device::set_cuda_device(device_index);
+        
         Allocator* cuda_alloc = AllocatorRegistry::get_allocator(Device::CUDA);
         if (!cuda_alloc) {
              throw std::runtime_error("to_cuda_: Failed to get CUDA allocator");
         }
-        
-        // Ensure we are on the right device for allocation/copy if needed (allocator handles it usually)
         
         void* new_ptr = cuda_alloc->allocate(this->nbytes());
         if (!new_ptr) {
@@ -591,7 +638,7 @@ namespace OwnTensor
         }
 
         try {
-            device::copy_memory(new_ptr, Device::CUDA, this->data(), this->device().device, this->nbytes());
+            device::copy_memory(new_ptr, DeviceIndex(Device::CUDA, device_index), this->data(), this->device(), this->nbytes());
         } catch (...) {
             cuda_alloc->deallocate(new_ptr);
             throw;
@@ -627,7 +674,7 @@ namespace OwnTensor
 
         // Naive Implementation: In-Place Pinned Memory using cudaHostRegister
         // This registers the existing pageable memory as pinned, avoiding a copy.
-        // It allows method chaining by returning the tensor itself,(not a void function).
+        // It allows method chaining by returning the tensor itself.
         
         #ifdef WITH_CUDA
         void* ptr = impl_->mutable_data();
@@ -1007,8 +1054,34 @@ template const complex128_t* Tensor::grad<complex128_t>() const;
     template void Tensor::set_data<complex32_t>(const std::vector<complex32_t>&);
     template void Tensor::set_data<complex64_t>(const std::vector<complex64_t>&);
     template void Tensor::set_data<complex128_t>(const std::vector<complex128_t>&);
-    // template void Tensor::set_data<float4_e2m1_t>(const std::vector<float4_e2m1_t>&);
-    // template void Tensor::set_data<float4_e2m1_2x_t>(const std::vector<float4_e2m1_2x_t>&);
+    template void Tensor::set_data<float>(const float*, size_t);
+    template void Tensor::set_data<double>(const double*, size_t);
+    template void Tensor::set_data<int32_t>(const int32_t*, size_t);
+    template void Tensor::set_data<int64_t>(const int64_t*, size_t);
+    template void Tensor::set_data<bool>(const bool*, size_t);
+
+    template void Tensor::set_grad<float>(const float*, size_t);
+    template void Tensor::set_grad<double>(const double*, size_t);
+    template void Tensor::set_grad<int32_t>(const int32_t*, size_t);
+    template void Tensor::set_grad<int64_t>(const int64_t*, size_t);
+    template void Tensor::set_grad<bool>(const bool*, size_t);
+
+    template void Tensor::set_data<bool>(std::initializer_list<bool>);
+    template void Tensor::set_data<int8_t>(std::initializer_list<int8_t>);
+    template void Tensor::set_data<int16_t>(std::initializer_list<int16_t>);
+    template void Tensor::set_data<int32_t>(std::initializer_list<int32_t>);
+    template void Tensor::set_data<int64_t>(std::initializer_list<int64_t>);
+    template void Tensor::set_data<float>(std::initializer_list<float>);
+    template void Tensor::set_data<double>(std::initializer_list<double>);
+    template void Tensor::set_data<uint8_t>(std::initializer_list<uint8_t>);
+    template void Tensor::set_data<uint16_t>(std::initializer_list<uint16_t>);
+    template void Tensor::set_data<uint32_t>(std::initializer_list<uint32_t>);
+    template void Tensor::set_data<uint64_t>(std::initializer_list<uint64_t>);
+    template void Tensor::set_data<float16_t>(std::initializer_list<float16_t>);
+    template void Tensor::set_data<bfloat16_t>(std::initializer_list<bfloat16_t>);
+    template void Tensor::set_data<complex32_t>(std::initializer_list<complex32_t>);
+    template void Tensor::set_data<complex64_t>(std::initializer_list<complex64_t>);
+    template void Tensor::set_data<complex128_t>(std::initializer_list<complex128_t>);
     
 
     // Explicit instantiations for set_grad
@@ -1067,31 +1140,6 @@ template const complex128_t* Tensor::grad<complex128_t>() const;
     template void Tensor::fill<float4_e2m1_t>(float4_e2m1_t);
     template void Tensor::fill<float4_e2m1_2x_t>(float4_e2m1_2x_t);
 
-    Tensor Tensor::slice(OwnTensor::Tensor& tensor, size_t start, size_t length){
-        OwnTensor::TensorOptions opts = tensor.opts();
-
-        if(start > tensor.numel() || start + length > tensor.numel()){
-            throw std::runtime_error(
-                "range exceeded... (zero based indexing)"
-            );
-        }
-
-        OwnTensor::Tensor new_tensor = OwnTensor::Tensor({{1, static_cast<int64_t>(length)}}, opts);
-
-        dispatch_by_dtype(tensor.dtype(),[&](auto dummy){
-            // using T = decltype(dummy);
-
-            size_t byte_offset = start * OwnTensor::Tensor::dtype_size(tensor.dtype());
-            void* temp_pointer = static_cast<uint8_t*>(const_cast<void*>(tensor.data())) + byte_offset;
-
-            OwnTensor::device::copy_memory(new_tensor.data(), opts.device.device, temp_pointer, opts.device.device, length * OwnTensor::Tensor::dtype_size(tensor.dtype()));
-
-        });
-
-        
-        return new_tensor;
-    }
-
     // Specialization for fill with bool (Moved from header)
     template<>
     void Tensor::fill<bool>(bool value) {
@@ -1108,13 +1156,123 @@ template const complex128_t* Tensor::grad<complex128_t>() const;
             // For GPU
             #ifdef WITH_CUDA
             std::vector<uint8_t> temp_data(numel(), fill_value);
-            device::copy_memory(data(), device().device,
-                            temp_data.data(), Device::CPU,
+            device::copy_memory(data(), device(),
+                            temp_data.data(), DeviceIndex(Device::CPU),
                             numel() * sizeof(uint8_t));
              #else
              throw std::runtime_error("CUDA not enabled");
              #endif
         }
+    }
+
+
+    // ========================================================================
+    // TopK Implementation
+    // ========================================================================
+    std::pair<Tensor, Tensor> Tensor::topk(int64_t k, int64_t dim, bool largest, bool sorted) const {
+        if (k < 0) throw std::runtime_error("topk: k must be non-negative");
+        
+        int64_t ndim_ = ndim();
+        if (dim < 0) dim += ndim_;
+        if (dim < 0 || dim >= ndim_) throw std::runtime_error("topk: index out of range");
+        
+        int64_t n = shape().dims[dim];
+        if (k > n) throw std::runtime_error("topk: k=" + std::to_string(k) + " is larger than dimension size=" + std::to_string(n));
+
+        // If on GPU, CPU roundtrip
+        if (is_cuda()) {
+             Tensor cpu_in = this->to_cpu();
+             auto result = cpu_in.topk(k, dim, largest, sorted);
+             int dev_idx = device().index;
+             return {result.first.to_cuda(dev_idx), result.second.to_cuda(dev_idx)};
+        }
+
+        // CPU implementation
+        // 1. Permute to bring dim to last
+        Tensor input = *this;
+        bool permuted = false;
+        if (dim != ndim_ - 1) {
+            // Need transpose/permute. 
+            // For now, simple transpose: swap(dim, last)
+            input = input.transpose(dim, ndim_ - 1);
+            permuted = true;
+        }
+        
+        // Ensure contiguous
+        input = input.contiguous();
+        
+        const auto& in_dims = input.shape().dims;
+        int64_t last_dim = in_dims.back();
+        int64_t outer_size = input.numel() / last_dim;
+        
+        // Output shapes
+        Shape out_shape = input.shape();
+        out_shape.dims.back() = k;
+        
+        Tensor values(out_shape, input.dtype(), device(), false);
+        Tensor indices(out_shape, Dtype::Int64, device(), false);
+        
+        // Process rows
+        dispatch_by_dtype(input.dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            const T* in_ptr = input.data<T>();
+            T* val_ptr = values.data<T>();
+            int64_t* idx_ptr = indices.data<int64_t>();
+            
+            // Per row vector for sorting
+            // Note: Parallelize this loop with OpenMP if available
+            #pragma omp parallel for
+            for (int64_t i = 0; i < outer_size; ++i) {
+                // Must allocate vector inside loop for thread safety with OpenMP
+                std::vector<std::pair<T, int64_t>> row(last_dim);
+                const T* row_in = in_ptr + i * last_dim;
+                
+                for (int64_t j = 0; j < last_dim; ++j) {
+                    row[j] = {row_in[j], j};
+                }
+                
+                
+                // Partial sort or full sort?
+                if (sorted) {
+                     // sort gives strict ordering
+                    if constexpr (std::is_same_v<T, complex32_t> || std::is_same_v<T, complex64_t> || std::is_same_v<T, complex128_t>) {
+                        throw std::runtime_error("topk not supported for complex types");
+                    } else {
+                        auto cmp = [largest](const std::pair<T, int64_t>& a, const std::pair<T, int64_t>& b) {
+                            if (largest) return a.first > b.first; 
+                            else return a.first < b.first;
+                        };
+                        std::partial_sort(row.begin(), row.begin() + k, row.end(), cmp);
+                    }
+                } else {
+                    if constexpr (std::is_same_v<T, complex32_t> || std::is_same_v<T, complex64_t> || std::is_same_v<T, complex128_t>) {
+                         throw std::runtime_error("topk not supported for complex types");
+                    } else {
+                        auto cmp = [largest](const std::pair<T, int64_t>& a, const std::pair<T, int64_t>& b) {
+                            if (largest) return a.first > b.first; 
+                            else return a.first < b.first;
+                        };
+                        std::nth_element(row.begin(), row.begin() + k, row.end(), cmp);
+                    }
+                }
+                
+                T* row_val = val_ptr + i * k;
+                int64_t* row_idx = idx_ptr + i * k;
+                
+                for (int64_t j = 0; j < k; ++j) {
+                    row_val[j] = row[j].first;
+                    row_idx[j] = row[j].second;
+                }
+            }
+        });
+        
+        // Un-permute results if needed
+        if (permuted) {
+            values = values.transpose(dim, ndim_ - 1).contiguous();
+            indices = indices.transpose(dim, ndim_ - 1).contiguous();
+        }
+        
+        return {values, indices};
     }
 
 } // namespace OwnTensor

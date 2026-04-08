@@ -5,7 +5,7 @@
 namespace OwnTensor {
 namespace autograd {
 
-Edge get_grad_edge(Tensor& tensor) {
+Edge get_grad_edge(const Tensor& tensor) {
     if (tensor.grad_fn()) {
         // Non-leaf: connect to existing grad_fn
         return make_edge(tensor.grad_fn(), tensor.output_nr());

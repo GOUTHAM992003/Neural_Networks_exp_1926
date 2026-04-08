@@ -24,7 +24,7 @@ public:
             weight_ = SavedVariable(weight, false);
         }
     }
-
+    const char* name() const override { return "LayerNormBackward"; }
     virtual std::vector<Tensor> apply(std::vector<Tensor>&& grads) override;
     
     void release_saved_variables() override {

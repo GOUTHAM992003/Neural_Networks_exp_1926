@@ -157,7 +157,33 @@ namespace OwnTensor
             throw std::runtime_error("CUDA support not compiled");
 #endif
         } else {
-            throw std::runtime_error("addmm: CPU implementation not fully optimized yet (intended for CUDA)");
+                        // CPU implementation fallback
+            cpu_matmul(mat1, mat2, output); // output = mat1 @ mat2
+            
+            // Apply alpha and beta: output = alpha * output + beta * input
+            if (output.dtype() == Dtype::Float32) {
+                float* out_ptr = output.data<float>();
+                const float* in_ptr = input.data<float>();
+                int64_t total_elements = output.numel();
+                int64_t last_dim = output.shape().dims.back();
+                
+                if (input.shape() == output.shape()) {
+                    #pragma omp parallel for
+                    for (int64_t i = 0; i < total_elements; ++i) {
+                        out_ptr[i] = alpha * out_ptr[i] + beta * in_ptr[i];
+                    }
+                } else if (input.ndim() == 1 && input.shape().dims[0] == last_dim) {
+                    // Broadcasting for bias: input is [N], output is [..., N]
+                    #pragma omp parallel for
+                    for (int64_t i = 0; i < total_elements; ++i) {
+                        out_ptr[i] = alpha * out_ptr[i] + beta * in_ptr[i % last_dim];
+                    }
+                } else {
+                    throw std::runtime_error("addmm (CPU): Unsupported broadcasting shape for input. Expected same shape or 1D bias matching last dim.");
+                }
+            } else {
+                throw std::runtime_error("addmm (CPU): Only Float32 is supported in this fallback implementation.");
+            }
         }
         return output;
     }

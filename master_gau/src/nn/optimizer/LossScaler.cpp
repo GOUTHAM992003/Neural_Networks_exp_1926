@@ -22,10 +22,7 @@ Tensor LossScaler::scale_loss(Tensor loss) {
     return loss * current_scale_;
 }
 
-bool LossScaler::unscale_gradients(const std::vector<Tensor>& params) {
-    bool overflow = false;
-    float inv_scale = 1.0f / current_scale_;
-
+bool LossScaler::check_overflow(const std::vector<Tensor>& params) {
     for (const auto& p : params) {
         if (!p.requires_grad()) continue;
         
@@ -33,21 +30,10 @@ bool LossScaler::unscale_gradients(const std::vector<Tensor>& params) {
         if (!g.is_valid()) continue;
 
         if (has_overflow(g)) {
-            overflow = true;
-            break;
+            return true;
         }
     }
-
-    if (!overflow) {
-        for (auto& p : params) {
-            if (!p.requires_grad()) continue;
-            Tensor g = p.grad_view();
-            if (!g.is_valid()) continue;
-            g *= inv_scale;
-        }
-    }
-
-    return overflow;
+    return false;
 }
 
 void LossScaler::update(bool overflow) {

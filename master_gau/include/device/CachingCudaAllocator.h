@@ -66,9 +66,13 @@ namespace OwnTensor
                 }
                 
                 double fragmentation_ratio() const {
-                    return allocated_current > 0 
-                        ? 100.0 * (allocated_current - active_current) / allocated_current 
-                        : 0.0;
+                    // return allocated_current > 0 
+                    //     ? 100.0 * (allocated_current - active_current) / allocated_current 
+                    //     : 0.0;
+                    if (allocated_current <= active_current || allocated_current == 0) {
+                        return 0.0;
+                    }
+                    return 100.0 * (double)(allocated_current - active_current) / allocated_current;
                 }
                 
                 // Legacy compatibility aliases
@@ -78,7 +82,7 @@ namespace OwnTensor
             };
 
             MemoryStats get_stats(int device = -1) const;
-
+            std::vector<size_t> get_stats_vector(int device) const ;
             void print_memory_summary() const;
             BlockPool& get_pool(size_t size, int device);
 

@@ -7,6 +7,7 @@ namespace OwnTensor {
 namespace autograd {
 
 Tensor exp(const Tensor& input) {
+    GraphRecordMode::record_forward("EXPONENTS: exp");
     // ExpBackward takes Output (y).
     // ops_template makes result first.
     // If I pass output, I need result to be available.
@@ -23,42 +24,46 @@ Tensor exp(const Tensor& input) {
     
     /* Manual Implementation for Exp */
     Tensor result = OwnTensor::exp(input);
-    if (input.requires_grad()) {
+    if (GradMode::is_enabled() && input.requires_grad()) {
         auto grad_fn = std::make_shared<ExpBackward>(result); // Pass result!
-        Tensor& x_mut = const_cast<Tensor&>(input);
-        grad_fn->set_next_edge(0, get_grad_edge(x_mut));
+        grad_fn->set_next_edge(0, get_grad_edge(input));
         result.set_grad_fn(grad_fn);
         result.set_requires_grad(true);
     }
+    if (autograd::g_shape_debug) GraphRecordMode::attach_forward_shape(result.shape(), result.dtype());
     return result;
 }
 
 Tensor log(const Tensor& input) {
+    GraphRecordMode::record_forward("EXPONENTS: log");
     return make_unary_op<LogBackward>(input,
         [](const Tensor& x) { return OwnTensor::log(x); },
         input);
 }
 
 Tensor exp2(const Tensor& input) {
+    GraphRecordMode::record_forward("EXPONENTS: exp2");
     // Similar to exp, uses output for efficiency.
     Tensor result = OwnTensor::exp2(input);
-    if (input.requires_grad()) {
+    if (GradMode::is_enabled() && input.requires_grad()) {
         auto grad_fn = std::make_shared<Exp2Backward>(result);
-        Tensor& x_mut = const_cast<Tensor&>(input);
-        grad_fn->set_next_edge(0, get_grad_edge(x_mut));
+        grad_fn->set_next_edge(0, get_grad_edge(input));
         result.set_grad_fn(grad_fn);
         result.set_requires_grad(true);
     }
+    if (autograd::g_shape_debug) GraphRecordMode::attach_forward_shape(result.shape(), result.dtype());
     return result;
 }
 
 Tensor log2(const Tensor& input) {
+    GraphRecordMode::record_forward("EXPONENTS: log2");
     return make_unary_op<Log2Backward>(input,
         [](const Tensor& x) { return OwnTensor::log2(x); },
         input);
 }
 
 Tensor log10(const Tensor& input) {
+    GraphRecordMode::record_forward("EXPONENTS: log10");
     return make_unary_op<Log10Backward>(input,
         [](const Tensor& x) { return OwnTensor::log10(x); },
         input);

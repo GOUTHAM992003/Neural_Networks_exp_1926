@@ -3,6 +3,8 @@
 #include "ops/TensorOps.h"
 #include "ops/ScalarOps.h"
 #include "ops/helpers/ConditionalOps.h"
+#include "dtype/Types.h"
+#include "device/DeviceCore.h"
 #include <stdexcept>
 
 #ifdef WITH_CUDA
@@ -26,21 +28,15 @@ std::vector<Tensor> MSELossBackward::apply(std::vector<Tensor>&& grads) {
     
     const Tensor& grad_output = grads[0];
     
-    // TODO: Fused kernel needed (AUTOGRAD RELATED ONLY)
     Tensor grad_pred;
     if (grad_output.device().is_cuda() && grad_output.dtype() == Dtype::Float32) {
          grad_pred = Tensor(saved_pred_.shape(), grad_output.opts());
-         const Tensor& g_out = (grad_output.device().is_cpu()) ? grad_output.to(saved_pred_.device()) : grad_output;
-         cuda::mse_loss_backward_cuda(g_out.data<float>(), saved_pred_.data<float>(), saved_target_.data<float>(), grad_pred.data<float>(), numel_);
+         OwnTensor::device::set_cuda_device(grad_output.device().index);
+         cuda::mse_loss_backward_cuda(grad_output.data<float>(), saved_pred_.data<float>(), saved_target_.data<float>(), grad_pred.data<float>(), numel_);
     } else {
          float scale = 2.0f / static_cast<float>(numel_);
-         float grad_val = 1.0f;
-         if (grad_output.numel() == 1) {
-             grad_val = *grad_output.data<float>();
-         }
-
          Tensor diff = saved_pred_ - saved_target_;
-         grad_pred = diff * (scale * grad_val);
+         grad_pred = diff * scale * grad_output;
     }
     
     return {grad_pred};
@@ -65,29 +61,23 @@ std::vector<Tensor> MAELossBackward::apply(std::vector<Tensor>&& grads) {
     
     const Tensor& grad_output = grads[0];
     
-    // TODO: Fused kernel needed (AUTOGRAD RELATED ONLY)
     Tensor grad_pred;
     if (grad_output.device().is_cuda() && grad_output.dtype() == Dtype::Float32) {
          grad_pred = Tensor(saved_pred_.shape(), grad_output.opts());
-         const Tensor& g_out = (grad_output.device().is_cpu()) ? grad_output.to(saved_pred_.device()) : grad_output;
-         cuda::mae_loss_backward_cuda(g_out.data<float>(), saved_pred_.data<float>(), saved_target_.data<float>(), grad_pred.data<float>(), numel_);
+         OwnTensor::device::set_cuda_device(grad_output.device().index);
+         cuda::mae_loss_backward_cuda(grad_output.data<float>(), saved_pred_.data<float>(), saved_target_.data<float>(), grad_pred.data<float>(), numel_);
     } else {
          float scale = 1.0f / static_cast<float>(numel_);
-         float grad_val = 1.0f;
-         if (grad_output.numel() == 1) {
-             grad_val = *grad_output.data<float>();
-         }
 
          Tensor diff = saved_pred_ - saved_target_;
-         Tensor zero = Tensor::zeros(diff.shape(), 
+         Tensor zero = Tensor::zeros(diff.shape(),
              TensorOptions().with_dtype(diff.dtype()).with_device(diff.device()));
          Tensor ones = Tensor::ones(diff.shape(),
              TensorOptions().with_dtype(diff.dtype()).with_device(diff.device()));
          Tensor neg_ones = ones * -1.0f;
-         
-         // sign(x) = 1 if x > 0, -1 if x < 0, 0 if x == 0
+
          Tensor sign_diff = where(diff > zero, ones, where(diff < zero, neg_ones, zero));
-         grad_pred = sign_diff * (scale * grad_val);
+         grad_pred = sign_diff * scale * grad_output;
     }
     
     return {grad_pred};
@@ -114,25 +104,20 @@ std::vector<Tensor> BCELossBackward::apply(std::vector<Tensor>&& grads) {
     
     // BCE: L = -mean(target * log(pred) + (1-target) * log(1-pred))
     // grad_pred = (-target/pred + (1-target)/(1-pred)) / numel
-    // TODO: Fused kernel needed (AUTOGRAD RELATED ONLY)
     Tensor grad_pred;
     if (grad_output.device().is_cuda() && grad_output.dtype() == Dtype::Float32) {
          grad_pred = Tensor(saved_pred_.shape(), grad_output.opts());
-         const Tensor& g_out = (grad_output.device().is_cpu()) ? grad_output.to(saved_pred_.device()) : grad_output;
-         cuda::bce_loss_backward_cuda(g_out.data<float>(), saved_pred_.data<float>(), saved_target_.data<float>(), grad_pred.data<float>(), numel_);
+         OwnTensor::device::set_cuda_device(grad_output.device().index);
+         cuda::bce_loss_backward_cuda(grad_output.data<float>(), saved_pred_.data<float>(), saved_target_.data<float>(), grad_pred.data<float>(), numel_);
     } else {
          float scale = 1.0f / static_cast<float>(numel_);
-         float grad_val = 1.0f;
-         if (grad_output.numel() == 1) {
-             grad_val = *grad_output.data<float>();
-         }
 
          Tensor ones = Tensor::ones(saved_pred_.shape(),
              TensorOptions().with_dtype(saved_pred_.dtype()).with_device(saved_pred_.device()));
-         
+
          Tensor term1 = saved_target_ / saved_pred_ * -1.0f;
          Tensor term2 = (ones - saved_target_) / (ones - saved_pred_);
-         grad_pred = (term1 + term2) * (scale * grad_val);
+         grad_pred = (term1 + term2) * scale * grad_output;
     }
     
     return {grad_pred};
@@ -163,9 +148,10 @@ std::vector<Tensor> CCELossBackward::apply(std::vector<Tensor>&& grads) {
          Tensor grad_pred = Tensor::zeros(saved_pred_.shape(), saved_pred_.opts());
          int64_t num_classes = saved_pred_.shape().dims.back();
          int64_t batch_size = saved_pred_.numel() / num_classes;
-         
+
          const Tensor& g_out = (grad_output.device().is_cpu()) ? grad_output.to(saved_pred_.device()) : grad_output;
-         
+
+         OwnTensor::device::set_cuda_device(saved_pred_.device().index);
          cuda::categorical_cross_entropy_backward_cuda(
              g_out.data<float>(),
              saved_pred_.data<float>(),
@@ -176,17 +162,9 @@ std::vector<Tensor> CCELossBackward::apply(std::vector<Tensor>&& grads) {
          return {grad_pred};
     }
 
-    Tensor grad_pred = saved_target_ / saved_pred_ * -1.0f;
-    
     float scale = 1.0f / static_cast<float>(numel_);
-    
-    // Get scalar grad_output value
-    float grad_val = 1.0f;
-    if (grad_output.numel() == 1) {
-        grad_val = *grad_output.data<float>();
-    }
-    
-    grad_pred = grad_pred * (scale * grad_val);
+    Tensor grad_pred = saved_target_ / saved_pred_ * -1.0f;
+    grad_pred = grad_pred * scale * grad_output;
     
     return {grad_pred};
 }
@@ -231,31 +209,27 @@ std::vector<Tensor> SparseCrossEntropyLossBackward::apply(std::vector<Tensor>&& 
         .with_dtype(saved_logits_.dtype())
         .with_device(saved_logits_.device());
     
-    Tensor grad_logits_2d = Tensor::zeros(logits_2d.shape(), opts);
+    Tensor grad_logits_2d = Tensor::empty(logits_2d.shape(), opts);
     
-    // CPU implementation
-    if (logits_2d.device().is_cpu()) {
-        float grad_val = *grad_output.data<float>();
-        const float* logits_data = logits_2d.data<float>();
-        float* grad_data = grad_logits_2d.data<float>();
-        
-        // Compute softmax and gradient for each sample
+    // CPU implementation (templated on logits dtype, always computes in float)
+    auto cpu_sparse_ce_backward = [&](auto* logits_data, auto* grad_data) {
+        using T = std::remove_const_t<std::remove_pointer_t<decltype(logits_data)>>;
+        // grad_output is a scalar — read as float regardless of dtype
+        float grad_val = static_cast<float>(*grad_output.data<T>());
+
         for (int64_t i = 0; i < batch_size_; ++i) {
-            // Find max for numerical stability
-            float max_val = logits_data[i * num_classes_];
+            float max_val = static_cast<float>(logits_data[i * num_classes_]);
             for (int64_t c = 1; c < num_classes_; ++c) {
-                max_val = std::max(max_val, logits_data[i * num_classes_ + c]);
+                max_val = std::max(max_val, static_cast<float>(logits_data[i * num_classes_ + c]));
             }
-            
-            // Compute exp(x - max) and sum
+
             float sum_exp = 0.0f;
             std::vector<float> exp_vals(num_classes_);
             for (int64_t c = 0; c < num_classes_; ++c) {
-                exp_vals[c] = std::exp(logits_data[i * num_classes_ + c] - max_val);
+                exp_vals[c] = std::exp(static_cast<float>(logits_data[i * num_classes_ + c]) - max_val);
                 sum_exp += exp_vals[c];
             }
-            
-            // Get target class
+
             int64_t target_class = 0;
             if (saved_targets_.dtype() == Dtype::Int64) {
                 target_class = saved_targets_.data<int64_t>()[i];
@@ -264,60 +238,65 @@ std::vector<Tensor> SparseCrossEntropyLossBackward::apply(std::vector<Tensor>&& 
             } else if (saved_targets_.dtype() == Dtype::UInt16) {
                 target_class = static_cast<int64_t>(saved_targets_.data<uint16_t>()[i]);
             }
-            
-            // Gradient: softmax[i,c] - (c == target ? 1 : 0)
+
             float total_scale = grad_val * host_scale;
             for (int64_t c = 0; c < num_classes_; ++c) {
                 float softmax_val = exp_vals[c] / sum_exp;
                 float one_hot = (c == target_class) ? 1.0f : 0.0f;
-                grad_data[i * num_classes_ + c] = (softmax_val - one_hot) * total_scale;
+                grad_data[i * num_classes_ + c] = static_cast<T>((softmax_val - one_hot) * total_scale);
             }
+        }
+    };
+
+    if (logits_2d.device().is_cpu()) {
+        if (logits_2d.dtype() == Dtype::Float32) {
+            cpu_sparse_ce_backward(logits_2d.data<float>(), grad_logits_2d.data<float>());
+        } else if (logits_2d.dtype() == Dtype::Float16) {
+            cpu_sparse_ce_backward(logits_2d.data<float16_t>(), grad_logits_2d.data<float16_t>());
+        } else if (logits_2d.dtype() == Dtype::Bfloat16) {
+            cpu_sparse_ce_backward(logits_2d.data<bfloat16_t>(), grad_logits_2d.data<bfloat16_t>());
         }
     } else {
         #ifdef WITH_CUDA
-        AUTO_PROFILE_CUDA("Backward::SparseCrossEntropy_CUDA");
-        grad_logits_2d = Tensor::zeros(logits_2d.shape(), opts);
+        // Ensure all inputs are on the same device as logits_2d
+        Tensor targets_cuda = saved_targets_;
+        if (targets_cuda.device() != logits_2d.device()) {
+            targets_cuda = targets_cuda.to(logits_2d.device());
+        }
         
-        // Dispatch based on dtype
-        if (logits_2d.dtype() == Dtype::Float32) {
-            if (saved_targets_.dtype() == Dtype::UInt16) {
-                cuda::sparse_cross_entropy_backward_cuda<float, uint16_t>(
-                    logits_2d.data<float>(),
-                    saved_targets_.data<uint16_t>(),
-                    grad_logits_2d.data<float>(),
-                    batch_size_,
-                    num_classes_,
-                    grad_output.data<float>(),
-                    host_scale,
-                    0  // default stream
-                );
-            } else if (saved_targets_.dtype() == Dtype::Int64) {
-                cuda::sparse_cross_entropy_backward_cuda<float, int64_t>(
-                    logits_2d.data<float>(),
-                    saved_targets_.data<int64_t>(),
-                    grad_logits_2d.data<float>(),
-                    batch_size_,
-                    num_classes_,
-                    grad_output.data<float>(),
-                    host_scale,
-                    0
-                );
-            } else if (saved_targets_.dtype() == Dtype::Int32) {
-                cuda::sparse_cross_entropy_backward_cuda<float, int32_t>(
-                    logits_2d.data<float>(),
-                    saved_targets_.data<int32_t>(),
-                    grad_logits_2d.data<float>(),
-                    batch_size_,
-                    num_classes_,
-                    grad_output.data<float>(),
-                    host_scale,
-                    0
-                );
+        Tensor grad_output_cuda = grad_output;
+        if (grad_output_cuda.device() != logits_2d.device()) {
+            grad_output_cuda = grad_output_cuda.to(logits_2d.device());
+        }
+
+        // Set device context
+        device::set_cuda_device(logits_2d.device().index);
+        cudaStream_t stream = OwnTensor::cuda::getCurrentStream();
+
+        AUTO_PROFILE_CUDA("Backward::SparseCrossEntropy_CUDA");
+        grad_logits_2d = Tensor::empty(logits_2d.shape(), opts);
+        
+        // Dispatch by logits dtype x target dtype
+        auto dispatch_targets = [&](auto* logits_ptr, auto* grad_ptr, auto* grad_out_ptr) {
+            if (targets_cuda.dtype() == Dtype::UInt16) {
+                cuda::sparse_cross_entropy_backward_cuda(logits_ptr, targets_cuda.data<uint16_t>(), grad_ptr, batch_size_, num_classes_, grad_out_ptr, host_scale, stream);
+            } else if (targets_cuda.dtype() == Dtype::Int64) {
+                cuda::sparse_cross_entropy_backward_cuda(logits_ptr, targets_cuda.data<int64_t>(), grad_ptr, batch_size_, num_classes_, grad_out_ptr, host_scale, stream);
+            } else if (targets_cuda.dtype() == Dtype::Int32) {
+                cuda::sparse_cross_entropy_backward_cuda(logits_ptr, targets_cuda.data<int32_t>(), grad_ptr, batch_size_, num_classes_, grad_out_ptr, host_scale, stream);
             } else {
                 throw std::runtime_error("SparseCrossEntropyLossBackward: unsupported target dtype for CUDA");
             }
+        };
+
+        if (logits_2d.dtype() == Dtype::Float32) {
+            dispatch_targets(logits_2d.data<float>(), grad_logits_2d.data<float>(), grad_output_cuda.data<float>());
+        } else if (logits_2d.dtype() == Dtype::Float16) {
+            dispatch_targets(logits_2d.data<float16_t>(), grad_logits_2d.data<float16_t>(), grad_output_cuda.data<float16_t>());
+        } else if (logits_2d.dtype() == Dtype::Bfloat16) {
+            dispatch_targets(logits_2d.data<bfloat16_t>(), grad_logits_2d.data<bfloat16_t>(), grad_output_cuda.data<bfloat16_t>());
         } else {
-            throw std::runtime_error("SparseCrossEntropyLossBackward: only Float32 supported for CUDA");
+            throw std::runtime_error("SparseCrossEntropyLossBackward: unsupported logits dtype for CUDA");
         }
         
         // No sync needed - kernel will complete before next operation uses grad_logits_2d
