@@ -72,3 +72,5 @@ Tensor-Implementations_gau/a.out
 Tensor-Implementations_gau/ftest1
 Tensor-Implementations_gau/promotion_table_test
 Tensor-Implementations_gau/promotion_test
+master_gau/data/
+master_gau/checkpoints/

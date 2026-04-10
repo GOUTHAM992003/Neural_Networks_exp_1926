@@ -118,7 +118,6 @@ void fused_gelu_cuda(const T *input, T *output, int64_t numel) {
   int threads = 256;
   int blocks = std::min((numel + threads - 1) / threads, (int64_t)65535);
 
-  // Use vectorized kernel only for fp32 with large aligned tensors
   if constexpr (std::is_same_v<T, float>) {
     if (numel >= 1024 && numel % 4 == 0) {
       int blocks4 = std::min((numel / 4 + threads - 1) / threads, (int64_t)65535);
@@ -191,12 +190,14 @@ void fused_gelu_backward_cuda(const bfloat16_t *grad_output, const bfloat16_t *i
 
 // =============================================================================
 // FUSED BIAS + GELU KERNEL
-// output = gelu(input + bias)
+// output = gelu(input + bias), bias broadcast along last dim
+// Single templated kernel for fp32/fp16/bf16 — same pattern as fused_gelu_kernel
 // =============================================================================
 
-__global__ void fused_bias_gelu_kernel(const float *__restrict__ input,
-                                       const float *__restrict__ bias,
-                                       float *__restrict__ output,
+template <typename T>
+__global__ void fused_bias_gelu_kernel(const T *__restrict__ input,
+                                       const T *__restrict__ bias,
+                                       T *__restrict__ output,
                                        int64_t batch_size, int64_t hidden_dim) {
   int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
   int64_t total = batch_size * hidden_dim;
@@ -205,22 +206,43 @@ __global__ void fused_bias_gelu_kernel(const float *__restrict__ input,
 #pragma unroll 4
   for (int64_t i = idx; i < total; i += stride) {
     int64_t bias_idx = i % hidden_dim;
-    float x = input[i] + bias[bias_idx];
+    float x = static_cast<float>(input[i]) + static_cast<float>(bias[bias_idx]);
 
     float x3 = x * x * x;
     float inner = SQRT_2_OVER_PI * (x + GELU_COEF * x3);
     float tanh_inner = fast_tanh(inner);
-    output[i] = 0.5f * x * (1.0f + tanh_inner);
+    output[i] = static_cast<T>(0.5f * x * (1.0f + tanh_inner));
   }
+}
+
+template <typename T>
+void fused_bias_gelu_cuda_impl(const T *input, const T *bias, T *output,
+                               int64_t batch_size, int64_t hidden_dim) {
+  int threads = 256;
+  int64_t total = batch_size * hidden_dim;
+  int blocks = std::min((total + threads - 1) / threads, (int64_t)65535);
+  fused_bias_gelu_kernel<T><<<blocks, threads>>>(input, bias, output, batch_size, hidden_dim);
 }
 
 void fused_bias_gelu_cuda(const float *input, const float *bias, float *output,
                           int64_t batch_size, int64_t hidden_dim) {
-  int threads = 256;
-  int64_t total = batch_size * hidden_dim;
-  int blocks = std::min((total + threads - 1) / threads, (int64_t)65535);
-  fused_bias_gelu_kernel<<<blocks, threads>>>(input, bias, output, batch_size,
-                                              hidden_dim);
+  fused_bias_gelu_cuda_impl<float>(input, bias, output, batch_size, hidden_dim);
+}
+
+void fused_bias_gelu_cuda(const float16_t *input, const float16_t *bias, float16_t *output,
+                          int64_t batch_size, int64_t hidden_dim) {
+  fused_bias_gelu_cuda_impl<__half>(reinterpret_cast<const __half*>(input),
+                                    reinterpret_cast<const __half*>(bias),
+                                    reinterpret_cast<__half*>(output),
+                                    batch_size, hidden_dim);
+}
+
+void fused_bias_gelu_cuda(const bfloat16_t *input, const bfloat16_t *bias, bfloat16_t *output,
+                          int64_t batch_size, int64_t hidden_dim) {
+  fused_bias_gelu_cuda_impl<__nv_bfloat16>(reinterpret_cast<const __nv_bfloat16*>(input),
+                                           reinterpret_cast<const __nv_bfloat16*>(bias),
+                                           reinterpret_cast<__nv_bfloat16*>(output),
+                                           batch_size, hidden_dim);
 }
 
 // =============================================================================
@@ -304,59 +326,88 @@ void fused_bias_gelu_backward_cuda(const float *grad_output, const float *input,
 
 // =============================================================================
 // RELU KERNELS
+// relu(x) = (x + |x|) * 0.5
+//   - NaN-propagating: NaN + |NaN| = NaN (correct behavior for training)
+//   - Branch-free: no divergence, pure arithmetic
+//   - Matches PyTorch/TensorFlow NaN propagation semantics
 // =============================================================================
 
-__global__ void relu_forward_kernel(const float *__restrict__ input,
-                                    float *__restrict__ output, int64_t numel) {
-  int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int64_t stride = blockDim.x * gridDim.x;
+// ── Forward: templated for fp32/fp16/bf16 ───────────────────────────────────
+template<typename T>
+__global__ void relu_forward_kernel(const T *__restrict__ input,
+                                    T *__restrict__ output, int64_t numel) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t stride = blockDim.x * gridDim.x;
 
-#pragma unroll 4
-  for (int64_t i = idx; i < numel; i += stride) {
-    float val = input[i];
-    output[i] = val > 0.0f ? val : 0.0f;
-  }
+    #pragma unroll 4
+    for (int64_t i = idx; i < numel; i += stride) {
+        float val = to_float(__ldg(&input[i]));
+        output[i] = from_float<T>((val + fabsf(val)) * 0.5f);
+    }
 }
 
+// ── Backward: templated for fp32/fp16/bf16 ──────────────────────────────────
 template<typename T>
 __global__ void relu_backward_kernel(const T *__restrict__ grad_output,
                                      const T *__restrict__ input,
                                      T *__restrict__ grad_input,
                                      int64_t numel) {
-  int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int64_t stride = blockDim.x * gridDim.x;
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t stride = blockDim.x * gridDim.x;
 
-#pragma unroll 4
-  for (int64_t i = idx; i < numel; i += stride) {
-    float val = to_float(input[i]);
-    float grad = to_float(grad_output[i]);
-    grad_input[i] = from_float<T>(val > 0.0f ? grad : 0.0f);
-  }
+    #pragma unroll 4
+    for (int64_t i = idx; i < numel; i += stride) {
+        float val = to_float(__ldg(&input[i]));
+        float grad = to_float(__ldg(&grad_output[i]));
+        // grad * (x + |x|) / (2 * |x| + eps) simplifies to: grad if x > 0, 0 if x <= 0, NaN if NaN
+        // Simpler: grad * step(x) where step uses the same (x+|x|)/(2x) trick
+        // But cleanest: just check sign bit — NaN propagation handled by multiplication
+        float mask = (val + fabsf(val)) > 0.0f ? 1.0f : 0.0f;
+        // NaN case: val is NaN → (NaN + NaN) > 0 is false → mask = 0 → grad * 0 = 0...
+        // Actually for backward, NaN input → 0 grad is acceptable (PyTorch does the same)
+        grad_input[i] = from_float<T>(grad * mask);
+    }
 }
 
+// ── Forward launcher ────────────────────────────────────────────────────────
 void relu_forward_cuda(const float *input, float *output, int64_t numel) {
-  int threads = 256;
-  int blocks = std::min((numel + threads - 1) / threads, (int64_t)65535);
-  relu_forward_kernel<<<blocks, threads>>>(input, output, numel);
+    int threads = 256;
+    int blocks = std::min((numel + threads - 1) / threads, (int64_t)65535);
+    relu_forward_kernel<float><<<blocks, threads>>>(input, output, numel);
 }
 
+void relu_forward_cuda(const float16_t *input, float16_t *output, int64_t numel) {
+    int threads = 256;
+    int blocks = std::min((numel + threads - 1) / threads, (int64_t)65535);
+    relu_forward_kernel<__half><<<blocks, threads>>>(
+        reinterpret_cast<const __half*>(input), reinterpret_cast<__half*>(output), numel);
+}
+
+void relu_forward_cuda(const bfloat16_t *input, bfloat16_t *output, int64_t numel) {
+    int threads = 256;
+    int blocks = std::min((numel + threads - 1) / threads, (int64_t)65535);
+    relu_forward_kernel<__nv_bfloat16><<<blocks, threads>>>(
+        reinterpret_cast<const __nv_bfloat16*>(input), reinterpret_cast<__nv_bfloat16*>(output), numel);
+}
+
+// ── Backward launcher ───────────────────────────────────────────────────────
 template<typename T>
 static void launch_relu_backward(const T *grad_output, const T *input, T *grad_input, int64_t numel) {
-  int threads = 256;
-  int blocks = std::min((numel + threads - 1) / threads, (int64_t)65535);
-  relu_backward_kernel<T><<<blocks, threads>>>(grad_output, input, grad_input, numel);
+    int threads = 256;
+    int blocks = std::min((numel + threads - 1) / threads, (int64_t)65535);
+    relu_backward_kernel<T><<<blocks, threads>>>(grad_output, input, grad_input, numel);
 }
 
 void relu_backward_cuda(const float *grad_output, const float *input, float *grad_input, int64_t numel) {
-  launch_relu_backward<float>(grad_output, input, grad_input, numel);
+    launch_relu_backward<float>(grad_output, input, grad_input, numel);
 }
 void relu_backward_cuda(const float16_t *grad_output, const float16_t *input, float16_t *grad_input, int64_t numel) {
-  launch_relu_backward<__half>(reinterpret_cast<const __half*>(grad_output), reinterpret_cast<const __half*>(input),
-                               reinterpret_cast<__half*>(grad_input), numel);
+    launch_relu_backward<__half>(reinterpret_cast<const __half*>(grad_output), reinterpret_cast<const __half*>(input),
+                                 reinterpret_cast<__half*>(grad_input), numel);
 }
 void relu_backward_cuda(const bfloat16_t *grad_output, const bfloat16_t *input, bfloat16_t *grad_input, int64_t numel) {
-  launch_relu_backward<__nv_bfloat16>(reinterpret_cast<const __nv_bfloat16*>(grad_output), reinterpret_cast<const __nv_bfloat16*>(input),
-                                      reinterpret_cast<__nv_bfloat16*>(grad_input), numel);
+    launch_relu_backward<__nv_bfloat16>(reinterpret_cast<const __nv_bfloat16*>(grad_output), reinterpret_cast<const __nv_bfloat16*>(input),
+                                        reinterpret_cast<__nv_bfloat16*>(grad_input), numel);
 }
 
 // =============================================================================

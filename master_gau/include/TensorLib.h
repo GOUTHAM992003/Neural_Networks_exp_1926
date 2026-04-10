@@ -17,6 +17,7 @@
 #include "dtype/Types.h"
 
 // Operations
+#include "ops/UnaryOps/Activations.h"
 #include "ops/UnaryOps/Arithmetics.h"
 #include "ops/UnaryOps/Exponents.h"
 #include "ops/UnaryOps/Reduction.h"

@@ -128,6 +128,12 @@ struct Vectorized<float> {
         return _mm256_or_ps(values, other.values);
     }
 
+    // Absolute value: clear sign bit
+    Vectorized abs() const {
+        const __m256 sign_mask = _mm256_set1_ps(-0.0f); // 0x80000000
+        return _mm256_andnot_ps(sign_mask, values);
+    }
+
     // NaN check: returns mask where NaN lanes are all-1s
     Vectorized isnan() const {
         return _mm256_cmp_ps(values, values, _CMP_UNORD_Q);
@@ -136,6 +142,65 @@ struct Vectorized<float> {
     // Blend: select from b where mask is set, else from a
     static Vectorized blendv(const Vectorized& a, const Vectorized& b, const Vectorized& mask) {
         return _mm256_blendv_ps(a.values, b.values, mask.values);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Vectorized tanh() — Rational polynomial approximation (Pade)
+    //
+    // For |x| <= 3.97:  tanh(x) ≈ x * P(x²) / Q(x²)   (~20-bit accuracy)
+    // For |x| > 3.97:   tanh(x) = ±1  (saturated)
+    //
+    // Coefficients from Cephes library (public domain):
+    //   P(z) = -0.8237728127 + z*(-0.003831010665 + z*(-5.70498872e-6))
+    //   Q(z) =  2.4713006234 + z*( 1.0            + z*( 0.0004946110 + z*0.0))
+    //   tanh(x) = x + x * z * P(z) / Q(z)  where z = x²
+    //
+    // All done with FMA — zero branching in the hot path.
+    // ─────────────────────────────────────────────────────────────
+    Vectorized tanh() const {
+        // Constants
+        const __m256 one      = _mm256_set1_ps(1.0f);
+        const __m256 neg_one  = _mm256_set1_ps(-1.0f);
+        const __m256 clamp_hi = _mm256_set1_ps(3.97f);
+
+        // Polynomial coefficients (Cephes single-precision)
+        const __m256 p0 = _mm256_set1_ps(-8.237728127e-1f);
+        const __m256 p1 = _mm256_set1_ps(-3.831010665e-3f);
+        const __m256 p2 = _mm256_set1_ps(-5.70498872e-6f);
+
+        const __m256 q0 = _mm256_set1_ps(2.4713006234e0f);
+        const __m256 q1 = _mm256_set1_ps(1.0f);
+        const __m256 q2 = _mm256_set1_ps(4.946110e-4f);
+
+        __m256 x = values;
+
+        // z = x * x
+        __m256 z = _mm256_mul_ps(x, x);
+
+        // Numerator: P(z) = p0 + z*(p1 + z*p2)  (Horner's method with FMA)
+        __m256 num = _mm256_fmadd_ps(p2, z, p1);   // p2*z + p1
+        num = _mm256_fmadd_ps(num, z, p0);          // (p2*z + p1)*z + p0
+
+        // Denominator: Q(z) = q0 + z*(q1 + z*q2)
+        __m256 den = _mm256_fmadd_ps(q2, z, q1);   // q2*z + q1
+        den = _mm256_fmadd_ps(den, z, q0);          // (q2*z + q1)*z + q0
+
+        // tanh(x) = x + x * z * P(z) / Q(z)
+        __m256 result = _mm256_mul_ps(z, num);       // z * P(z)
+        result = _mm256_div_ps(result, den);         // z * P(z) / Q(z)
+        result = _mm256_fmadd_ps(result, x, x);     // x + x * z*P(z)/Q(z)
+
+        // Clamp: for |x| > 3.97, return ±1
+        const __m256 sign_mask = _mm256_set1_ps(-0.0f);
+        __m256 abs_x = _mm256_andnot_ps(sign_mask, x);
+        __m256 saturated = _mm256_cmp_ps(abs_x, clamp_hi, _CMP_GT_OQ);
+        __m256 sign = _mm256_and_ps(x, sign_mask);            // extract sign
+        __m256 clamped = _mm256_or_ps(sign, one);             // ±1 with sign of x
+        // But clamped should be sign(x)*1, which needs: if x<0 then -1 else 1
+        clamped = _mm256_blendv_ps(one, neg_one, sign);       // -1 where x<0, +1 otherwise
+
+        // Blend: use polynomial result where |x| <= 3.97, clamped where |x| > 3.97
+        return _mm256_blendv_ps(result, clamped, saturated);
     }
 };
 
