@@ -178,6 +178,49 @@ Same pattern as `autograd::sum()` → `reduce_sum()` in ReductionOps.
 
 ---
 
+## All 8 Kernel Paths — Optimization Status
+
+| # | Kernel Path | Before our work | After our work | What we did | Status |
+|---|-------------|----------------|----------------|-------------|--------|
+| 1 | **gelu_forward CPU** | Inline 8-pass tensor ops in autograd wrapper (`ActivationOps.cpp` lambda). No fusion, no SIMD. | Fused single-pass AVX2 kernel in `Activations.cpp:196-276`. Vectorized tanh, FMA, 2x unroll, OpenMP, fp16/bf16 F16C paths. | Extracted from autograd, wrote optimized kernel | **Fully optimized** |
+| 2 | **bias_gelu_forward CPU** | Didn't exist for CPU. GPU-only (`throw` on CPU). | Fused single-pass AVX2 kernel in `Activations.cpp:572-700`. Bias+GeLU in one pass, same 7 optimizations as gelu, fp16/bf16 paths. | Created from scratch | **New + optimized** |
+| 3 | **gelu_forward GPU** | Already had `fused_gelu_kernel_vectorized` (float4, `fast_tanh` PTX) + scalar template for fp16/bf16. In `ActivationKernels.cu:83-114`. | Same code. Tried `__ldg`, helper functions, separate typed kernels — all slower. Reverted. Just cleaned up declarations in `.h`. | No kernel changes | **Unchanged (already good)** |
+| 4 | **bias_gelu_forward GPU** | Existed as fp32-only non-template scalar kernel with `i%hidden_dim`. In `ActivationKernels.cu:197-215`. | Templated for fp16/bf16 support (`fused_bias_gelu_kernel<T>`). Same scalar pattern — template doesn't hurt perf for fp32. | Added fp16/bf16 dtype support | **Added fp16/bf16, same perf** |
+| 5 | **gelu_backward CPU** | Inline 8-pass tensor ops in autograd wrapper (`ActivationBackward.cpp:92-109`). No fusion, no SIMD. | Fused AVX2 kernel in `Activations.cpp:833-912`. Same optimizations: vectorized tanh, FMA, OpenMP, fp16/bf16 F16C. | Extracted from autograd, wrote optimized kernel | **Fully optimized** |
+| 6 | **bias_gelu_backward CPU** | Didn't exist for CPU. GPU-only. | Fused AVX2 kernel in `Activations.cpp:1125-1190`. Thread-local bias accumulators to avoid contention. Single pass computes grad_input + accumulates grad_bias. | Created from scratch | **New + optimized** |
+| 7 | **gelu_backward GPU** | Scalar template kernel with `fast_tanh`, `#pragma unroll 4`, fp32/fp16/bf16. In `ActivationKernels.cu:144-170`. | Same code. No changes. | No changes | **Unchanged** |
+| 8 | **bias_gelu_backward GPU** | fp32-only, two-pass design: Pass 1 element-parallel grad_input, Pass 2 shared-mem bias reduction. In `ActivationKernels.cu:236-303`. | Same code. No changes. | No changes | **Unchanged** |
+
+### CPU optimizations applied (kernels 1, 2, 5, 6):
+
+| # | Optimization | Applied to |
+|---|-------------|-----------|
+| 1 | Single-pass fused kernel (zero temporaries) | All 4 CPU kernels |
+| 2 | AVX2 SIMD (`Vectorized<float>`, 8 floats/vector) | All 4 CPU kernels |
+| 3 | Vectorized tanh polynomial (`Vectorized<float>::tanh()`, Cephes coefficients) | gelu_fwd, bias_gelu_fwd, gelu_bwd, bias_gelu_bwd |
+| 4 | FMA (`Vec::fmadd` for `kappa*x³ + x`) | All 4 CPU kernels |
+| 5 | 2x loop unrolling (16 floats/iteration) | gelu_fwd, bias_gelu_fwd |
+| 6 | OpenMP parallelization (threshold: 16384 elements) | All 4 CPU kernels |
+| 7 | fp16/bf16 F16C hardware paths (`load_fp16_as_float`/`store_float_as_fp16`) | gelu_fwd, bias_gelu_fwd, gelu_bwd |
+
+### GPU kernels unchanged (kernels 3, 4, 7, 8):
+
+Already optimized with:
+- `fast_tanh` PTX hardware instruction (`tanh.approx.f32`)
+- `float4` vectorized memory access (fp32 gelu forward only)
+- `#pragma unroll 4` on all kernels
+- `__restrict__` pointers for alias-free optimization
+- Grid-stride loops for arbitrary tensor sizes
+
+### Training script (`gpt2_attn_fixed.cpp`):
+
+- Uses `autograd::gelu(h)` at line 227 — calls our optimized `gelu_forward()` internally
+- Does **NOT** use `fused_bias_gelu` — bias is added inside `fc_up.forward(h)` before gelu
+- Tensor size at gelu: **[8, 1024, 1536]** (B=8, T=1024, 4×n_embd=1536) = 12.6M elements
+- Profiling confirmed: same kernel instances, same kernel names, ~4% timing variance (within GPU clock noise)
+
+---
+
 ## Deleted legacy
 
 - `include/mlp/` and `src/mlp-blocks/` — unused early code with bugs, training uses `autograd::gelu()` exclusively.
