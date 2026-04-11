@@ -418,6 +418,230 @@ The `LayerNormBackward::apply()` in `NormalizationBackward.cpp` is called **by t
 
 ## PART 6 — Restructuring & Optimization (Completed)
 
+### TL;DR — Architecture Visual
+
+```
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                        BEFORE (Monolithic)                                  ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║                                                                              ║
+║   NormalizationOps.cpp (168 lines — MIXED EVERYTHING)                       ║
+║   ┌─────────────────────────────────────────────────────────┐               ║
+║   │  autograd::layer_norm()                                  │               ║
+║   │  ├─ Tensor allocation (output, mean, rstd)              │               ║
+║   │  ├─ GPU dispatch → cuda::layer_norm_forward_cuda()      │               ║
+║   │  ├─ ▓▓▓ CPU KERNEL EMBEDDED AS LAMBDA ▓▓▓              │  ← PROBLEM    ║
+║   │  │   └─ 3 scalar loops, no SIMD, no Welford            │               ║
+║   │  └─ Autograd graph wiring                               │               ║
+║   └─────────────────────────────────────────────────────────┘               ║
+║                                                                              ║
+║   NormalizationBackward.cpp (141 lines — MIXED EVERYTHING)                  ║
+║   ┌─────────────────────────────────────────────────────────┐               ║
+║   │  LayerNormBackward::apply()                              │               ║
+║   │  ├─ GPU dispatch → cuda::layer_norm_backward_cuda()     │               ║
+║   │  └─ ▓▓▓ CPU KERNEL EMBEDDED AS LAMBDA ▓▓▓              │  ← PROBLEM    ║
+║   │      └─ Serial gamma/beta, 4 scalar loops, no SIMD     │               ║
+║   └─────────────────────────────────────────────────────────┘               ║
+║                                                                              ║
+║   Problems: Can't optimize kernels independently. Can't test                ║
+║   math without autograd. Can't reuse kernels. Mixed concerns.               ║
+║                                                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                         AFTER (3-Layer Separation)                          ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║                                                                              ║
+║   LAYER 1: nn Module (parameter holder)                                     ║
+║   ┌──────────────────────────────────────┐                                  ║
+║   │  nn::LayerNorm  │  nn::RMSNorm       │  ← NN.h + LayerNorm.cpp         ║
+║   │  owns γ,β,eps   │  owns γ,eps        │                                  ║
+║   │  forward() ─────┼──forward() ────────┼──→ calls autograd wrapper        ║
+║   └──────────────────────────────────────┘                                  ║
+║           │                    │                                             ║
+║           ▼                    ▼                                             ║
+║   LAYER 2: Autograd wrapper (graph only, NO computation)                    ║
+║   ┌──────────────────────────────────────┐                                  ║
+║   │  autograd::layer_norm()              │  ← NormalizationOps.cpp (90 ln)  ║
+║   │  autograd::rms_norm()                │                                  ║
+║   │  ├─ calls pure math forward ─────────┼──→ LAYER 3                      ║
+║   │  └─ wires autograd graph (edges,     │                                  ║
+║   │     grad_fn, saved tensors)          │                                  ║
+║   └──────────────────────────────────────┘                                  ║
+║   ┌──────────────────────────────────────┐                                  ║
+║   │  LayerNormBackward::apply()          │  ← NormalizationBackward.cpp     ║
+║   │  RMSNormBackward::apply()            │    (45 lines)                    ║
+║   │  └─ calls pure math backward ────────┼──→ LAYER 3                      ║
+║   └──────────────────────────────────────┘                                  ║
+║           │                                                                  ║
+║           ▼                                                                  ║
+║   LAYER 3: Pure math engine (all computation lives here)                    ║
+║   ┌──────────────────────────────────────────────────────────────┐          ║
+║   │  Normalizations.h  (declarations)                             │          ║
+║   │  Normalizations.cpp (CPU kernels + CPU/GPU dispatch)          │          ║
+║   │                                                               │          ║
+║   │  ┌─ layer_norm_forward() ──────────────────────────────────┐ │          ║
+║   │  │  CPU: Welford one-pass + AVX2 SIMD    ← 12.3x faster  │ │          ║
+║   │  │  GPU: cuda::layer_norm_forward_cuda() ← same kernel    │ │          ║
+║   │  └─────────────────────────────────────────────────────────┘ │          ║
+║   │  ┌─ layer_norm_backward() ─────────────────────────────────┐ │          ║
+║   │  │  CPU: OMP parallel + AVX2 SIMD        ← 5.6x faster   │ │          ║
+║   │  │  GPU: float4 vectorized kernels       ← ~20% faster    │ │          ║
+║   │  └─────────────────────────────────────────────────────────┘ │          ║
+║   │  ┌─ rms_norm_forward() ───────────────────────────────────┐  │          ║
+║   │  │  CPU: one-pass sum-of-squares + AVX2   ← NEW           │  │          ║
+║   │  │  GPU: same kernel, rms_norm=true       ← NEW           │  │          ║
+║   │  └────────────────────────────────────────────────────────┘  │          ║
+║   │  ┌─ rms_norm_backward() ──────────────────────────────────┐  │          ║
+║   │  │  CPU: OMP parallel gamma + per-row dx  ← NEW           │  │          ║
+║   │  │  GPU: dedicated gamma + input kernels  ← NEW           │  │          ║
+║   │  └────────────────────────────────────────────────────────┘  │          ║
+║   └──────────────────────────────────────────────────────────────┘          ║
+║           │                                                                  ║
+║           ▼                                                                  ║
+║   CUDA Kernels (raw hardware, no Tensor concept)                            ║
+║   ┌──────────────────────────────────────────────────────────────┐          ║
+║   │  LayerNormKernels.cu                                          │          ║
+║   │                                                               │          ║
+║   │  norm_forward_kernel<T, AccT, bool rms_norm>                  │          ║
+║   │  ├─ rms_norm=false → LayerNorm (Welford + float4 + shfl)    │          ║
+║   │  └─ rms_norm=true  → RMSNorm  (sum-of-sq + float4 + shfl)  │          ║
+║   │                                                               │          ║
+║   │  ln_backward_gamma_beta_kernel<T>  (column-reduce, 2D block) │          ║
+║   │  ln_backward_input_kernel<T>       (row-reduce, float4 vec)  │          ║
+║   │  rms_backward_gamma_kernel<T>      (column-reduce, no beta)  │          ║
+║   │  rms_backward_input_kernel<T>      (row-reduce, rstd³)       │          ║
+║   └──────────────────────────────────────────────────────────────┘          ║
+║                                                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                     CALL FLOW — LayerNorm Forward                           ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║                                                                              ║
+║   User code:  model.forward(x)                                              ║
+║       │                                                                      ║
+║       ▼                                                                      ║
+║   nn::LayerNorm::forward(input)              [LayerNorm.cpp:25]             ║
+║       │  return autograd::layer_norm(input, weight, bias, shape, eps)       ║
+║       ▼                                                                      ║
+║   autograd::layer_norm(...)                  [NormalizationOps.cpp:18]      ║
+║       │  auto result = layer_norm_forward(input, weight, bias, shape, eps)  ║
+║       │  // wire autograd graph (grad_fn, edges)                            ║
+║       │  return result.output                                               ║
+║       ▼                                                                      ║
+║   layer_norm_forward(...)                    [Normalizations.cpp]           ║
+║       │  if (input.device().is_cuda())                                      ║
+║       │      cuda::layer_norm_forward_cuda(...)   ──→  GPU kernel           ║
+║       │  else                                                               ║
+║       │      cpu_layer_norm_forward_impl<T>(...)  ──→  AVX2 + Welford      ║
+║       │  return {output, mean, rstd}                                        ║
+║       ▼                                                                      ║
+║   [GPU] norm_forward_kernel<float, float, false><<<rows, 256>>>(...)        ║
+║         Phase 1: float4 vectorized Welford accumulation                     ║
+║         Phase 2: Convert to Welford state                                   ║
+║         Phase 3: Warp shuffle reduction                                     ║
+║         Phase 4: Shared memory block reduction                              ║
+║         Phase 5: Extract mean, rstd                                         ║
+║         Phase 6: float4 vectorized normalize + gamma/beta                   ║
+║                                                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                     CALL FLOW — LayerNorm Backward                          ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║                                                                              ║
+║   User code:  loss.backward()                                               ║
+║       │                                                                      ║
+║       ▼                                                                      ║
+║   Autograd Engine walks graph, finds LayerNormBackward node                 ║
+║       │                                                                      ║
+║       ▼                                                                      ║
+║   LayerNormBackward::apply(grads)            [NormalizationBackward.cpp:12] ║
+║       │  auto result = layer_norm_backward(grad, input, mean, rstd, ...)   ║
+║       │  return {result.grad_input, result.grad_weight, result.grad_bias}  ║
+║       ▼                                                                      ║
+║   layer_norm_backward(...)                   [Normalizations.cpp]           ║
+║       │  if (cuda)                                                          ║
+║       │      cuda::layer_norm_backward_cuda(...)                            ║
+║       │  else                                                               ║
+║       │      cpu_layer_norm_backward_impl<T>(...)                           ║
+║       ▼                                                                      ║
+║   [GPU] Two kernels launched:                                               ║
+║                                                                              ║
+║   KERNEL A: ln_backward_gamma_beta_kernel    ← reduces ACROSS rows          ║
+║     dim3(32,8) blocks, column tiles of 32                                   ║
+║     Produces: grad_gamma[cols], grad_beta[cols]                             ║
+║                                                                              ║
+║   KERNEL B: ln_backward_input_kernel         ← reduces WITHIN each row      ║
+║     <<<rows, 256/512>>> blocks                                              ║
+║     Pass A: float4 accumulate sum1, sum2 → warp+block reduce               ║
+║     Pass B: float4 compute grad_x per element                              ║
+║     Produces: grad_x[rows, cols]                                            ║
+║                                                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                   LAYERNORM vs RMSNORM — Math Difference                    ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║                                                                              ║
+║   LayerNorm (3 stats):                                                      ║
+║   ┌────────────────────────────────────────────────────────┐                ║
+║   │  μ = mean(x)                          ← compute mean  │                ║
+║   │  σ = sqrt(mean((x - μ)²) + ε)        ← variance       │                ║
+║   │  y = γ · (x - μ) / σ + β             ← center + scale │                ║
+║   │       ▲         ▲           ▲                          │                ║
+║   │    gamma    subtract    add beta                       │                ║
+║   │              mean                                      │                ║
+║   └────────────────────────────────────────────────────────┘                ║
+║   Parameters: gamma (γ) + beta (β)                                          ║
+║   Used in: Original Transformers, GPT-2, BERT                               ║
+║                                                                              ║
+║   RMSNorm (1 stat):                                                         ║
+║   ┌────────────────────────────────────────────────────────┐                ║
+║   │  rms = sqrt(mean(x²) + ε)            ← just RMS       │                ║
+║   │  y = γ · x / rms                     ← scale only     │                ║
+║   │       ▲                                                │                ║
+║   │    gamma only                                          │                ║
+║   │    NO mean, NO beta                                    │                ║
+║   └────────────────────────────────────────────────────────┘                ║
+║   Parameters: gamma (γ) only                                                ║
+║   Used in: LLaMA, Mistral, Gemma, all modern LLMs                          ║
+║                                                                              ║
+║   GPU Implementation: SAME kernel, bool template                            ║
+║   ┌──────────────────────────────────────────────────┐                      ║
+║   │  norm_forward_kernel<T, AccT, rms_norm>          │                      ║
+║   │  rms_norm=false: accumulate sum+sq → Welford     │  ← LayerNorm PTX    ║
+║   │  rms_norm=true:  accumulate sq only → simple sum │  ← RMSNorm PTX     ║
+║   │  if constexpr → compiled away, ZERO overhead     │                      ║
+║   └──────────────────────────────────────────────────┘                      ║
+║                                                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                   SPEEDUP SUMMARY — Training Size [8,1024,384]              ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║                                                                              ║
+║   CPU Forward:   ████████████░  12.3x faster  (1.728ms → 0.141ms)          ║
+║   CPU Backward:  █████░         5.6x faster   (25.94ms → 4.637ms)          ║
+║   GPU Forward:   ░              ~same          (0.113ms → 0.106ms)          ║
+║   GPU Backward:  █░             ~20% faster    (kernel: ~0.36 → 0.29ms)    ║
+║                                                                              ║
+║   vs PyTorch:    RMS Fwd GPU  ███░  3.7x faster                            ║
+║                  RMS Bwd GPU  ████░ 4.0x faster                             ║
+║                  LN Bwd GPU   █░    1.16x faster                            ║
+║                                                                              ║
+║   vs TensorFlow: LN Fwd GPU  ████░ 4.4x faster                            ║
+║                   LN Bwd GPU  █████████░ 9.2x faster                       ║
+║                                                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+```
+
 ### Architecture Change: Separated Math Engine from Autograd
 
 Previously, CPU forward/backward kernels were **embedded as lambdas** inside `NormalizationOps.cpp` (autograd wrapper) and `NormalizationBackward.cpp`. This mixed computation with autograd graph wiring — unlike how PyTorch separates them and how our own GELU/Activation ops are structured.
