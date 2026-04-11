@@ -20,6 +20,7 @@
 #include "ops/UnaryOps/Activations.h"
 #include "ops/UnaryOps/Arithmetics.h"
 #include "ops/UnaryOps/Exponents.h"
+#include "ops/UnaryOps/Normalizations.h"
 #include "ops/UnaryOps/Reduction.h"
 #include "ops/UnaryOps/Trigonometry.h"
 

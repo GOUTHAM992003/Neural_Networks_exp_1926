@@ -83,9 +83,19 @@ public:
     Tensor weight;
     Tensor bias;
     float eps;
-    
+
     LayerNorm(int normalized_shape, float eps = 1e-5);
     LayerNorm() = default;
+    Tensor forward(const Tensor& input) override;
+};
+
+class RMSNorm : public Module {
+public:
+    Tensor weight;
+    float eps;
+
+    RMSNorm(int normalized_shape, float eps = 1e-5);
+    RMSNorm() = default;
     Tensor forward(const Tensor& input) override;
 };
 
