@@ -744,6 +744,7 @@ LayerNormBackwardResult layer_norm_backward(
     int normalized_shape,
     float eps)
 {
+    (void)eps;
     int64_t total_ele = input.numel();
     int64_t cols = normalized_shape;
     int64_t rows = total_ele / cols;
@@ -763,19 +764,19 @@ LayerNormBackwardResult layer_norm_backward(
         float* gb_ptr = grad_bias.data<float>();
 
         if (grad_output.dtype() == Dtype::Float32) {
-            float* gamma = weight.is_valid() ? weight.data<float>() : nullptr;
+            const float* gamma = weight.is_valid() ? weight.data<float>() : nullptr;
             cuda::layer_norm_backward_cuda(
                 grad_output.data<float>(), input.data<float>(),
                 mean.data<float>(), rstd.data<float>(), gamma,
                 grad_input.data<float>(), gw_ptr, gb_ptr, rows, cols);
         } else if (grad_output.dtype() == Dtype::Float16) {
-            float16_t* gamma = weight.is_valid() ? weight.data<float16_t>() : nullptr;
+            const float16_t* gamma = weight.is_valid() ? weight.data<float16_t>() : nullptr;
             cuda::layer_norm_backward_cuda(
                 grad_output.data<float16_t>(), input.data<float16_t>(),
                 mean.data<float>(), rstd.data<float>(), gamma,
                 grad_input.data<float16_t>(), gw_ptr, gb_ptr, rows, cols);
         } else if (grad_output.dtype() == Dtype::Bfloat16) {
-            bfloat16_t* gamma = weight.is_valid() ? weight.data<bfloat16_t>() : nullptr;
+            const bfloat16_t* gamma = weight.is_valid() ? weight.data<bfloat16_t>() : nullptr;
             cuda::layer_norm_backward_cuda(
                 grad_output.data<bfloat16_t>(), input.data<bfloat16_t>(),
                 mean.data<float>(), rstd.data<float>(), gamma,
@@ -886,6 +887,7 @@ RMSNormBackwardResult rms_norm_backward(
     int normalized_shape,
     float eps)
 {
+    (void)eps;
     int64_t cols = normalized_shape;
     int64_t rows = input.numel() / cols;
 
@@ -901,19 +903,19 @@ RMSNormBackwardResult rms_norm_backward(
         float* gw_ptr = grad_weight.data<float>();
 
         if (grad_output.dtype() == Dtype::Float32) {
-            float* gamma = weight.is_valid() ? weight.data<float>() : nullptr;
+            const float* gamma = weight.is_valid() ? weight.data<float>() : nullptr;
             cuda::rms_norm_backward_cuda(
                 grad_output.data<float>(), input.data<float>(),
                 rstd.data<float>(), gamma,
                 grad_input.data<float>(), gw_ptr, rows, cols);
         } else if (grad_output.dtype() == Dtype::Float16) {
-            float16_t* gamma = weight.is_valid() ? weight.data<float16_t>() : nullptr;
+            const float16_t* gamma = weight.is_valid() ? weight.data<float16_t>() : nullptr;
             cuda::rms_norm_backward_cuda(
                 grad_output.data<float16_t>(), input.data<float16_t>(),
                 rstd.data<float>(), gamma,
                 grad_input.data<float16_t>(), gw_ptr, rows, cols);
         } else if (grad_output.dtype() == Dtype::Bfloat16) {
-            bfloat16_t* gamma = weight.is_valid() ? weight.data<bfloat16_t>() : nullptr;
+            const bfloat16_t* gamma = weight.is_valid() ? weight.data<bfloat16_t>() : nullptr;
             cuda::rms_norm_backward_cuda(
                 grad_output.data<bfloat16_t>(), input.data<bfloat16_t>(),
                 rstd.data<float>(), gamma,

@@ -530,3 +530,135 @@ __global__ void norm_forward_kernel(...)
 | Fixed 256 threads on GPU | Suboptimal for very small cols | Add `threads = min(256, nextPow2(cols))` |
 | Block reduction serial (thread 0 loops warps) | Minor latency | Use tree reduction for large block counts |
 | No `aligned_grid` fast path in gamma/beta backward | Extra boundary check instructions | Template `aligned_grid` bool |
+
+---
+
+## PART 7 — Benchmark Results
+
+### Test Configuration
+
+| Setting | Value |
+|---|---|
+| **Hardware** | NVIDIA GeForce RTX 3060 (sm_86), 20 CPU threads |
+| **Compiler** | g++ (C++20, -O3, -mavx2, -mfma), nvcc (CUDA 13.0, --use_fast_math, sm_86) |
+| **Dtype** | Float32 for all benchmarks |
+| **Warmup** | 5 iterations (discarded) |
+| **Timed iterations** | 50 (scaling test), 100 (framework comparison) |
+| **CUDA sync** | `cudaDeviceSynchronize()` before start and after end of timed section |
+| **Seeds** | 1337 (input tensors), 42 (bias/gamma), 99 (grad tensors) — deterministic |
+| **Training size** | [8, 1024, 384] = 3.1M elements (from `gpt2_attn_fixed.cpp`: batch=8, seq=1024, n_embd=384) |
+
+### Test Files
+
+| File | Purpose | What it measures |
+|---|---|---|
+| `layernorm_scaling_test.cpp` | NEW code, 7 tensor sizes | `layer_norm_forward/backward` + `rms_norm_forward/backward` (pure math, no autograd overhead) |
+| `layernorm_before_opt_test.cpp` | OLD code baseline (for colleague's unmodified repo) | `autograd::layer_norm()` forward + full `.backward()` (includes autograd graph creation) |
+| `bench_pytorch_layernorm.py` | PyTorch 2.7.1+cu126 comparison | `F.layer_norm`, `F.rms_norm`, forward + backward, same shape/seed |
+| `bench_tensorflow_layernorm.py` | TensorFlow 2.19.0 comparison | `keras.layers.LayerNormalization`, manual RMSNorm, same shape/seed |
+
+### Tensor Sizes Tested (Scaling)
+
+| Label | Shape | Elements | Notes |
+|---|---|---|---|
+| Tiny | [1, 128, 128] | 16K | Small model test |
+| Small | [1, 512, 512] | 262K | |
+| Medium | [8, 1024, 384] | 3.1M | **GPT-2 training size** |
+| GPT2 | [8, 1024, 768] | 6.3M | Standard GPT-2 hidden |
+| Large | [32, 1024, 768] | 25.2M | Larger batch |
+| XLarge | [64, 1024, 768] | 50.3M | |
+| Huge | [64, 2048, 1024] | 134.2M | Stress test |
+
+---
+
+### Before vs After — Training Size [8, 1024, 384]
+
+Tested on same machine (RTX 3060). OLD = colleague's unmodified repo with `autograd::layer_norm()`. NEW = optimized `layer_norm_forward/backward()`.
+
+| Operation | **OLD** | **NEW** | **Speedup** |
+|---|---|---|---|
+| **CPU Forward** | 1.728ms | 0.141ms | **12.3x faster** |
+| **CPU Backward** | 25.940ms | 4.637ms | **5.6x faster** |
+| **GPU Forward** | 0.113ms | 0.106ms | ~1.0x (same kernel) |
+| **GPU Backward** (autograd path) | 0.866ms | 0.799ms | ~1.1x |
+| **GPU Backward** (kernel only) | N/A | 0.292ms | — |
+
+**Why GPU forward is unchanged**: The GPU forward kernel (`norm_forward_kernel<float, float, false>`) generates identical PTX to the old `layer_norm_forward_kernel<float, float>`. Only the template was extended with `bool rms_norm`, which compiles away for `false`.
+
+**Why GPU backward autograd path shows modest improvement**: The 0.866→0.799ms measurement includes autograd overhead (~0.5ms: graph creation, tensor allocation, engine dispatch). The actual kernel speedup from float4 vectorization is visible in kernel-only measurement (0.292ms).
+
+**Why CPU wins are massive**: Old CPU code had zero SIMD (pure scalar loops) and serial gamma/beta accumulation. New code has AVX2 8-wide SIMD + Welford one-pass + OMP parallel reduction.
+
+---
+
+### Full Scaling Results — NEW Code (LayerNorm)
+
+**Forward (pure math, no autograd):**
+
+| Size | CPU (ms) | GPU (ms) | GPU Speedup |
+|---|---|---|---|
+| Tiny [1,128,128] = 16K | 0.046 | 0.003 | 15.3x |
+| Small [1,512,512] = 262K | 0.025 | 0.008 | 3.1x |
+| Medium [8,1024,384] = 3.1M | 0.133 | 0.108 | 1.2x |
+| GPT2 [8,1024,768] = 6.3M | 0.283 | 0.158 | 1.8x |
+| Large [32,1024,768] = 25.2M | 7.270 | 0.624 | 11.7x |
+| XLarge [64,1024,768] = 50.3M | 13.304 | 1.264 | 10.5x |
+| Huge [64,2048,1024] = 134.2M | 32.128 | 3.620 | 8.9x |
+
+**Backward (pure math, no autograd):**
+
+| Size | CPU (ms) | GPU (ms) | GPU Speedup |
+|---|---|---|---|
+| Tiny [1,128,128] = 16K | 0.119 | 0.017 | 7.0x |
+| Small [1,512,512] = 262K | 0.557 | 0.030 | 18.6x |
+| Medium [8,1024,384] = 3.1M | 4.853 | 0.305 | 15.9x |
+| GPT2 [8,1024,768] = 6.3M | 10.554 | 0.466 | 22.6x |
+| Large [32,1024,768] = 25.2M | 61.671 | 1.891 | 32.6x |
+| XLarge [64,1024,768] = 50.3M | 121.892 | 3.803 | 32.1x |
+| Huge [64,2048,1024] = 134.2M | 319.742 | 9.962 | 32.1x |
+
+---
+
+### Full Scaling Results — NEW Code (RMSNorm)
+
+**Forward:**
+
+| Size | CPU (ms) | GPU (ms) | GPU Speedup |
+|---|---|---|---|
+| Tiny [1,128,128] = 16K | 0.033 | 0.003 | 11.0x |
+| Small [1,512,512] = 262K | 0.024 | 0.006 | 4.0x |
+| Medium [8,1024,384] = 3.1M | 0.071 | 0.088 | 0.8x (CPU wins at this size) |
+| GPT2 [8,1024,768] = 6.3M | 0.213 | 0.157 | 1.4x |
+| Large [32,1024,768] = 25.2M | 8.393 | 0.653 | 12.9x |
+| XLarge [64,1024,768] = 50.3M | 14.122 | 1.328 | 10.6x |
+| Huge [64,2048,1024] = 134.2M | 31.567 | 3.591 | 8.8x |
+
+**Backward:**
+
+| Size | CPU (ms) | GPU (ms) | GPU Speedup |
+|---|---|---|---|
+| Tiny [1,128,128] = 16K | 0.110 | 0.007 | 15.7x |
+| Small [1,512,512] = 262K | 0.565 | 0.029 | 19.5x |
+| Medium [8,1024,384] = 3.1M | 4.804 | 0.296 | 16.2x |
+| GPT2 [8,1024,768] = 6.3M | 10.531 | 0.496 | 21.2x |
+| Large [32,1024,768] = 25.2M | 61.693 | 2.002 | 30.8x |
+| XLarge [64,1024,768] = 50.3M | 122.264 | 3.960 | 30.9x |
+| Huge [64,2048,1024] = 134.2M | 321.071 | 9.965 | 32.2x |
+
+---
+
+### Framework Comparison — [8, 1024, 384] (GPU, fp32)
+
+| Operation | **Ours** | **PyTorch 2.7** | **TF 2.19** | Ours vs PT | Ours vs TF |
+|---|---|---|---|---|---|
+| LN Forward | 0.107ms | 0.103ms | 0.474ms | 0.96x | **4.4x faster** |
+| LN Backward | 0.292ms | 0.339ms | 2.683ms | **1.16x faster** | **9.2x faster** |
+| RMS Forward | 0.081ms | 0.299ms | 0.082ms | **3.7x faster** | ~1.0x |
+| RMS Backward | 0.289ms | 1.165ms | 1.705ms | **4.0x faster** | **5.9x faster** |
+
+| Operation | **Ours** | **PyTorch 2.7** | **TF 2.19** | Ours vs PT | Ours vs TF |
+|---|---|---|---|---|---|
+| LN Forward (CPU) | 0.142ms | 0.118ms | 2.522ms | 0.83x | **17.8x faster** |
+| RMS Forward (CPU) | 0.070ms | 0.294ms | 0.557ms | **4.2x faster** | **8.0x faster** |
+
+> **Note:** PyTorch backward timings include forward pass (Python `.backward()` requires forward first). Our backward-only measurement is kernel-only. TF backward also includes forward.
