@@ -430,7 +430,7 @@ The `LayerNormBackward::apply()` in `NormalizationBackward.cpp` is called **by t
 ║   │  autograd::layer_norm()                                  │               ║
 ║   │  ├─ Tensor allocation (output, mean, rstd)              │               ║
 ║   │  ├─ GPU dispatch → cuda::layer_norm_forward_cuda()      │               ║
-║   │  ├─ ▓▓▓ CPU KERNEL EMBEDDED AS LAMBDA ▓▓▓              │  ← PROBLEM    ║
+║   │  ├─  CPU KERNEL EMBEDDED AS LAMBDA            │  ← PROBLEM    ║
 ║   │  │   └─ 3 scalar loops, no SIMD, no Welford            │               ║
 ║   │  └─ Autograd graph wiring                               │               ║
 ║   └─────────────────────────────────────────────────────────┘               ║
@@ -439,7 +439,7 @@ The `LayerNormBackward::apply()` in `NormalizationBackward.cpp` is called **by t
 ║   ┌─────────────────────────────────────────────────────────┐               ║
 ║   │  LayerNormBackward::apply()                              │               ║
 ║   │  ├─ GPU dispatch → cuda::layer_norm_backward_cuda()     │               ║
-║   │  └─ ▓▓▓ CPU KERNEL EMBEDDED AS LAMBDA ▓▓▓              │  ← PROBLEM    ║
+║   │  └─  CPU KERNEL EMBEDDED AS LAMBDA               │  ← PROBLEM    ║
 ║   │      └─ Serial gamma/beta, 4 scalar loops, no SIMD     │               ║
 ║   └─────────────────────────────────────────────────────────┘               ║
 ║                                                                              ║
