@@ -1,5 +1,6 @@
 #include "ops/cuda/attention/AttentionCommon.cuh"
 #include "ops/helpers/AttentionKernels.h"
+#include "ops/helpers/KernelDispatch.h"
 #include "autograd/backward/AttentionBackward.h"
 
 namespace OwnTensor{
@@ -71,6 +72,7 @@ __inline__ __device__ float bwd_warp_sum(float val) {
     return val;
 }
 
+
 template<int HeadDim>
 __global__ void mem_efficient_bwd_precompute_D(
     const float* __restrict__ dO,
@@ -132,7 +134,6 @@ __global__ void mem_efficient_bwd_precompute_D(
         if (v1) D[(long long)bh * T + row1] = sum1;
     }
 }
-
 // ============================================================================
 // Exp7: scalar KV-outer backward, fallback for non-multiple-of-16 HeadDims
 // ============================================================================
@@ -518,6 +519,18 @@ __global__ void mem_efficient_bwd_unified_kernel_exp11(MemEfficientBwdParams par
 }
 
 // ============================================================================
+// exp12 (SM89 Ada Lovelace) lives in arch/AttentionBackward_sm89.cu.
+// Forward-declare the entry point for the arch-dispatch below.
+// ============================================================================
+void mem_efficient_attn_backward_sm89_cuda(
+    const float* query, const float* key, const float* value,
+    const float* output, const float* grad_output, const float* lse,
+    float* grad_query, float* grad_key, float* grad_value,
+    float* D_buf,
+    int64_t B, int64_t nh, int64_t T, int64_t hd,
+    bool is_causal);
+
+// ============================================================================
 // Public API (namespace cuda)
 // ============================================================================
 
@@ -564,7 +577,7 @@ void mem_efficient_attn_backward(
     params.is_causal = is_causal;
 
     // exp7: scalar KV-outer fallback for HeadDims not divisible by 16
-    #define LAUNCH_MEM_BWD_EXP7(HD) \
+#define LAUNCH_MEM_BWD_EXP7(HD) \
     do { \
         const int block_n7 = ((HD) < 64) ? 16 : (1024 / (HD)); \
         const size_t shmem_exp7 = 2ULL * block_n7 * ((HD) + 1) * sizeof(float); \
@@ -582,7 +595,7 @@ void mem_efficient_attn_backward(
     } while (0)
 
     // exp11: Q-tile-centric, TF32 WMMA, dQ atomic-free, HD%16==0 only
-    #define LAUNCH_MEM_BWD_EXP11(HD) \
+#define LAUNCH_MEM_BWD_EXP11(HD) \
     do { \
         constexpr int BN11 = 16, BM11 = 16; \
         const size_t shmem11 = \
@@ -598,8 +611,8 @@ void mem_efficient_attn_backward(
         cudaFuncSetAttribute( \
             mem_efficient_bwd_unified_kernel_exp11<HD, false>, \
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem11); \
-        cudaMemset(params.dK, 0, (size_t)BH * (int)T * (HD) * sizeof(float)); \
-        cudaMemset(params.dV, 0, (size_t)BH * (int)T * (HD) * sizeof(float)); \
+        cudaMemsetAsync(params.dK, 0, (size_t)BH * (int)T * (HD) * sizeof(float)); \
+        cudaMemsetAsync(params.dV, 0, (size_t)BH * (int)T * (HD) * sizeof(float)); \
         mem_efficient_bwd_precompute_D<HD><<<grid_D, block_cfg>>>( \
             grad_output, output, D_buf, (int)T); \
         if (is_causal) { \
@@ -610,6 +623,16 @@ void mem_efficient_attn_backward(
                 <<<grid_q11, block_cfg, shmem11>>>(params); \
         } \
     } while (0)
+
+    // SM89 (Ada Lovelace): dispatch to exp12 (BM=32, bank-conflict-free, 2 blocks/SM).
+    // Non-%16 HD falls through to exp7 below regardless of arch.
+    if (hd % 16 == 0 && cuda::get_arch() == cuda::ArchFamily::Ada) {
+        mem_efficient_attn_backward_sm89_cuda(
+            query, key, value, output, grad_output, lse,
+            grad_query, grad_key, grad_value, D_buf,
+            B, nh, T, hd, is_causal);
+        return;
+    }
 
     switch ((int)hd) {
         case   8: LAUNCH_MEM_BWD_EXP7(  8); break;
@@ -630,10 +653,9 @@ void mem_efficient_attn_backward(
             printf("mem_efficient_attn_backward: unsupported head_dim %d\n", (int)hd);
             break;
     }
-    #undef LAUNCH_MEM_BWD_EXP7
-    #undef LAUNCH_MEM_BWD_EXP11
+#undef LAUNCH_MEM_BWD_EXP7
+#undef LAUNCH_MEM_BWD_EXP11
+}
 
-} 
-
-}// namespace cuda
+} // namespace cuda
 } // namespace OwnTensor

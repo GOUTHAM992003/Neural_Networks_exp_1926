@@ -228,8 +228,8 @@ public:
             std::memcpy(pinned_x_, tokens, BT * sizeof(u_int16_t));
             std::memcpy(pinned_y_, tokens + 1, BT * sizeof(u_int16_t));
 
-            cudaMemcpy(input_tensor_.data(), pinned_x_, BT * sizeof(u_int16_t), cudaMemcpyHostToDevice);
-            cudaMemcpy(target_tensor_.data(), pinned_y_, BT * sizeof(u_int16_t), cudaMemcpyHostToDevice);
+            cudaMemcpyAsync(input_tensor_.data(), pinned_x_, BT * sizeof(u_int16_t), cudaMemcpyHostToDevice, 0);
+            cudaMemcpyAsync(target_tensor_.data(), pinned_y_, BT * sizeof(u_int16_t), cudaMemcpyHostToDevice, 0);
         } else {
             // Fallback: use set_data with pageable memory
             x_buf_.resize(BT);

@@ -410,7 +410,7 @@ int main() {
         config.weight_tying = true; // Toggle weight tying here
         
         // Training hyperparameters
-        const int B = 4;           // Batch size
+        const int B = 16;           // Batch size
         const int T = 1024;        // Sequence length
         const int GLOBAL_BATCH = 524288;  // Global batch size
         const int GRAD_ACCUM_STEPS = GLOBAL_BATCH / (B * T);
@@ -418,7 +418,7 @@ int main() {
         const float MAX_LR = 6e-3f;            //6e-4f;  
         const float MIN_LR = MAX_LR * 0.1f;
         const int WARMUP_STEPS = 0;
-        const int MAX_STEPS = 20;
+        const int MAX_STEPS = 10;
 
         const int VAL_FREQ = 1000;
         const int TOK_GEN_FREQ = 1000;
@@ -462,7 +462,7 @@ int main() {
         nn::AdamW optimizer(params, MAX_LR, 0.9f, 0.95f, 1e-8f, 0.1f);
         
         // Create data loaders
-        std::string data_root = "/home/blu-bridge016/Desktop/master_gau_latest/data";
+        std::string data_root = "/mnt/volgrp03/3rd_floor/edufineweb";
         DataLoaderLite train_loader(B, T, rank, world_size, "train", data_root, true, 100000000, gpu_device);
         DataLoaderLite val_loader(B, T, rank, world_size, "val", data_root, true, 100000000, gpu_device);
         
@@ -724,4 +724,3 @@ int main() {
         return 1;
     }
 }
-

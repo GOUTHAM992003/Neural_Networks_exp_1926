@@ -717,15 +717,15 @@ void sparse_ce_backward_cuda_vec(
     dim3 grid_norm{(unsigned)batch_size};
     //* Buffers for multi-block online softmax
     float *d_partial_max, *d_partial_sum;
-    cudaMalloc(&d_partial_max, (int64_t)batch_size * grid_reduce.x * sizeof(float));
-    cudaMalloc(&d_partial_sum, (int64_t)batch_size * grid_reduce.x * sizeof(float));
+    d_partial_max = static_cast<float*>(CachingCUDAAllocator::instance().allocate((int64_t)batch_size * grid_reduce.x * sizeof(float)));
+    d_partial_sum = static_cast<float*>(CachingCUDAAllocator::instance().allocate((int64_t)batch_size * grid_reduce.x * sizeof(float)));
     //* same stream for serializing and avoiding synchronization
     //* by deafult stream 0
     sparseCEReduce_kernel_optimized<<<grid_reduce, block, 6 * block.x * sizeof(float)>>>(logits, targets, grad_logits, d_partial_max, d_partial_sum, batch_size, vocab_size);
     sparseCENormalize_kernel_optimized<<<grid_norm, block, block.x * 4 * sizeof(float)>>>(logits, targets, grad_logits, d_partial_max, d_partial_sum, batch_size, vocab_size, grad_output, host_scale, (int)grid_reduce.x);
 
-    cudaFree(d_partial_max);
-    cudaFree(d_partial_sum);
+    CachingCUDAAllocator::instance().deallocate(d_partial_max);
+    CachingCUDAAllocator::instance().deallocate(d_partial_sum);
 }
 
 
@@ -908,15 +908,15 @@ void sparse_ce_backward_cuda(
     dim3 grid_norm{(unsigned)batch_size};
     //* Buffers for multi-block online softmax
     float *d_partial_max, *d_partial_sum;
-    cudaMalloc(&d_partial_max, (int64_t)batch_size * grid_reduce.x * sizeof(float));
-    cudaMalloc(&d_partial_sum, (int64_t)batch_size * grid_reduce.x * sizeof(float));
+    d_partial_max = static_cast<float*>(CachingCUDAAllocator::instance().allocate((int64_t)batch_size * grid_reduce.x * sizeof(float)));
+    d_partial_sum = static_cast<float*>(CachingCUDAAllocator::instance().allocate((int64_t)batch_size * grid_reduce.x * sizeof(float)));
     //* same stream for serializing and avoiding synchronization
     //* by deafult stream 0
     sparseCEReduce_kernel<<<grid_reduce, block, 2 * block.x * sizeof(float)>>>(logits, targets, grad_logits, d_partial_max, d_partial_sum, batch_size, vocab_size);
     sparseCENormalize_kernel<<<grid_norm, block>>>(logits, targets, grad_logits, d_partial_max, d_partial_sum, batch_size, vocab_size, grad_output, host_scale, (int)grid_reduce.x);
 
-    cudaFree(d_partial_max);
-    cudaFree(d_partial_sum);
+    CachingCUDAAllocator::instance().deallocate(d_partial_max);
+    CachingCUDAAllocator::instance().deallocate(d_partial_sum);
 }
 
 
@@ -1176,7 +1176,7 @@ void categorical_cross_entropy_forward_cuda(
     if (batch_size == 0) return;
     
     float* d_losses;
-    cudaMalloc(&d_losses, batch_size * sizeof(float));
+    d_losses = static_cast<float*>(CachingCUDAAllocator::instance().allocate(batch_size * sizeof(float)));
     
     int threads = 256;
     int blocks = batch_size;
@@ -1194,18 +1194,18 @@ void categorical_cross_entropy_forward_cuda(
             d_losses, loss_output, batch_size);
     } else {
         float* d_partial;
-        cudaMalloc(&d_partial, reduce_blocks * sizeof(float));
+        d_partial = static_cast<float*>(CachingCUDAAllocator::instance().allocate(reduce_blocks * sizeof(float)));
          sum_reduction_kernel<float><<<reduce_blocks, reduce_threads, reduce_threads * sizeof(float)>>>(
             d_losses, d_partial, batch_size);
          sum_reduction_kernel<float><<<1, reduce_threads, reduce_threads * sizeof(float)>>>(
             d_partial, loss_output, reduce_blocks);
-        cudaFree(d_partial);
+        CachingCUDAAllocator::instance().deallocate(d_partial);
     }
     
     // 3. Average (Divide by batch_size)
     scale_loss_kernel<<<1, 1>>>(loss_output, 1.0f / static_cast<float>(batch_size));
     
-    cudaFree(d_losses);
+    CachingCUDAAllocator::instance().deallocate(d_losses);
 }
 
 __global__ void cce_backward_kernel(
@@ -1287,7 +1287,7 @@ __global__ void mse_backward_kernel(
 void mse_loss_forward_cuda(const float* predictions, const float* targets, float* loss_output, int64_t numel) {
     if (numel == 0) return;
     float* d_losses;
-    cudaMalloc(&d_losses, numel * sizeof(float));
+    d_losses = static_cast<float*>(CachingCUDAAllocator::instance().allocate(numel * sizeof(float)));
     
     int threads = 256;
     int blocks = (numel + threads - 1) / threads;
@@ -1301,14 +1301,14 @@ void mse_loss_forward_cuda(const float* predictions, const float* targets, float
         sum_reduction_kernel<float><<<1, reduce_threads, reduce_threads*sizeof(float)>>>(d_losses, loss_output, numel);
     } else {
         float* d_partial;
-        cudaMalloc(&d_partial, reduce_blocks * sizeof(float));
+        d_partial = static_cast<float*>(CachingCUDAAllocator::instance().allocate(reduce_blocks * sizeof(float)));
         sum_reduction_kernel<float><<<reduce_blocks, reduce_threads, reduce_threads*sizeof(float)>>>(d_losses, d_partial, numel);
         sum_reduction_kernel<float><<<1, reduce_threads, reduce_threads*sizeof(float)>>>(d_partial, loss_output, reduce_blocks);
-        cudaFree(d_partial);
+        CachingCUDAAllocator::instance().deallocate(d_partial);
     }
     
     scale_loss_kernel<<<1, 1>>>(loss_output, 1.0f / static_cast<float>(numel));
-    cudaFree(d_losses);
+    CachingCUDAAllocator::instance().deallocate(d_losses);
 }
 
 void mse_loss_backward_cuda(const float* grad_output, const float* predictions, const float* targets, float* grad_input, int64_t numel) {
@@ -1349,7 +1349,7 @@ __global__ void mae_backward_kernel(
 void mae_loss_forward_cuda(const float* predictions, const float* targets, float* loss_output, int64_t numel) {
     if (numel == 0) return;
     float* d_losses;
-    cudaMalloc(&d_losses, numel * sizeof(float));
+    d_losses = static_cast<float*>(CachingCUDAAllocator::instance().allocate(numel * sizeof(float)));
     
     int threads = 256;
     int blocks = (numel + threads - 1) / threads;
@@ -1363,14 +1363,14 @@ void mae_loss_forward_cuda(const float* predictions, const float* targets, float
         sum_reduction_kernel<float><<<1, reduce_threads, reduce_threads*sizeof(float)>>>(d_losses, loss_output, numel);
     } else {
         float* d_partial;
-        cudaMalloc(&d_partial, reduce_blocks * sizeof(float));
+        d_partial = static_cast<float*>(CachingCUDAAllocator::instance().allocate(reduce_blocks * sizeof(float)));
         sum_reduction_kernel<float><<<reduce_blocks, reduce_threads, reduce_threads*sizeof(float)>>>(d_losses, d_partial, numel);
         sum_reduction_kernel<float><<<1, reduce_threads, reduce_threads*sizeof(float)>>>(d_partial, loss_output, reduce_blocks);
-        cudaFree(d_partial);
+        CachingCUDAAllocator::instance().deallocate(d_partial);
     }
     
     scale_loss_kernel<<<1, 1>>>(loss_output, 1.0f / static_cast<float>(numel));
-    cudaFree(d_losses);
+    CachingCUDAAllocator::instance().deallocate(d_losses);
 }
 
 void mae_loss_backward_cuda(const float* grad_output, const float* predictions, const float* targets, float* grad_input, int64_t numel) {
@@ -1436,7 +1436,7 @@ __global__ void bce_backward_kernel(
 void bce_loss_forward_cuda(const float* predictions, const float* targets, float* loss_output, int64_t numel) {
     if (numel == 0) return;
     float* d_losses;
-    cudaMalloc(&d_losses, numel * sizeof(float));
+    d_losses = static_cast<float*>(CachingCUDAAllocator::instance().allocate(numel * sizeof(float)));
     
     int threads = 256;
     int blocks = (numel + threads - 1) / threads;
@@ -1450,14 +1450,14 @@ void bce_loss_forward_cuda(const float* predictions, const float* targets, float
         sum_reduction_kernel<float><<<1, reduce_threads, reduce_threads*sizeof(float)>>>(d_losses, loss_output, numel);
     } else {
         float* d_partial;
-        cudaMalloc(&d_partial, reduce_blocks * sizeof(float));
+        d_partial = static_cast<float*>(CachingCUDAAllocator::instance().allocate(reduce_blocks * sizeof(float)));
         sum_reduction_kernel<float><<<reduce_blocks, reduce_threads, reduce_threads*sizeof(float)>>>(d_losses, d_partial, numel);
         sum_reduction_kernel<float><<<1, reduce_threads, reduce_threads*sizeof(float)>>>(d_partial, loss_output, reduce_blocks);
-        cudaFree(d_partial);
+        CachingCUDAAllocator::instance().deallocate(d_partial);
     }
     
     scale_loss_kernel<<<1, 1>>>(loss_output, 1.0f / static_cast<float>(numel));
-    cudaFree(d_losses);
+    CachingCUDAAllocator::instance().deallocate(d_losses);
 }
 
 void bce_loss_backward_cuda(const float* grad_output, const float* predictions, const float* targets, float* grad_input, int64_t numel) {

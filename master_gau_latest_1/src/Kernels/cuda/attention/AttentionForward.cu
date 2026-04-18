@@ -1,7 +1,39 @@
 #include "ops/helpers/AttentionKernels.h"
+#include "ops/helpers/KernelDispatch.h"
 #include "ops/cuda/attention/AttentionCommon.cuh"
 
 namespace OwnTensor {
+
+// ============================================================================
+// Constants & Prefetch Helpers
+// ============================================================================
+
+__device__ __forceinline__ void cp_async_wait_all() {
+    asm volatile("cp.async.wait_all;\n" ::: "memory");
+}
+
+__device__ __forceinline__ void cp_async_commit() {
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+}
+
+template<int N>
+__device__ __forceinline__ void cp_async_wait_group() {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N) : "memory");
+}
+
+__device__ __forceinline__ void cp_async_l16(void* smem_ptr, const void* global_ptr, bool pred) {
+    uint32_t smem_addr = __cvta_generic_to_shared(smem_ptr);
+    asm volatile(
+        "{\n"
+        "  .reg .pred p;\n"
+        "  setp.ne.b32 p, %2, 0;\n"
+        "  @p cp.async.ca.shared.global [%0], [%1], 16;\n"
+        "  @!p st.shared.v4.u32 [%0], {0,0,0,0};\n"
+        "}\n"
+        : : "r"(smem_addr), "l"(global_ptr), "r"((int)pred) : "memory");
+}
+
+// static constexpr int MAX_HD = 256;   // max supported head dimension
 
 // ============================================================================
 // Forward Kernel: Fused Memory-Efficient Attention (shared-memory-centric)
@@ -492,51 +524,6 @@ static void launch_fwd_kernel(
 }
 
 
-// ============================================================================
-// Exp1 Forward: WMMA TF32 Tensor-Core Score GEMM + P@V GEMM
-// ============================================================================
-//
-// Changes vs fused_attn_forward_kernel (baseline scalar):
-//   1. Score GEMM (Q @ K^T → s_scores): replaced scalar dot-product loop with
-//      wmma::mma_sync using nvcuda::wmma::precision::tf32 (16×16×8 tiles).
-//      Hardware converts FP32 → TF32 (10-bit mantissa) inside load_matrix_sync.
-//      No explicit pre-conversion needed — pass float* directly.
-//      Accumulator stays FP32; only the two input matrices are in TF32.
-//   2. P@V GEMM (P @ V → s_pv): same WMMA TF32 approach.
-//   3. Thread layout changed from "8 threads/row" to full 32-thread warps:
-//      - Score GEMM: warps 0–3 each compute one 16×16 tile of s_scores[32×32]
-//                    (2×2 grid of tiles). Warps 4–7 idle this phase.
-//      - Softmax:    all 8 warps; each warp processes 4 rows (32/8).
-//                    Each lane owns one key column (BK=32 → 32 lanes exactly).
-//                    Warp-level shuffle reduction for row-max and row-sum.
-//      - P@V GEMM:   all 8 warps; each warp handles tile_id = warp_id + pass*8
-//                    in the 2×(hd/16) output tile grid.
-//   4. Extra smem buffer s_pv[TC_BQ × HD_PAD] stores the P@V result before
-//      accumulating into s_out, preventing the read-write race that would
-//      occur if P@V output were stored directly back into s_kv while other
-//      warps may still be reading V from s_kv.
-//   5. s_out kept in smem (vs reg_out in registers for baseline). Required
-//      because per-row alpha rescaling between KV tiles needs warp cooperation.
-//   6. Only valid for HeadDim divisible by 16 (WMMA tile dimension WMMA_N=16).
-//      launch_fwd_tc_kernel falls back to the scalar kernel for other head dims.
-//
-// Requires: Ampere GPU (sm_80+) for TF32 WMMA support.
-//           The Makefile targets sm_86 so this is always satisfied.
-//
-// Shared memory layout:
-//   s_q      [TC_BQ  × HD_PAD]   Q tile (fp32, loaded once per block)
-//   s_kv     [TC_BK  × HD_PAD]   K tile then V tile (fp32, reused each KV iter)
-//   s_scores [TC_BQ  × TC_BK]    raw dot-products → softmax weights P
-//                                  (no padding; stride=TC_BK=32)
-//   s_m      [TC_BQ]             running max per query row
-//   s_l      [TC_BQ]             running denominator (sum of exp) per query row
-//   s_out    [TC_BQ  × HD_PAD]   output accumulator (replaces reg_out)
-//   s_pv     [TC_BQ  × HD_PAD]   temporary P@V result for this KV tile
-//
-// Grid/Block: identical to the scalar kernel.
-//   Grid : (ceil(T / TC_BQ), B * nh)
-//   Block: FWD_TC_NUM_THREADS = 256
-
 static constexpr int FWD_TC_BQ          = 32;   // query rows per block
 static constexpr int FWD_TC_BK          = 32;   // key/value rows per KV tile
 static constexpr int FWD_TC_NUM_THREADS = 256;  // 8 warps × 32 lanes
@@ -594,8 +581,10 @@ __global__ void fused_attn_forward_kernel_tc(
     // ── Shared memory layout ──────────────────────────────────────────────────
     extern __shared__ float smem[];
     float* s_q      = smem;
-    float* s_kv     = s_q      + FWD_TC_BQ * HD_PAD;
-    float* s_scores = s_kv     + FWD_TC_BK * HD_PAD;  // stride = TC_BK (no pad)
+    // Double-buffered s_kv: index stage by [0,1]
+    float* s_kv_base = s_q      + FWD_TC_BQ * HD_PAD;
+    float* s_kv[2]  = { s_kv_base, s_kv_base + FWD_TC_BK * HD_PAD };
+    float* s_scores = s_kv_base + 2 * FWD_TC_BK * HD_PAD;  // stride = TC_BK (no pad)
     float* s_m      = s_scores + FWD_TC_BQ * FWD_TC_BK;
     float* s_l      = s_m      + FWD_TC_BQ;
     float* s_out    = s_l      + FWD_TC_BQ;
@@ -610,118 +599,94 @@ __global__ void fused_attn_forward_kernel_tc(
         s_out[i] = 0.0f;
     }
 
-    // ── Step 1: Cooperative load Q tile → s_q ────────────────────────────────
-    for (int i = tid; i < FWD_TC_BQ * HeadDim; i += FWD_TC_NUM_THREADS) {
-        const int q = i / HeadDim;
-        const int d = i % HeadDim;
-        s_q[q * HD_PAD + d] = (qi_block + q < T)
-                               ? Q_bnh[(qi_block + q) * HeadDim + d] : 0.0f;
+    // ── Step 1: Cooperative load Q tile → s_q (Vectorized) ───────────────────
+    {
+        const int vec_total = (FWD_TC_BQ * HeadDim) / 4;
+        for (int i = tid; i < vec_total; i += FWD_TC_NUM_THREADS) {
+            const int q = (i * 4) / HeadDim;
+            const int d = (i * 4) % HeadDim;
+            const int64_t g_idx = (qi_block + q) * HeadDim + d;
+            
+            float4 val = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (qi_block + q < T) {
+                val = *(const float4*)&Q_bnh[g_idx];
+            }
+            *(float4*)&s_q[q * HD_PAD + d] = val;
+        }
     }
     __syncthreads();
 
-    const int actual_q = (int)min((int64_t)FWD_TC_BQ, T - qi_block);
+    const int actual_q = (int)(( (int64_t)FWD_TC_BQ < (T - qi_block) ) ? (int64_t)FWD_TC_BQ : (T - qi_block));
     if (actual_q <= 0) return;
 
     const int64_t max_kj = is_causal
-        ? min(qi_block + (int64_t)actual_q, T)
+        ? (( (qi_block + (int64_t)actual_q) < T ) ? (qi_block + (int64_t)actual_q) : T)
         : T;
+
+    // ── Pre-fetch first K tile ───────────────────────────────────────────────
+    {
+        const int vec_total = (FWD_TC_BK * HeadDim) / 4;
+        for (int i = tid; i < vec_total; i += FWD_TC_NUM_THREADS) {
+            const int k = (i * 4) / HeadDim;
+            const int d = (i * 4) % HeadDim;
+            const int64_t g = 0LL + k;
+            cp_async_l16(&s_kv[0][k * HD_PAD + d], &K_bnh[g * HeadDim + d], g < T);
+        }
+        cp_async_commit();
+    }
 
     // ── Step 2: Main loop over KV tiles ──────────────────────────────────────
     for (int64_t kj_block = 0; kj_block < max_kj; kj_block += FWD_TC_BK) {
-        const int block_len = (int)min((int64_t)FWD_TC_BK, T - kj_block);
+        const int block_len = (int)(( (int64_t)FWD_TC_BK < (T - kj_block) ) ? (int64_t)FWD_TC_BK : (T - kj_block));
+        const int64_t next_kj_block = kj_block + FWD_TC_BK;
+        const bool has_next = (next_kj_block < max_kj);
 
-        // ── 2a: Load K tile → s_kv ────────────────────────────────────────────
-        for (int i = tid; i < FWD_TC_BK * HeadDim; i += FWD_TC_NUM_THREADS) {
-            const int k = i / HeadDim;
-            const int d = i % HeadDim;
-            const int g = (int)kj_block + k;
-            s_kv[k * HD_PAD + d] = (g < T) ? K_bnh[g * HeadDim + d] : 0.0f;
+        // ── 2a: Wait for K tile, start loading V tile ───────────────────────
+        cp_async_wait_group<0>();
+        __syncthreads(); // K tile ready in s_kv[0]
+
+        // Load V tile into s_kv[1] async
+        {
+            const int vec_total = (FWD_TC_BK * HeadDim) / 4;
+            for (int i = tid; i < vec_total; i += FWD_TC_NUM_THREADS) {
+                const int v = (i * 4) / HeadDim;
+                const int d = (i * 4) % HeadDim;
+                const int64_t g = kj_block + v;
+                cp_async_l16(&s_kv[1][v * HD_PAD + d], &V_bnh[g * HeadDim + d], g < T);
+            }
+            cp_async_commit();
         }
-        __syncthreads();    // K tile visible to Score GEMM
 
-        // ── 2b: Score GEMM via WMMA TF32 — warps 0–3 ─────────────────────────
-        //
-        //   Computes Q[32×hd] @ K[32×hd]^T → s_scores[32×32].
-        //   4 output tiles (2×2 of 16×16), one per warp:
-        //     warp w → m_tile = w/2, n_tile = w%2
-        //
-        //   A (row_major): Q slice [m_tile*16 : (m_tile+1)*16][k*8 : (k+1)*8]
-        //     load_matrix_sync(float*) converts FP32→TF32 internally.
-        //
-        //   B (col_major): K slice [n_tile*16 : (n_tile+1)*16][k*8 : (k+1)*8]
-        //     col_major of a row-major K block gives K^T:
-        //       B[k'][n'] = K_smem[(n_tile*16+n') * HD_PAD + k*8+k']
-        //     ⟹ mma computes A × B = Q[m_tile rows] @ K[n_tile rows]^T  ✓
-        //
-        //   Accumulator: FP32 throughout.
+        // ── 2b: Score GEMM via WMMA — warps 0–3 ──────────────────────────────
         if (warp_id < 4) {
-            const int m_tile = warp_id / SCORE_N_TILES;  // 0 or 1
-            const int n_tile = warp_id % SCORE_N_TILES;  // 0 or 1
-
-            wmma::fragment<wmma::accumulator,
-                           FWD_TC_WMMA_M, FWD_TC_WMMA_N, FWD_TC_WMMA_K,
-                           float> acc;
+            const int m_tile = warp_id / SCORE_N_TILES;
+            const int n_tile = warp_id % SCORE_N_TILES;
+            wmma::fragment<wmma::accumulator, FWD_TC_WMMA_M, FWD_TC_WMMA_N, FWD_TC_WMMA_K, float> acc;
             wmma::fill_fragment(acc, 0.0f);
 
             #pragma unroll
             for (int k = 0; k < SCORE_K_TILES; ++k) {
-                wmma::fragment<wmma::matrix_a,
-                               FWD_TC_WMMA_M, FWD_TC_WMMA_N, FWD_TC_WMMA_K,
-                               wmma::precision::tf32, wmma::row_major> a_frag;
-                wmma::fragment<wmma::matrix_b,
-                               FWD_TC_WMMA_M, FWD_TC_WMMA_N, FWD_TC_WMMA_K,
-                               wmma::precision::tf32, wmma::col_major> b_frag;
+                wmma::fragment<wmma::matrix_a, FWD_TC_WMMA_M, FWD_TC_WMMA_N, FWD_TC_WMMA_K, wmma::precision::tf32, wmma::row_major> a_frag;
+                wmma::fragment<wmma::matrix_b, FWD_TC_WMMA_M, FWD_TC_WMMA_N, FWD_TC_WMMA_K, wmma::precision::tf32, wmma::col_major> b_frag;
 
-                wmma::load_matrix_sync(
-                    a_frag,
-                    s_q + m_tile * FWD_TC_WMMA_M * HD_PAD + k * FWD_TC_WMMA_K,
-                    HD_PAD);
-
-                wmma::load_matrix_sync(
-                    b_frag,
-                    s_kv + n_tile * FWD_TC_WMMA_N * HD_PAD + k * FWD_TC_WMMA_K,
-                    HD_PAD);
-
+                wmma::load_matrix_sync(a_frag, s_q + m_tile * FWD_TC_WMMA_M * HD_PAD + k * FWD_TC_WMMA_K, HD_PAD);
+                wmma::load_matrix_sync(b_frag, s_kv[0] + n_tile * FWD_TC_WMMA_N * HD_PAD + k * FWD_TC_WMMA_K, HD_PAD);
                 wmma::mma_sync(acc, a_frag, b_frag, acc);
             }
-
-            // Store raw dot-products to s_scores, stride = TC_BK = 32
-            wmma::store_matrix_sync(
-                s_scores + m_tile * FWD_TC_WMMA_M * FWD_TC_BK
-                         + n_tile * FWD_TC_WMMA_N,
-                acc, FWD_TC_BK, wmma::mem_row_major);
+            wmma::store_matrix_sync(s_scores + m_tile * FWD_TC_WMMA_M * FWD_TC_BK + n_tile * FWD_TC_WMMA_N, acc, FWD_TC_BK, wmma::mem_row_major);
         }
-        __syncthreads();    // s_scores ready for softmax (all warps)
+        __syncthreads(); // s_scores ready
 
-        // ── 2c: Online softmax — scalar, all 8 warps ──────────────────────────
-        //
-        //   Thread layout: warp w handles rows [w*4 : w*4+4).
-        //   Lane j handles key column j (BK=32 → one column per lane).
-        //   Full row-max and row-sum reductions fit in a single warp shuffle.
-        //
-        //   Per row:
-        //     (i)  Read scaled score or -INF (out-of-bounds / causal mask)
-        //     (ii) Warp-reduce max → m_new; compute alpha = exp(m_old - m_new)
-        //     (iii) Rescale s_out[row][*] by alpha (multi-pass over HeadDim)
-        //     (iv) Exponentiate, apply dropout → P in s_scores
-        //     (v)  Warp-reduce sum; update s_m[row], s_l[row] (lane 0 writes)
+        // ── 2c: Online softmax ───────────────────────────────────────────────
         {
             for (int r = 0; r < ROWS_PER_WARP; ++r) {
-                const int   row        = warp_id * ROWS_PER_WARP + r;
+                const int row = warp_id * ROWS_PER_WARP + r;
                 const int64_t qi_global = qi_block + row;
-                const bool  qi_valid   = (qi_global < T);
+                const bool qi_valid = (qi_global < T);
 
-                // (i) Read score; apply scale and boundary / causal mask
-                float val;
-                if (lane_id < block_len && qi_valid) {
-                    val = s_scores[row * FWD_TC_BK + lane_id] * scale;
-                    if (is_causal && (kj_block + lane_id) > qi_global)
-                        val = -INFINITY;
-                } else {
-                    val = -INFINITY;
-                }
+                float val = (lane_id < block_len && qi_valid) ? s_scores[row * FWD_TC_BK + lane_id] * scale : -INFINITY;
+                if (is_causal && (kj_block + lane_id) > qi_global) val = -INFINITY;
 
-                // (ii) Warp-reduce max
                 float row_max = val;
                 #pragma unroll
                 for (int off = 16; off > 0; off >>= 1)
@@ -729,30 +694,24 @@ __global__ void fused_attn_forward_kernel_tc(
 
                 const float m_old = s_m[row];
                 const float m_new = qi_valid ? fmaxf(m_old, row_max) : m_old;
+                const float alpha = (m_old == -INFINITY) ? 0.0f : ((m_old == m_new) ? 1.0f : expf(m_old - m_new));
 
-                float alpha;
-                if      (m_old == -INFINITY) alpha = 0.0f;
-                else if (m_old == m_new)     alpha = 1.0f;
-                else                         alpha = expf(m_old - m_new);
-
-                // (iii) Rescale s_out[row][*] by alpha
-                //   32 lanes cover HeadDim in ceil(HeadDim/32) passes
-                for (int d = lane_id; d < HeadDim; d += 32)
-                    s_out[row * HD_PAD + d] *= alpha;
-
-                // (iv) Exponentiate and apply dropout mask
-                float exp_s;
-                if (lane_id < block_len && qi_valid && m_new > -INFINITY) {
-                    exp_s = expf(val - m_new);
-                    if (dropout_p > 0.0f && dropout_mask != nullptr)
-                        exp_s *= dropout_mask[(bnh * T + qi_global) * T
-                                              + (kj_block + lane_id)];
-                } else {
-                    exp_s = 0.0f;
+                #pragma unroll
+                for (int d_base = 0; d_base < HeadDim; d_base += 128) {
+                    int d = d_base + lane_id * 4;
+                    if (d < HeadDim) {
+                        float4* ptr = (float4*)&s_out[row * HD_PAD + d];
+                        float4 v_out = *ptr;
+                        v_out.x *= alpha; v_out.y *= alpha; v_out.z *= alpha; v_out.w *= alpha;
+                        *ptr = v_out;
+                    }
                 }
-                s_scores[row * FWD_TC_BK + lane_id] = exp_s;  // P stored back
 
-                // (v) Warp-reduce sum; update running state (lane 0 only)
+                float exp_s = (lane_id < block_len && qi_valid && m_new > -INFINITY) ? expf(val - m_new) : 0.0f;
+                if (dropout_p > 0.0f && dropout_mask != nullptr && qi_valid && lane_id < block_len)
+                    exp_s *= dropout_mask[(bnh * T + qi_global) * T + (kj_block + lane_id)];
+                s_scores[row * FWD_TC_BK + lane_id] = exp_s;
+
                 float row_sum = exp_s;
                 #pragma unroll
                 for (int off = 16; off > 0; off >>= 1)
@@ -764,96 +723,89 @@ __global__ void fused_attn_forward_kernel_tc(
                 }
             }
         }
-        __syncthreads();    // s_scores (P), s_m, s_l fully updated
+        __syncthreads();
 
-        // ── 2d: Load V tile → s_kv (overwrites K) ────────────────────────────
-        for (int i = tid; i < FWD_TC_BK * HeadDim; i += FWD_TC_NUM_THREADS) {
-            const int v = i / HeadDim;
-            const int d = i % HeadDim;
-            const int g = (int)kj_block + v;
-            s_kv[v * HD_PAD + d] = (g < T) ? V_bnh[g * HeadDim + d] : 0.0f;
+        // ── 2d: Start pre-fetching next K tile if available ──────────────────
+        if (has_next) {
+            const int vec_total = (FWD_TC_BK * HeadDim) / 4;
+            for (int i = tid; i < vec_total; i += FWD_TC_NUM_THREADS) {
+                const int k = (i * 4) / HeadDim;
+                const int d = (i * 4) % HeadDim;
+                const int64_t g = next_kj_block + k;
+                cp_async_l16(&s_kv[0][k * HD_PAD + d], &K_bnh[g * HeadDim + d], g < T);
+            }
+            cp_async_commit();
         }
-        __syncthreads();    // V tile ready for P@V GEMM
 
-        // ── 2e: P@V GEMM via WMMA TF32 ───────────────────────────────────────
-        //
-        //   Computes P[32×32] @ V[32×hd] → s_pv[32×hd].
-        //   Each warp handles one 16×16 output tile; warps iterate PV_PASSES times.
-        //
-        //   A (row_major): P slice [m_tile*16 : (m_tile+1)*16][k*8 : (k+1)*8]
-        //     base = s_scores + m_tile*16*TC_BK + k*WMMA_K, stride = TC_BK = 32
-        //   B (row_major): V slice [k*8 : (k+1)*8][n_tile*16 : (n_tile+1)*16]
-        //     base = s_kv + k*WMMA_K*HD_PAD + n_tile*16, stride = HD_PAD
-        //   Store to s_pv with ldm = HD_PAD = hd+4; hd is multiple of 16
-        //     → HD_PAD % 4 == 0 ✓ (satisfies wmma::store_matrix_sync FP32 req.)
+        // ── 2e: Wait for V tile, compute P@V GEMM ────────────────────────────
+        cp_async_wait_group<1>(); // Wait for current V tile (s_kv[1])
+        __syncthreads();
+
         {
             for (int pass = 0; pass < PV_PASSES; ++pass) {
-                const int tile_id = warp_id + pass * (FWD_TC_NUM_THREADS / 32);
+                const int tile_id = warp_id + pass * 8;
                 if (tile_id < PV_TOTAL) {
                     const int m_tile = tile_id / PV_N_TILES;
                     const int n_tile = tile_id % PV_N_TILES;
-
-                    wmma::fragment<wmma::accumulator,
-                                   FWD_TC_WMMA_M, FWD_TC_WMMA_N, FWD_TC_WMMA_K,
-                                   float> acc;
+                    wmma::fragment<wmma::accumulator, FWD_TC_WMMA_M, FWD_TC_WMMA_N, FWD_TC_WMMA_K, float> acc;
                     wmma::fill_fragment(acc, 0.0f);
 
                     #pragma unroll
                     for (int k = 0; k < PV_K_TILES; ++k) {
-                        wmma::fragment<wmma::matrix_a,
-                                       FWD_TC_WMMA_M, FWD_TC_WMMA_N, FWD_TC_WMMA_K,
-                                       wmma::precision::tf32, wmma::row_major> a_frag;
-                        wmma::fragment<wmma::matrix_b,
-                                       FWD_TC_WMMA_M, FWD_TC_WMMA_N, FWD_TC_WMMA_K,
-                                       wmma::precision::tf32, wmma::row_major> b_frag;
-
-                        wmma::load_matrix_sync(
-                            a_frag,
-                            s_scores + m_tile * FWD_TC_WMMA_M * FWD_TC_BK
-                                     + k * FWD_TC_WMMA_K,
-                            FWD_TC_BK);
-
-                        wmma::load_matrix_sync(
-                            b_frag,
-                            s_kv + k * FWD_TC_WMMA_K * HD_PAD
-                                 + n_tile * FWD_TC_WMMA_N,
-                            HD_PAD);
-
+                        wmma::fragment<wmma::matrix_a, FWD_TC_WMMA_M, FWD_TC_WMMA_N, FWD_TC_WMMA_K, wmma::precision::tf32, wmma::row_major> a_frag;
+                        wmma::fragment<wmma::matrix_b, FWD_TC_WMMA_M, FWD_TC_WMMA_N, FWD_TC_WMMA_K, wmma::precision::tf32, wmma::row_major> b_frag;
+                        wmma::load_matrix_sync(a_frag, s_scores + m_tile * FWD_TC_WMMA_M * FWD_TC_BK + k * FWD_TC_WMMA_K, FWD_TC_BK);
+                        wmma::load_matrix_sync(b_frag, s_kv[1] + k * FWD_TC_WMMA_K * HD_PAD + n_tile * FWD_TC_WMMA_N, HD_PAD);
                         wmma::mma_sync(acc, a_frag, b_frag, acc);
                     }
-
-                    wmma::store_matrix_sync(
-                        s_pv + m_tile * FWD_TC_WMMA_M * HD_PAD
-                             + n_tile * FWD_TC_WMMA_N,
-                        acc, HD_PAD, wmma::mem_row_major);
+                    wmma::store_matrix_sync(s_pv + m_tile * FWD_TC_WMMA_M * HD_PAD + n_tile * FWD_TC_WMMA_N, acc, HD_PAD, wmma::mem_row_major);
                 }
             }
         }
-        __syncthreads();    // s_pv ready for accumulation into s_out
+        __syncthreads();
 
-        // ── 2f: Accumulate P@V result into s_out ─────────────────────────────
-        for (int i = tid; i < FWD_TC_BQ * HeadDim; i += FWD_TC_NUM_THREADS) {
-            const int q = i / HeadDim;
-            const int d = i % HeadDim;
-            s_out[q * HD_PAD + d] += s_pv[q * HD_PAD + d];
+        // ── 2f: Accumulate P@V into s_out (Vectorized) ────────────────────────
+        {
+            const int vec_total = (FWD_TC_BQ * HeadDim) / 4;
+            for (int i = tid; i < vec_total; i += FWD_TC_NUM_THREADS) {
+                const int q = (i * 4) / HeadDim;
+                const int d = (i * 4) % HeadDim;
+                float4* out_ptr = (float4*)&s_out[q * HD_PAD + d];
+                float4* pv_ptr  = (float4*)&s_pv[q * HD_PAD + d];
+                float4 v_out = *out_ptr;
+                float4 v_pv  = *pv_ptr;
+                v_out.x += v_pv.x; v_out.y += v_pv.y; v_out.z += v_pv.z; v_out.w += v_pv.w;
+                *out_ptr = v_out;
+            }
         }
-        __syncthreads();    // before next KV tile overwrites s_kv / s_scores
+        __syncthreads();
     }
 
-    // ── Step 3: Normalize s_out by s_l (in-place) ────────────────────────────
-    for (int i = tid; i < actual_q * HeadDim; i += FWD_TC_NUM_THREADS) {
-        const int   q    = i / HeadDim;
-        const int   d    = i % HeadDim;
-        const float li   = s_l[q];
-        s_out[q * HD_PAD + d] *= (li > 0.0f) ? (1.0f / li) : 0.0f;
+    // ── Step 3: Normalize s_out by s_l (Vectorized) ─────────────────────────
+    {
+        const int vec_total = (actual_q * HeadDim) / 4;
+        for (int i = tid; i < vec_total; i += FWD_TC_NUM_THREADS) {
+            const int q = (i * 4) / HeadDim;
+            const int d = (i * 4) % HeadDim;
+            const float li = s_l[q];
+            const float inv_l = (li > 0.0f) ? (1.0f / li) : 0.0f;
+            
+            float4* out_ptr = (float4*)&s_out[q * HD_PAD + d];
+            float4 val = *out_ptr;
+            val.x *= inv_l; val.y *= inv_l; val.z *= inv_l; val.w *= inv_l;
+            *out_ptr = val;
+        }
     }
     __syncthreads();
 
-    // ── Step 4: Coalesced writeback s_out → global O ─────────────────────────
-    for (int i = tid; i < actual_q * HeadDim; i += FWD_TC_NUM_THREADS) {
-        const int q = i / HeadDim;
-        const int d = i % HeadDim;
-        O_bnh[(qi_block + q) * HeadDim + d] = s_out[q * HD_PAD + d];
+    // ── Step 4: Coalesced writeback s_out → global O (Vectorized) ───────────
+    {
+        const int vec_total = (actual_q * HeadDim) / 4;
+        for (int i = tid; i < vec_total; i += FWD_TC_NUM_THREADS) {
+            const int q = (i * 4) / HeadDim;
+            const int d = (i * 4) % HeadDim;
+            *(float4*)&O_bnh[(qi_block + q) * HeadDim + d] = *(float4*)&s_out[q * HD_PAD + d];
+        }
     }
 
     // ── Step 5: Write LSE ─────────────────────────────────────────────────────
@@ -872,7 +824,7 @@ __global__ void fused_attn_forward_kernel_tc(
 //   s_m + s_l                 : 2 × TC_BQ
 static size_t compute_fwd_tc_smem(int64_t hd) {
     const size_t hd_pad = (size_t)hd + FWD_TC_SMEM_PAD;
-    return (4ULL * FWD_TC_BQ * hd_pad          // s_q, s_kv, s_out, s_pv
+    return (5ULL * FWD_TC_BQ * hd_pad          // s_q, s_kv[2], s_out, s_pv
           + (size_t)FWD_TC_BQ * FWD_TC_BK      // s_scores
           + 2ULL * FWD_TC_BQ)                  // s_m, s_l
          * sizeof(float);
@@ -944,25 +896,36 @@ static void launch_fwd_tc_kernel(
     #undef LAUNCH_FWD_TC
 }
 
+// Optimised kernel compiled for Ada Lovelace sm89 (A6000, RTX 4090, L40S).
+// Defined in arch/AttentionForward_sm89.cu.
+void fused_attn_forward_tc_sm89_cuda(
+    const float* Q, const float* K, const float* V,
+    float* O, float* LSE,
+    int64_t T, int64_t hd, float scale, bool is_causal,
+    float dropout_p, const float* dropout_mask,
+    int grid_y,
+    cudaStream_t stream = 0);
+
 namespace cuda{
+
 void mem_efficient_attn_forward(
     const float* query, const float* key, const float* value,
     float* output, float* lse,
     int64_t B, int64_t nh, int64_t T, int64_t hd,
     bool is_causal,
     float dropout_p, const float* dropout_mask)
-{
-    if (hd > MAX_HD) {
-        printf("mem_efficient_attn_forward: hd=%d exceeds MAX_HD=%d\n",
-               (int)hd, MAX_HD);
-        return;
+    {
+        if (hd > MAX_HD) {
+            printf("mem_efficient_attn_forward: hd=%d exceeds MAX_HD=%d\n",
+                (int)hd, MAX_HD);
+            return;
+        }
+        float scale = 1.0f / sqrtf(static_cast<float>(hd));
+        int grid_y = (int)(B * nh);
+        launch_fwd_kernel(query, key, value, output, lse,
+                        T, hd, scale, is_causal,
+                        dropout_p, dropout_mask, grid_y);
     }
-    float scale = 1.0f / sqrtf(static_cast<float>(hd));
-    int grid_y = (int)(B * nh);
-    launch_fwd_kernel(query, key, value, output, lse,
-                      T, hd, scale, is_causal,
-                      dropout_p, dropout_mask, grid_y);
-}
 
 void mem_efficient_attn_forward_tc(
     const float* query, const float* key, const float* value,
@@ -970,18 +933,30 @@ void mem_efficient_attn_forward_tc(
     int64_t B, int64_t nh, int64_t T, int64_t hd,
     bool is_causal,
     float dropout_p, const float* dropout_mask)
-{
-    if (hd > MAX_HD) {
-        printf("mem_efficient_attn_forward_tc: hd=%d exceeds MAX_HD=%d\n",
-               (int)hd, MAX_HD);
-        return;
+    {
+        if (hd > MAX_HD) {
+            printf("mem_efficient_attn_forward_tc: hd=%d exceeds MAX_HD=%d\n",
+                (int)hd, MAX_HD);
+            return;
+        }
+        float scale = 1.0f / sqrtf(static_cast<float>(hd));
+        int grid_y = (int)(B * nh);
+
+        // Dispatch to Ada-tuned kernel when running on sm89 (A6000 Ada, RTX 4090, L40S).
+        // The sm89 kernel uses BQ_TILE=64 for hd≤80 (all 8 warps active in
+        // score GEMM, 2× K-reuse per block) and BQ_TILE=32 for hd≥96.
+        // The original RTX 3060 path below is untouched.
+        if (cuda::get_arch() == cuda::ArchFamily::Ada) {
+            fused_attn_forward_tc_sm89_cuda(query, key, value, output, lse,
+                                            T, hd, scale, is_causal,
+                                            dropout_p, dropout_mask, grid_y);
+            return;
+        }
+
+        launch_fwd_tc_kernel(query, key, value, output, lse,
+                            T, hd, scale, is_causal,
+                            dropout_p, dropout_mask, grid_y);
     }
-    float scale = 1.0f / sqrtf(static_cast<float>(hd));
-    int grid_y = (int)(B * nh);
-    launch_fwd_tc_kernel(query, key, value, output, lse,
-                         T, hd, scale, is_causal,
-                         dropout_p, dropout_mask, grid_y);
-}
 
 } // namespace cuda
 } // namespace OwnTensor 
