@@ -12,6 +12,7 @@
 #include "ops/helpers/MultiTensorKernels.h"
 #include <cuda_runtime.h>
 #include "device/DeviceCore.h"
+#include "device/AllocationTracker.h"
 
 namespace OwnTensor {
 namespace nn {
@@ -598,7 +599,8 @@ AdamW::AdamW(const std::vector<Tensor>& params,
 
 void AdamW::step() {
   step_count_++;
-   // Lazy initialization of momentum buffers — always FP32
+  TRACK_ALLOC_SCOPE("L601:nn::AdamW::step");
+  // Lazy initialization of momentum buffers — always FP32
   if (!initialized_) {
       m_.reserve(params_.size());
       v_.reserve(params_.size());

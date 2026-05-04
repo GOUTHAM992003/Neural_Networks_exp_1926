@@ -44,5 +44,19 @@ void multi_tensor_adam_cuda(
    bool is_adamw = false
 );
 
+void multi_tensor_adam_sm89_cuda(
+    const std::vector<TensorInfo>& params,
+    const std::vector<TensorInfo>& grads,
+    const std::vector<TensorInfo>& ms,
+    const std::vector<TensorInfo>& vs,
+    float lr, float beta1, float beta2, float eps, float weight_decay,
+    float bias_correction1, float bias_correction2, bool is_adamw
+);
+
+void multi_tensor_scale_sm89_cuda(
+    const std::vector<TensorInfo>& tensors, const float* clip_coef
+);
+
+
 } // namespace cuda
 } // namespace OwnTensor

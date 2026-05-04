@@ -1,0 +1,41 @@
+{
+  "tuning": {
+    "warmup_steps": 10,
+    "defrag_during_warmup": true,
+    "defrag_interval_steps": 1,
+    "empty_cache_during_warmup": true,
+    "min_buckets": 6,
+    "max_buckets": 10,
+    "max_bucket_width_mb": 0,
+    "strict_waste_target": false,
+    "waste_threshold": 0.15,
+    "persist_results": true,
+    "persist_path": "size_class_config.json",
+    "load_persisted": false,
+    "enabled": false,
+
+    "profile_mode": false,
+    "profile_steps_per_candidate": 3,
+    "profile_log_path": "../Debug_Logs/Tuner_Profile/profile_results.csv",
+    "profile_k_min": 2,
+    "profile_k_max": 5,
+    "profile_widths": [0],
+    "profile_min_cache_hit_rate": 85.0,
+    "profile_max_fragmentation": 20.0,
+
+    "benchmark_mode": true,
+    "benchmark_steps_per_candidate": 8,
+    "benchmark_log_path": "../Debug_Logs/Tuner_Deep/DeepTunerResults_1.csv",
+    "benchmark_k_min": 3,
+    "benchmark_k_max": 9,
+    "benchmark_overhead_bound_mb": 2.25,
+    "benchmark_num_candidates": 500,
+    "benchmark_sampling_strategy": "latin_hypercube",
+    "benchmark_seed": 42,
+    "benchmark_min_cache_hit_rate": 95.0,
+    "benchmark_max_fragmentation": 20.0,
+
+    "deep_mode": true,
+    "boundary_align_mb": 0.25
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "boundaries_bytes": [2097152,10485760,13631488, 20971520],
+  "computed_from": {
+    "unique_sizes_profiled": 84,
+    "total_allocations_profiled": 21697,
+    "waste_ratio": 0
+  }
+}

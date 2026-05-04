@@ -166,7 +166,7 @@ public:
         // Tensor attn_out = autograd::matmul(attn_probs, v);
         // // std::cout << "Came Here in Attention" << std::endl;
         Tensor attn_out = autograd::scaled_dot_product_attention(
-                q, k, v, /*is_causal=*/true, autograd::SDPBackend::MemoryEfficient);
+                q, k, v, /*is_causal=*/true, 0.0f, autograd::SDPBackend::MemoryEfficient);
 
         Tensor merged = autograd::reshape(
                             autograd::transpose(attn_out, 1, 2),
@@ -442,7 +442,7 @@ int main() {
         nn::AdamW optimizer(params, MAX_LR, 0.9f, 0.95f, 1e-8f, 0.1f);
         
         // Create data loaders
-        std::string data_root = "/home/blu-bridge016/Downloads/tensor_madhu/data";
+        std::string data_root = "/home/blu-bridge016/Desktop/master_gau_latest/data";
         DataLoaderLite train_loader(B, T, rank, world_size, "train", data_root, true, 100000000, gpu_device);
         DataLoaderLite val_loader(B, T, rank, world_size, "val", data_root, true, 100000000, gpu_device);
         

@@ -68,9 +68,10 @@ docu/
 ./snippet_runner
 snippet_runner
 *.bin
-
+*.py
+*.png
 snippet_runner
-
+*.md
 *.ckpt
 .cache
 *.sqlite

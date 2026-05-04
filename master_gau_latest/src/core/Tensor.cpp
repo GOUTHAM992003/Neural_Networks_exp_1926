@@ -15,7 +15,6 @@
 #include "dtype/DtypeTraits.h"
 #include "core/TensorDispatch.h"
 #include "core/TensorDataManip.h"
-#include "autograd/GraphRecorder.h"
 #include <iostream>
 #include <cstring>
 #include <algorithm>
@@ -146,8 +145,8 @@ namespace OwnTensor
             stride,
             offset,
             impl->dtype(),
-            impl->device(),
-            impl // Pass base_impl to keep original alive (for views)
+            impl->device()
+            // impl // Pass base_impl to keep original alive (for views)
         );
 
         if (impl->requires_grad()) {
@@ -282,9 +281,10 @@ namespace OwnTensor
         // If already contiguous with zero offset, return self (no copy needed)
         // If already contiguous with zero offset, return self (no copy needed)
         if (is_contiguous() && storage_offset() == 0) {
-            Tensor out(impl_->sizes(), dtype(), device(), requires_grad());
-            device::copy_memory(out.data(), impl_->device(), data(), impl_->device(), nbytes());
-            return out;
+            // Tensor out(impl_->sizes(), dtype(), device(), requires_grad());
+            // device::copy_memory(out.data(), impl_->device(), data(), impl_->device(), nbytes());
+            // return out;
+            return *this;
         }
 
         // Allocate destination with row-major layout on the same device
@@ -412,9 +412,6 @@ namespace OwnTensor
             impl_->device()
             // base_impl defaults to empty
         );
-        
-        // Propagate version counter to detached tensor
-        new_impl->set_version_counter(impl_->version_counter_ptr());
         
         return Tensor(std::move(new_impl));
     }
@@ -1066,6 +1063,7 @@ template const complex128_t* Tensor::grad<complex128_t>() const;
     template void Tensor::set_grad<int64_t>(const int64_t*, size_t);
     template void Tensor::set_grad<bool>(const bool*, size_t);
 
+
     template void Tensor::set_data<bool>(std::initializer_list<bool>);
     template void Tensor::set_data<int8_t>(std::initializer_list<int8_t>);
     template void Tensor::set_data<int16_t>(std::initializer_list<int16_t>);
@@ -1104,7 +1102,6 @@ template const complex128_t* Tensor::grad<complex128_t>() const;
 
     // Explicit instantiations for fill_grad
     template void Tensor::fill_grad<bool>(bool);
-    template void Tensor::fill_grad<int8_t>(int8_t);
     template void Tensor::fill_grad<int16_t>(int16_t);
     template void Tensor::fill_grad<int32_t>(int32_t);
     template void Tensor::fill_grad<int64_t>(int64_t);

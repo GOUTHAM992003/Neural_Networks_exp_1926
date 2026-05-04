@@ -8,6 +8,8 @@
 #include "ops/UnaryOps/Arithmetics.h"
 #include "ops/ScalarOps.h"
 #include "device/DeviceCore.h"
+#include "device/AllocationTracker.h"
+
 
 #ifdef WITH_CUDA
 #include "ops/helpers/LossKernels.h"
@@ -193,10 +195,12 @@ Tensor categorical_cross_entropy(const Tensor& predictions, const Tensor& target
 }
 
 Tensor sparse_cross_entropy_loss(const Tensor& logits, const Tensor& targets) {
-     GraphRecordMode::record_forward("LOSS: sparse_cross_entropy");
+    
+    GraphRecordMode::record_forward("LOSS: sparse_cross_entropy");
     // Handle both 2D [N, C] and 3D [B, T, C] logits
     auto logits_shape = logits.shape().dims;
     int64_t batch_size, num_classes;
+    TRACK_ALLOC_SCOPE("L201:autograd::sparse_cross_entropy_loss");
     Tensor logits_2d = logits;
     Tensor targets_1d = targets;
     
