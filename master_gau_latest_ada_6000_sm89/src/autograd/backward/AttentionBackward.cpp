@@ -140,5 +140,74 @@ std::vector<Tensor> MemEfficientAttentionBackward::apply(std::vector<Tensor>&& g
     return {grad_query, grad_key, grad_value};
 }
 
+// ============================================================================
+// PackedSDPABackward — writes dQ/dK/dV directly into one packed dqkv via
+// strided views. Pre-zeros dqkv once externally; passes skip_grad_zero=true
+// so the kernel does not run its contiguous-layout memset (which would
+// corrupt the interleaved packed buffer).
+// ============================================================================
+
+PackedSDPABackward::PackedSDPABackward(
+    const Tensor& qkv,
+    const Tensor& output, const Tensor& lse,
+    int64_t B, int64_t nh, int64_t T, int64_t hd,
+    bool is_causal)
+    : Node(1),  // single input edge: qkv
+      saved_qkv_(qkv), saved_output_(output), saved_lse_(lse),
+      B_(B), nh_(nh), T_(T), hd_(hd), C_(nh * hd), is_causal_(is_causal) {}
+
+std::vector<Tensor> PackedSDPABackward::apply(std::vector<Tensor>&& grads) {
+    if (grads.empty() || !grads[0].is_valid()) {
+        throw std::runtime_error("PackedSDPABackward: no gradient provided");
+    }
+    const Tensor& grad_output = grads[0];  // [B, T, C], contiguous
+    if (!grad_output.device().is_cuda() || grad_output.dtype() != Dtype::Float32) {
+        throw std::runtime_error(
+            "PackedSDPABackward: only CUDA float32 tensors are supported");
+    }
+
+    auto opts = TensorOptions().with_dtype(Dtype::Float32).with_device(grad_output.device());
+
+    Tensor dqkv  = Tensor::zeros(Shape{{B_, T_, 3 * C_}}, opts);
+    Tensor D_buf = Tensor::empty(Shape{{B_, nh_, T_}}, opts);
+
+    // Strides for views over qkv / dqkv as [B, nh, T, hd]:
+    //   strideB = T * 3C, strideM = 3C (Q,K,V interleaved on T axis),
+    //   strideH = hd, last (hd) stride = 1.
+    const int64_t qkv_strideB = T_ * 3 * C_;
+    const int64_t qkv_strideM = 3 * C_;
+    const int64_t qkv_strideH = hd_;
+
+    // O / dO is packed [B, T, C] contig as [B, nh, T, hd]:
+    const int64_t o_strideB = T_ * C_;
+    const int64_t o_strideM = C_;
+    const int64_t o_strideH = hd_;
+
+    // LSE / D are [B, nh, T] contig.
+    const int64_t lse_strideB = nh_ * T_;
+    const int64_t lse_strideH = T_;
+    const int64_t d_strideB   = nh_ * T_;
+    const int64_t d_strideH   = T_;
+
+    const float* qkv_ptr  = saved_qkv_.data<float>();
+    float*       dqkv_ptr = dqkv.data<float>();
+
+    cuda::mem_efficient_attn_backward(
+        /*Q  */ qkv_ptr + 0,        qkv_strideB, qkv_strideM, qkv_strideH,
+        /*K  */ qkv_ptr + C_,       qkv_strideB, qkv_strideM, qkv_strideH,
+        /*V  */ qkv_ptr + 2 * C_,   qkv_strideB, qkv_strideM, qkv_strideH,
+        /*O  */ saved_output_.data<float>(), o_strideB, o_strideM, o_strideH,
+        /*dO */ grad_output.data<float>(),   o_strideB, o_strideM, o_strideH,
+        /*LSE*/ saved_lse_.data<float>(),    lse_strideB, lse_strideH,
+        /*dQ */ dqkv_ptr + 0,        qkv_strideB, qkv_strideM, qkv_strideH,
+        /*dK */ dqkv_ptr + C_,       qkv_strideB, qkv_strideM, qkv_strideH,
+        /*dV */ dqkv_ptr + 2 * C_,   qkv_strideB, qkv_strideM, qkv_strideH,
+        /*D  */ D_buf.data<float>(), d_strideB, d_strideH,
+        B_, nh_, T_, hd_, is_causal_,
+        /*skip_grad_zero=*/true);
+
+    return {dqkv};
+}
+
 } // namespace autograd
 } // namespace OwnTensor

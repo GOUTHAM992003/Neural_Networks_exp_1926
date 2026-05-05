@@ -319,7 +319,8 @@ void mem_efficient_attn_backward_sm89_cuda(
     float* grad_value,        int64_t dv_strideB, int64_t dv_strideM, int64_t dv_strideH,
     float* D_buf,             int64_t d_strideB, int64_t d_strideH,
     int64_t B, int64_t nh, int64_t T, int64_t hd,
-    bool is_causal)
+    bool is_causal,
+    bool skip_grad_zero)
 {
     float scale = 1.0f / sqrtf(static_cast<float>(hd));
     const int BH = (int)(B * nh);
@@ -373,8 +374,10 @@ void mem_efficient_attn_backward_sm89_cuda(
         cudaFuncSetAttribute( \
             mem_efficient_bwd_unified_kernel_exp12<HD, true>, \
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem12); \
-        cudaMemsetAsync(params.dK, 0, (size_t)BH * (int)T * (HD) * sizeof(float)); \
-        cudaMemsetAsync(params.dV, 0, (size_t)BH * (int)T * (HD) * sizeof(float)); \
+        if (!skip_grad_zero) { \
+            cudaMemsetAsync(params.dK, 0, (size_t)BH * (int)T * (HD) * sizeof(float)); \
+            cudaMemsetAsync(params.dV, 0, (size_t)BH * (int)T * (HD) * sizeof(float)); \
+        } \
         mem_efficient_bwd_precompute_D_sm89<HD><<<grid_D, block_cfg>>>(params); \
         if (is_causal) { \
             mem_efficient_bwd_unified_kernel_exp12<HD, true> \

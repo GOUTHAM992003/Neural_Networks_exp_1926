@@ -76,3 +76,12 @@ master_gau/data/
 master_gau/checkpoints/
 checkpoints/
 *.ckpt
+
+# =========================
+# Nsight Systems / profiling reports
+# =========================
+*.nsys-rep
+*.qdrep
+*.qdstrm
+*.sqlite
+

@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <iomanip>
 #include <chrono>
@@ -165,32 +166,37 @@ public:
         // QKV Projection
         Tensor qkv = c_attn.forward(h);
 
-        std::vector<Tensor> inp = qkv.make_shards_inplace_axis(3, 2);
-        Tensor q = inp[0];
-        Tensor k = inp[1];
-        Tensor v = inp[2];
+        // Two paths, gated by USE_PACKED_SDPA env var (read once at startup):
+        //   USE_PACKED_SDPA=1  → packed: zero shard / reshape / transpose / cat
+        //   USE_PACKED_SDPA=0  → original shard-axis-2 path (relies on smart
+        //                        reshape + stride-aware kernels for partial fix)
+        static const bool kUsePackedSdpa = []() {
+            const char* e = std::getenv("USE_PACKED_SDPA");
+            return e && e[0] == '1';
+        }();
 
-        q = autograd::transpose( autograd::reshape(q, Shape({{B, T, n_heads_, head_dim_}})), 1, 2);
-        k = autograd::transpose( autograd::reshape(k, Shape({{B, T, n_heads_, head_dim_}})), 1, 2);
-        v = autograd::transpose( autograd::reshape(v, Shape({{B, T, n_heads_, head_dim_}})), 1, 2);
+        Tensor merged;
+        if (kUsePackedSdpa) {
+            merged = autograd::scaled_dot_product_attention_packed(
+                qkv, n_heads_, /*is_causal=*/true, /*dropout_p=*/0.0f,
+                autograd::SDPBackend::MemoryEfficient);
+        } else {
+            std::vector<Tensor> inp = qkv.make_shards_inplace_axis(3, 2);
+            Tensor q = inp[0];
+            Tensor k = inp[1];
+            Tensor v = inp[2];
 
-        // Scaled Dot-Product Attention
-        // Tensor attn_weights = autograd::matmul( autograd::mul(q, scale_), autograd::transpose(k, -2, -1));
+            q = autograd::transpose( autograd::reshape(q, Shape({{B, T, n_heads_, head_dim_}})), 1, 2);
+            k = autograd::transpose( autograd::reshape(k, Shape({{B, T, n_heads_, head_dim_}})), 1, 2);
+            v = autograd::transpose( autograd::reshape(v, Shape({{B, T, n_heads_, head_dim_}})), 1, 2);
 
-        // float neg_inf = -std::numeric_limits<float>::infinity();
-        // // auto masked = fused_tril_softmax(attn_weights, 0, neg_inf);
+            Tensor attn_out = autograd::scaled_dot_product_attention(
+                    q, k, v, /*is_causal=*/true, 0.0f, autograd::SDPBackend::MemoryEfficient);
 
-        // // Tensor attn_probs = autograd::softmax(masked);
-        // Tensor attn_probs = autograd::fused_tril_softmax(attn_weights, 0, neg_inf);
-
-        // Tensor attn_out = autograd::matmul(attn_probs, v);
-        // std::cout << "Came Here in Attention" << std::endl;
-        Tensor attn_out = autograd::scaled_dot_product_attention(
-                q, k, v, /*is_causal=*/true,0.0f, autograd::SDPBackend::MemoryEfficient);
-
-        Tensor merged = autograd::reshape(
-                            autograd::transpose(attn_out, 1, 2),
-                            Shape({{B, T, C}}));
+            merged = autograd::reshape(
+                                autograd::transpose(attn_out, 1, 2),
+                                Shape({{B, T, C}}));
+        }
 
         Tensor proj = c_proj.forward(merged);
 

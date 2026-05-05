@@ -555,7 +555,8 @@ void mem_efficient_attn_backward_sm89_cuda(
     float* grad_value,        int64_t dv_strideB, int64_t dv_strideM, int64_t dv_strideH,
     float* D_buf,             int64_t d_strideB, int64_t d_strideH,
     int64_t B, int64_t nh, int64_t T, int64_t hd,
-    bool is_causal);
+    bool is_causal,
+    bool skip_grad_zero);
 
 // ============================================================================
 // Public API (namespace cuda)
@@ -587,7 +588,8 @@ void mem_efficient_attn_backward(
     float* grad_value,        int64_t dv_strideB, int64_t dv_strideM, int64_t dv_strideH,
     float* D_buf,             int64_t d_strideB, int64_t d_strideH,
     int64_t B, int64_t nh, int64_t T, int64_t hd,
-    bool is_causal)
+    bool is_causal,
+    bool skip_grad_zero)
 {
     float scale = 1.0f / sqrtf(static_cast<float>(hd));
     const int BH = (int)(B * nh);
@@ -630,7 +632,9 @@ void mem_efficient_attn_backward(
         const size_t shmem_exp7 = 2ULL * block_n7 * ((HD) + 1) * sizeof(float); \
         const int kv_tiles7 = ((int)T + block_n7 - 1) / block_n7; \
         dim3 grid_bwd7(kv_tiles7, BH); \
-        cudaMemsetAsync(params.dQ, 0, (size_t)BH * (int)T * (HD) * sizeof(float)); \
+        if (!skip_grad_zero) { \
+            cudaMemsetAsync(params.dQ, 0, (size_t)BH * (int)T * (HD) * sizeof(float)); \
+        } \
         mem_efficient_bwd_precompute_D<HD><<<grid_D, block_cfg>>>(params); \
         if (is_causal) { \
             mem_efficient_bwd_unified_kernel_exp7<HD, true> \
@@ -658,8 +662,10 @@ void mem_efficient_attn_backward(
         cudaFuncSetAttribute( \
             mem_efficient_bwd_unified_kernel_exp11<HD, false>, \
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem11); \
-        cudaMemsetAsync(params.dK, 0, (size_t)BH * (int)T * (HD) * sizeof(float)); \
-        cudaMemsetAsync(params.dV, 0, (size_t)BH * (int)T * (HD) * sizeof(float)); \
+        if (!skip_grad_zero) { \
+            cudaMemsetAsync(params.dK, 0, (size_t)BH * (int)T * (HD) * sizeof(float)); \
+            cudaMemsetAsync(params.dV, 0, (size_t)BH * (int)T * (HD) * sizeof(float)); \
+        } \
         mem_efficient_bwd_precompute_D<HD><<<grid_D, block_cfg>>>(params); \
         if (is_causal) { \
             mem_efficient_bwd_unified_kernel_exp11<HD, true> \
@@ -685,7 +691,7 @@ void mem_efficient_attn_backward(
             grad_key,    dk_strideB, dk_strideM, dk_strideH,
             grad_value,  dv_strideB, dv_strideM, dv_strideH,
             D_buf,       d_strideB, d_strideH,
-            B, nh, T, hd, is_causal);
+            B, nh, T, hd, is_causal, skip_grad_zero);
         return;
     }
 

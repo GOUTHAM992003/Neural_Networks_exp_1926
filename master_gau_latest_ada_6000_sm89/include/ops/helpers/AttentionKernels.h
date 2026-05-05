@@ -62,7 +62,11 @@ void mem_efficient_attn_backward(
    float* grad_value,        int64_t dv_strideB, int64_t dv_strideM, int64_t dv_strideH,
    float* D_buf,             int64_t d_strideB, int64_t d_strideH,
    int64_t B, int64_t nh, int64_t T, int64_t hd,
-   bool is_causal
+   bool is_causal,
+   bool skip_grad_zero = false  // when true, kernel skips its internal dQ/dK/dV
+                                // memsets — caller must pre-zero (used by packed
+                                // SDPA where dQ/dK/dV are strided views into one
+                                // dqkv buffer and a contiguous memset would corrupt it)
 );
 
 } // namespace cuda

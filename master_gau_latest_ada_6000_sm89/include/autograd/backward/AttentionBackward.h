@@ -115,5 +115,38 @@ public:
     }
 };
 
+/**
+ * @brief Backward for scaled_dot_product_attention_packed.
+ *
+ * Forward saved a packed `qkv [B, T, 3*C]` and a packed output `O [B, T, C]`.
+ * Backward allocates one zeroed `dqkv [B, T, 3*C]`, passes strided views
+ * (Q@0, K@C, V@2C — same stride layout as forward) into the unified
+ * mem-efficient backward kernel with skip_grad_zero=true, and returns the
+ * single packed dqkv. No Tensor::cat needed downstream.
+ */
+class PackedSDPABackward : public Node {
+private:
+    Tensor saved_qkv_;
+    Tensor saved_output_;
+    Tensor saved_lse_;
+    int64_t B_, nh_, T_, hd_, C_;
+    bool is_causal_;
+
+public:
+    PackedSDPABackward(
+        const Tensor& qkv,
+        const Tensor& output, const Tensor& lse,
+        int64_t B, int64_t nh, int64_t T, int64_t hd,
+        bool is_causal);
+
+    const char* name() const override { return "PackedSDPABackward"; }
+    std::vector<Tensor> apply(std::vector<Tensor>&& grads) override;
+    void release_saved_variables() override {
+        saved_qkv_    = Tensor();
+        saved_output_ = Tensor();
+        saved_lse_    = Tensor();
+    }
+};
+
 } // namespace autograd
 } // namespace OwnTensor

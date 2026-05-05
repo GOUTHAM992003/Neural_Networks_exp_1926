@@ -88,6 +88,30 @@ Tensor scaled_dot_product_attention(
 );
 
 /**
+ * @brief Fully-fused packed-QKV attention (zero copies).
+ *
+ * Reads Q/K/V directly from packed `qkv [B,T,3C]` via strided pointers
+ * (no shard, no reshape, no transpose). Writes output as packed `[B,T,C]`
+ * contiguous — feeds straight into c_proj. Backward writes dQ/dK/dV into
+ * one packed dqkv [B,T,3C] (no Tensor::cat), feeds straight into c_attn
+ * backward. Eliminates all attention-driven copy/cat traffic.
+ *
+ * @param qkv         [B, T, 3*n_heads*head_dim] packed projection output
+ * @param n_heads     number of attention heads
+ * @param is_causal   apply causal mask
+ * @param dropout_p   currently must be 0.0
+ * @param backend     only MemoryEfficient is supported
+ * @return            [B, T, n_heads*head_dim] packed contiguous output
+ */
+Tensor scaled_dot_product_attention_packed(
+    const Tensor& qkv,
+    int64_t n_heads,
+    bool is_causal = true,
+    float dropout_p = 0.0f,
+    SDPBackend backend = SDPBackend::MemoryEfficient
+);
+
+/**
  * @brief Fused tril_softmax + matmul for attention: avoids duplicate attn_probs storage.
  *
  * Computes:

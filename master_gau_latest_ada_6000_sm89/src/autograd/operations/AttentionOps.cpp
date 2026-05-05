@@ -334,6 +334,86 @@ static Tensor sdpa_memory_efficient(
 #endif
 
 // ============================================================================
+// Packed-QKV mem-efficient forward (zero shard / reshape / transpose).
+// Reads Q/K/V from a single qkv [B,T,3C] via strided pointers.
+// Writes output as packed [B,T,C] contiguous (heads packed inner).
+// ============================================================================
+
+#ifdef WITH_CUDA
+static Tensor sdpa_memory_efficient_packed(
+    const Tensor& qkv,
+    int64_t n_heads,
+    bool is_causal)
+{
+    if (!qkv.device().is_cuda() || qkv.dtype() != Dtype::Float32) {
+        throw std::runtime_error(
+            "scaled_dot_product_attention_packed: only CUDA float32 tensors are supported");
+    }
+    if (qkv.shape().dims.size() != 3) {
+        throw std::runtime_error(
+            "scaled_dot_product_attention_packed: qkv must be a 3-D tensor [B, T, 3*C]");
+    }
+
+    const int64_t B  = qkv.shape().dims[0];
+    const int64_t T  = qkv.shape().dims[1];
+    const int64_t C3 = qkv.shape().dims[2];
+    if (C3 % 3 != 0) {
+        throw std::runtime_error(
+            "scaled_dot_product_attention_packed: qkv last dim must be divisible by 3");
+    }
+    const int64_t C  = C3 / 3;
+    if (n_heads <= 0 || C % n_heads != 0) {
+        throw std::runtime_error(
+            "scaled_dot_product_attention_packed: n_embd must be divisible by n_heads");
+    }
+    const int64_t nh = n_heads;
+    const int64_t hd = C / nh;
+
+    auto opts = TensorOptions().with_dtype(Dtype::Float32).with_device(qkv.device());
+
+    Tensor output = Tensor::empty(Shape{{B, T, C}}, opts);
+    Tensor lse    = Tensor::empty(Shape{{B, nh, T}}, opts);
+
+    // qkv viewed as [B, nh, T, hd]:
+    //   strideB = T * 3C, strideM = 3C, strideH = hd, last = 1.
+    const int64_t qkv_strideB = T * 3 * C;
+    const int64_t qkv_strideM = 3 * C;
+    const int64_t qkv_strideH = hd;
+
+    // output is [B,T,C] contig viewed as [B,nh,T,hd]:
+    const int64_t o_strideB = T * C;
+    const int64_t o_strideM = C;
+    const int64_t o_strideH = hd;
+
+    const int64_t lse_strideB = nh * T;
+    const int64_t lse_strideH = T;
+
+    const float* qkv_ptr = qkv.data<float>();
+    cuda::mem_efficient_attn_forward_tc(
+        /*Q*/ qkv_ptr + 0,        qkv_strideB, qkv_strideM, qkv_strideH,
+        /*K*/ qkv_ptr + C,        qkv_strideB, qkv_strideM, qkv_strideH,
+        /*V*/ qkv_ptr + 2 * C,    qkv_strideB, qkv_strideM, qkv_strideH,
+        output.data<float>(),  o_strideB, o_strideM, o_strideH,
+        lse.data<float>(),     lse_strideB, lse_strideH,
+        B, nh, T, hd, is_causal, 0.0f, nullptr);
+
+    if (GradMode::is_enabled() && qkv.requires_grad()) {
+        auto grad_fn = std::make_shared<PackedSDPABackward>(
+            qkv.detach(), output.detach(), lse.detach(),
+            B, nh, T, hd, is_causal);
+
+        Tensor& qkv_mut = const_cast<Tensor&>(qkv);
+        grad_fn->set_next_edge(0, get_grad_edge(qkv_mut));
+
+        output.set_grad_fn(grad_fn);
+        output.set_requires_grad(true);
+    }
+
+    return output;
+}
+#endif
+
+// ============================================================================
 // Public Dispatch
 // ============================================================================
 
@@ -368,6 +448,33 @@ Tensor scaled_dot_product_attention(
     }
 }
 
+
+Tensor scaled_dot_product_attention_packed(
+    const Tensor& qkv,
+    int64_t n_heads,
+    bool is_causal,
+    float /*dropout_p*/,
+    SDPBackend backend)
+{
+    GraphRecordMode::record_forward("ATTENTION: scaled_dot_product_attention_packed");
+    TRACK_ALLOC_SCOPE("L158:autograd::scaled_dot_product_attention_packed");
+
+    switch (backend) {
+        case SDPBackend::MemoryEfficient:
+#ifdef WITH_CUDA
+            return sdpa_memory_efficient_packed(qkv, n_heads, is_causal);
+#else
+            throw std::runtime_error(
+                "Packed memory-efficient attention requires CUDA.");
+#endif
+        case SDPBackend::Math:
+            throw std::runtime_error(
+                "scaled_dot_product_attention_packed: SDPBackend::Math not supported; "
+                "use scaled_dot_product_attention instead.");
+        default:
+            throw std::runtime_error("Unknown SDPBackend");
+    }
+}
 
 // ============================================================================
 // Fused tril_softmax + matmul (dedup attn_probs storage)
