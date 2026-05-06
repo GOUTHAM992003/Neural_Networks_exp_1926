@@ -521,68 +521,51 @@ compilation unit calls the function with the wrong number of arguments).
 
 ## 14. Architecture Mindmaps — Standard SDPA Forward
 
-Step-by-step data flow from the c_attn output through to c_proj, showing every
-intermediate operation, its tensor shape, stride layout, and whether it triggers
-a data copy or is metadata-only.
+**Verified against**: `gpt2_attn_navin.cpp:183-198`, `AttentionOps.cpp:258-333`,
+`ViewOps.cpp:58-108`
 
 ```
 qkv [B, T, 3C]  (contiguous output from c_attn Linear / cublasLt GEMM)
     │
     ▼
-make_shards_inplace_axis(3, axis=2)
-    │   Splits along dim-2 (the 3C dimension).
-    │   Creates 3 aliased VIEWS into the same storage:
-    │     q [B, T, C]  stride={T·3C, 3C, 1}  offset=0
-    │     k [B, T, C]  stride={T·3C, 3C, 1}  offset=C
-    │     v [B, T, C]  stride={T·3C, 3C, 1}  offset=2C
-    │   No data movement — just metadata.
+make_shards_inplace_axis(3, axis=2)                        ← METADATA ONLY
+    │   Creates 3 aliased VIEWS: q,k,v [B,T,C] stride={T·3C, 3C, 1}
     ▼
-reshape(q, [B, T, nh, hd])
-    │   Smart reshape (compute_view_stride) detects that splitting the
-    │   innermost contiguous dim C=768 into nh×hd = 12×64 is view-eligible
-    │   (stride[-1]=1, and 12×64=768 matches dim size).
-    │   Result: VIEW with strides {T·3C, 3C, 64, 1}  ✓ NO COPY
+autograd::reshape(q, [B, T, nh, hd])                       ← VIEW (smart reshape)
+    │   compute_view_stride: C=768 → 12×64 is view-eligible
+    │   Strides: {T·3C, 3C, 64, 1}  ✓ NO COPY  (same for k, v)
     ▼
-transpose(1, 2)
-    │   Swaps dims 1 and 2:  [B, T, nh, hd] → [B, nh, T, hd]
-    │   New strides: {T·3C, 64, 3C, 1}
-    │   Still a VIEW — no data copy.
+autograd::transpose(q, 1, 2)                               ← VIEW
+    │   [B,T,nh,hd] → [B,nh,T,hd]  strides: {T·3C, 64, 3C, 1}
+    │   ✓ NO COPY  (same for k, v)
     ▼
-.contiguous()  ← ⚠️ MANDATORY COPY #1
-    │   The tensor is NOT contiguous after transpose.
-    │   Stride check: {T·3C, 64, 3C, 1}
-    │     dim-2 stride = 3C = 2304, but dim-2 size × dim-3 stride = T × 1 ≠ 2304
-    │   Materializes a fresh [B, nh, T, hd] contiguous tensor.
-    │   This is a full strided_inner_vec_copy kernel.
-    │   ──── SAME for k and v (3 copies total) ────
+scaled_dot_product_attention(q, k, v)                      ← STRIDE-AWARE KERNEL
+    │   sdpa_memory_efficient (AttentionOps.cpp:278-302):
+    │     Lines 282-284: reads strides directly from q, k, v
+    │     Line 296-302: passes strides to mem_efficient_attn_forward_tc
+    │     ✓ NO .contiguous() — kernel handles non-contiguous input natively
+    │   Saves ORIGINAL strided q,k,v views for backward (line 310).
+    │   Output: attn_out [B, nh, T, hd] CONTIGUOUS (newly allocated).
     ▼
-scaled_dot_product_attention(q_contig, k_contig, v_contig)
-    │   Calls mem_efficient_attn_forward_tc with CONTIGUOUS q, k, v.
-    │   Output: attn_out [B, nh, T, hd] contiguous.
-    │   Also returns LSE [B, nh, T] for backward.
+autograd::transpose(attn_out, 1, 2)                        ← VIEW
+    │   [B,nh,T,hd] → [B,T,nh,hd]  strides: {nh·T·hd, hd, T·hd, 1}
     ▼
-attn_out.transpose(1, 2)
-    │   [B, nh, T, hd] → [B, T, nh, hd]
-    │   Strides become non-contiguous.
+autograd::reshape({B, T, C})                               ← ⚠️ THE ONE COPY
+    │   compute_view_stride on [B,T,nh,hd]: merge [nh,hd]→C needs
+    │   stride[2]==hd → but stride[2]=T·hd ≠ hd → FAILS
+    │   Falls through to .contiguous() (ViewOps.cpp:94).
+    │   ONE strided_inner_vec_copy kernel.
     ▼
-.contiguous()  ← ⚠️ MANDATORY COPY #2
-    │   Materializes [B, T, nh, hd] contiguous.
-    ▼
-reshape(B, T, C)
-    │   [B, T, nh, hd] → [B, T, C]  (C = nh × hd = 768)
-    │   Now contiguous, so this is a pure VIEW.
-    ▼
-y [B, T, C]  → feeds into c_proj Linear
+y [B, T, C]  contiguous → feeds into c_proj Linear
 ```
 
 ### Forward Kernel Count (Standard Path)
 
 | Kernel | Count | Purpose |
 |--------|-------|---------|
-| `strided_inner_vec_copy` | 3 | q, k, v `.contiguous()` after transpose |
 | `mem_efficient_attn_forward_tc` | 1 | The actual SDPA computation |
-| `strided_inner_vec_copy` | 1 | output `.contiguous()` after transpose |
-| **Total extra copies** | **4** | |
+| `strided_inner_vec_copy` | **1** | output merge: `transpose(1,2).reshape(B,T,C)` |
+| **Total extra copies** | **1** | |
 
 ---
 
@@ -625,51 +608,59 @@ y [B, T, C]  → feeds into c_proj Linear (ALREADY the right shape!)
 | `mem_efficient_attn_forward_tc` | 1 | The actual SDPA computation |
 | **Total extra copies** | **0** | |
 
-> **Key insight**: Packed SDPA eliminates ALL 4 copy kernels from the forward
-> pass. The kernel's stride-based indexing handles the interleaved Q/K/V layout
-> natively.
+> **Key insight**: Packed SDPA eliminates the 1 merge copy from the forward
+> pass. The kernel writes output directly as `[B,T,C]` contiguous — no
+> transpose+reshape needed afterward.
 
 ---
 
 ## 16. Architecture Mindmaps — Standard SDPA Backward
 
-The backward pass mirrors the forward, but with additional overhead from gradient
-recombination (the `Tensor::cat` to reassemble dQ/dK/dV into dqkv).
+**Verified against**: `AttentionBackward.cpp:84-141`, `ReshapeOps.cpp:35-41`,
+`TransposeBackward.cpp:9-17`, `parallelizeutilsBackward.cpp:11-38`
+
+The autograd graph unwinds in reverse. Every node below is traced from the
+actual `apply()` implementations.
 
 ```
 grad_output [B, T, C]  contiguous (from c_proj backward)
     │
     ▼
-Reshape backward: view as [B, T, nh, hd]   ← VIEW, no copy
+ReshapeBackward::apply (ReshapeOps.cpp:40)
+    │   grad.reshape({B, T, nh, hd})
+    │   grad is contiguous [B,T,C], splitting C into nh×hd → VIEW ✓ NO COPY
     ▼
-Transpose backward: .transpose(1,2)         ← VIEW, [B, nh, T, hd]
+TransposeBackward::apply (TransposeBackward.cpp:16)
+    │   grad.transpose(1, 2)
+    │   [B,T,nh,hd] → [B,nh,T,hd]  non-contiguous VIEW ✓ NO COPY
     ▼
-.contiguous()  ← ⚠️ COPY for grad_output
+MemEfficientAttentionBackward::apply (AttentionBackward.cpp:84-141)
     │
-    ▼  Saved tensors from forward: q_contig, k_contig, v_contig, O_contig, LSE
-    │  (these were saved AFTER .contiguous(), so already contiguous)
+    │   Line 99: const Tensor& grad_output = grad_output_raw;
+    │   ✓ NO .contiguous() — backward is STRIDE-AWARE.
+    │   Lines 119-138: passes all strides directly to kernel.
+    │
+    │   Internal kernel memsets (for atomicAdd targets):
+    │     cudaMemsetAsync(dQ, 0, ...)  — exp7 path
+    │     cudaMemsetAsync(dK, 0, ...)  — exp11/12 path
+    │     cudaMemsetAsync(dV, 0, ...)  — exp11/12 path
+    │   (Correct here — dQ/dK/dV are separate contiguous tensors)
+    │
+    │   Output: dQ, dK, dV each [B,nh,T,hd] CONTIGUOUS (lines 107-109)
+    │
+    ├──→ dQ backward through q's autograd chain:
+    │       TransposeBackward(1,2): dQ.transpose(1,2) → [B,T,nh,hd] VIEW
+    │       ReshapeBackward({B,T,C}): grad.reshape({B,T,C})
+    │         strides: {nh·T·hd, hd, T·hd, 1} → merge [nh,hd]→C:
+    │         stride[2]=T·hd ≠ hd → FAILS → .contiguous()  ← ⚠️ COPY #1
+    │
+    ├──→ dK: same chain → .contiguous()  ← ⚠️ COPY #2
+    └──→ dV: same chain → .contiguous()  ← ⚠️ COPY #3
     │
     ▼
-mem_efficient_attn_backward(grad_O, q, k, v, O, LSE, ...)
-    │
-    │   INTERNALLY the kernel does:
-    │     cudaMemsetAsync(dQ, 0, ...)  ← zeros dQ buffer (contiguous)
-    │     cudaMemsetAsync(dK, 0, ...)  ← zeros dK buffer
-    │     cudaMemsetAsync(dV, 0, ...)  ← zeros dV buffer
-    │   Then accumulates gradients via atomicAdd (for dQ in exp7)
-    │   or direct writes (for dK, dV).
-    │
-    │   Output: dQ [B, nh, T, hd], dK [B, nh, T, hd], dV [B, nh, T, hd]
-    │           all contiguous, all separate allocations.
-    ▼
-dQ.transpose(1,2).contiguous().reshape(B,T,C)  ← ⚠️ COPY (dQ merge)
-dK.transpose(1,2).contiguous().reshape(B,T,C)  ← ⚠️ COPY (dK merge)
-dV.transpose(1,2).contiguous().reshape(B,T,C)  ← ⚠️ COPY (dV merge)
-    │
-    ▼
-Tensor::cat({dQ, dK, dV}, dim=2)  ← ⚠️ cat_batched_kernel
-    │   Allocates dqkv [B, T, 3C] and copies all three into it.
-    │   This is the backward of make_shards_inplace_axis.
+Make_shards_inplace_axis_Backward::apply (parallelizeutilsBackward.cpp:37)
+    │   Tensor::cat(valid_grads, axis=2)
+    │   3 × [B,T,C] → [B,T,3C]  ← ⚠️ cat_batched_kernel
     ▼
 dqkv [B, T, 3C]  → feeds into c_attn Linear backward
 ```
@@ -678,74 +669,63 @@ dqkv [B, T, 3C]  → feeds into c_attn Linear backward
 
 | Kernel | Count | Purpose |
 |--------|-------|---------|
-| `strided_inner_vec_copy` | 1 | grad_output `.contiguous()` |
-| `cudaMemsetAsync` | 3 | Internal dQ, dK, dV zeroing |
+| `cudaMemsetAsync` | 2-3 | Internal dQ/dK/dV zeroing (exp-path dependent) |
 | `mem_efficient_attn_backward` | 1 | The actual backward |
-| `strided_inner_vec_copy` | 3 | dQ, dK, dV transpose+contiguous |
-| `cat_batched_kernel` | 1 | Recombine dQ+dK+dV → dqkv |
-| **Total extra kernels** | **8** | |
+| `strided_inner_vec_copy` | **3** | dQ, dK, dV: transpose→reshape→.contiguous() |
+| `cat_batched_kernel` | **1** | Recombine dQ+dK+dV → dqkv |
+| **Total extra copy/cat kernels** | **4** | (3 merge copies + 1 cat) |
+
+> **Note**: There is NO grad_output `.contiguous()` copy. The backward kernel
+> is stride-aware (AttentionBackward.cpp:96-99) — the non-contiguous grad goes
+> in directly. This was NOT always the case; the stride-aware change eliminated
+> what used to be a 4th copy here.
 
 ---
 
 ## 17. Architecture Mindmaps — Packed SDPA Backward
 
-The packed backward eliminates all copy, cat, and internal memset overhead by
-writing gradients directly into a pre-zeroed interleaved buffer.
+**Verified against**: `AttentionBackward.cpp:150-210`
 
 ```
 grad_output [B, T, C]  contiguous (from c_proj backward)
     │
-    │  Already [B, T, C] — the forward output was packed [B, T, C].
-    │  grad_O strides: {T·C, C, hd, 1}
-    │  NO transpose, NO .contiguous() needed.
+    │  NO transpose/reshape in forward → NO TransposeBackward or
+    │  ReshapeBackward nodes in the graph. grad_output arrives
+    │  directly at PackedSDPABackward::apply.
     │
-    │  Saved tensors from forward:
-    │    qkv [B, T, 3C]  (the original packed input, detached)
-    │    O   [B, T, C]   (the packed output)
-    │    LSE [B, nh, T]
+    │  Saved tensors: qkv [B,T,3C], O [B,T,C], LSE [B,nh,T]
     │
     ▼
-Allocate ONE tensor: dqkv = Tensor::zeros([B, T, 3C])
+Allocate ONE tensor: dqkv = Tensor::zeros([B, T, 3C])      (line 171)
     │
-    │  Compute 3 strided pointers into this single buffer:
-    │    dQ_ptr = dqkv.data<float>() + 0     stride: {T·3C, 3C, hd, 1}
-    │    dK_ptr = dqkv.data<float>() + C     stride: {T·3C, 3C, hd, 1}
-    │    dV_ptr = dqkv.data<float>() + 2·C   stride: {T·3C, 3C, hd, 1}
-    │
-    │  Same pointer trick as forward — dQ/dK/dV are interleaved
-    │  inside dqkv, NOT separate contiguous blocks.
+    │  3 strided pointers into this single buffer (lines 177-179):
+    │    dQ_ptr = dqkv_ptr + 0     stride: {T·3C, 3C, hd, 1}
+    │    dK_ptr = dqkv_ptr + C     stride: {T·3C, 3C, hd, 1}
+    │    dV_ptr = dqkv_ptr + 2·C   stride: {T·3C, 3C, hd, 1}
     │
     ▼
-mem_efficient_attn_backward(..., skip_grad_zero=true)
+mem_efficient_attn_backward(..., skip_grad_zero=true)       (line 195-207)
     │
-    │   skip_grad_zero=true means:
-    │     ✗ NO cudaMemsetAsync(dQ, 0, ...) — we already zeroed dqkv
-    │     ✗ NO cudaMemsetAsync(dK, 0, ...) — same buffer, already zero
-    │     ✗ NO cudaMemsetAsync(dV, 0, ...) — same buffer, already zero
+    │   skip_grad_zero=true:
+    │     ✗ NO cudaMemsetAsync — we already zeroed dqkv
+    │   WHY: kernel's internal memset assumes contiguous blocks.
+    │   Interleaved layout → contiguous memset would corrupt neighbors.
     │
-    │   WHY skip? Because the kernel's internal memset assumes dQ/dK/dV
-    │   are CONTIGUOUS blocks. But here they're INTERLEAVED (stride 3C
-    │   between rows). A contiguous memset would corrupt neighboring
-    │   gradients. We pre-zeroed the ENTIRE interleaved buffer instead.
-    │
-    │   The kernel writes gradients via the same stride-based indexing:
+    │   Kernel writes gradients via stride-based indexing:
     │     dQ[b][h][t][d] = dQ_ptr[b*T*3C + t*3C + h*hd + d]
-    │
-    │   Output: dQ/dK/dV are written IN-PLACE into dqkv.
     ▼
-dqkv [B, T, 3C]  → feeds DIRECTLY into c_attn Linear backward
-    │
+return {dqkv}                                               (line 209)
     │  ── NO transpose, NO .contiguous(), NO Tensor::cat ──
-    │  The single dqkv buffer IS the gradient for qkv.
+    │  Feeds DIRECTLY into c_attn Linear backward.
 ```
 
 ### Backward Kernel Count (Packed Path)
 
 | Kernel | Count | Purpose |
 |--------|-------|---------|
-| `cudaMemsetAsync` | 1 | Pre-zero the entire dqkv buffer |
+| `cudaMemsetAsync` | 1 | Pre-zero dqkv (via Tensor::zeros) |
 | `mem_efficient_attn_backward` | 1 | The actual backward |
-| **Total extra kernels** | **1** | (just the pre-zero) |
+| **Total extra copy/cat kernels** | **0** | |
 
 ### Why the kernel CAN'T memset internally for packed layout
 
@@ -757,89 +737,73 @@ dqkv buffer (interleaved):
 │ ...     │ ...     │ ...     │
 └─────────┴─────────┴─────────┘
 
-If kernel does cudaMemsetAsync(dQ_ptr, 0, B*nh*T*hd*sizeof(float)):
-  → It would zero a CONTIGUOUS block of B*nh*T*hd floats starting at dQ_ptr
-  → But dQ is NOT contiguous! It has stride 3C between rows.
-  → The memset would OVERWRITE dK and dV data! ✗ CORRUPTION
+cudaMemsetAsync(dQ_ptr, 0, B*nh*T*hd*sizeof(float)):
+  → Zeros a CONTIGUOUS block starting at dQ_ptr
+  → But dQ has stride 3C between rows — NOT contiguous
+  → Would OVERWRITE dK and dV data! ✗ CORRUPTION
 
-Solution: Pre-zero the ENTIRE dqkv buffer ONCE (all 3C×T×B floats),
-then tell the kernel skip_grad_zero=true so it doesn't touch the zeroing.
+Solution: Pre-zero ENTIRE dqkv once, skip_grad_zero=true.
 ```
 
 ---
 
 ## 18. Side-by-Side Summary & Memory Layout Visualization
 
-### Total Kernel Savings Per Attention Layer (Forward + Backward)
+### Kernel Savings Per Attention Layer (Forward + Backward)
 
 | | Standard | Packed | Saved |
 |---|---------|--------|-------|
-| **Forward copies** | 4 | 0 | **4** |
-| **Backward copies** | 3 | 0 | **3** |
-| **Internal memsets** | 3 | 0 | **3** |
-| **cat_batched** | 1 | 0 | **1** |
-| **Pre-zero** | 0 | 1 | -1 |
-| **SDPA kernels** | 2 | 2 | 0 |
-| **grad_output copy** | 1 | 0 | **1** |
-| **Total** | **14** | **3** | **11** |
+| **Forward merge copy** | 1 | 0 | **1** |
+| **Backward dQ/dK/dV merge copies** | 3 | 0 | **3** |
+| **Backward cat_batched** | 1 | 0 | **1** |
+| **Internal memsets** | 2-3 | 1 (pre-zero) | **1-2** |
+| **SDPA kernels (fwd+bwd)** | 2 | 2 | 0 |
+| **Total per layer** | **9-10** | **4** | **5-6** |
 
-With 12 attention layers in GPT-2, packed SDPA eliminates **132 kernels per
-training step** (11 × 12). That's 132 fewer kernel launches, 132 fewer memory
-passes, and significant VRAM bandwidth savings.
-
-### Mermaid Summary
+With 12 attention layers in GPT-2, packed SDPA eliminates **60-72 extra kernels
+per training step** (5-6 × 12).
 
 ```mermaid
 graph LR
     subgraph Standard["Standard SDPA (PACKED_SDPA=0)"]
         direction TB
-        SF["Forward: 5 kernels\n(1 SDPA + 4 copies)"]
-        SB["Backward: 9 kernels\n(1 SDPA + 3 memsets + 3 copies + 1 cat + 1 grad copy)"]
-        ST["Total: 14 kernels"]
+        SF["Forward: 2 kernels\n(1 SDPA + 1 merge copy)"]
+        SB["Backward: 7-8 kernels\n(1 SDPA + 2-3 memsets + 3 copies + 1 cat)"]
+        ST["Total: 9-10 kernels"]
         SF --> SB --> ST
     end
 
     subgraph Packed["Packed SDPA (PACKED_SDPA=1)"]
         direction TB
         PF["Forward: 1 kernel\n(1 SDPA only)"]
-        PB["Backward: 2 kernels\n(1 SDPA + 1 pre-zero)"]
-        PT["Total: 3 kernels"]
+        PB["Backward: 2-3 kernels\n(1 SDPA + 1 pre-zero)"]
+        PT["Total: 3-4 kernels"]
         PF --> PB --> PT
     end
 
     Standard ~~~ Packed
 ```
 
-### Memory Layout Visualization
-
-#### Standard Path — Memory After Shard + Reshape + Transpose + Contiguous
+### Memory Layout — Standard Path
 
 ```
-Original qkv storage (shared by q, k, v views):
+qkv storage — kernel reads strided Q/K/V directly (NO separate copies):
 ┌────────────────────────────────────────────────────────────┐
 │ Q₀₀₀...Q₀₀₇₆₇ │ K₀₀₀...K₀₀₇₆₇ │ V₀₀₀...V₀₀₇₆₇ │  ← token 0
 │ Q₀₁₀...Q₀₁₇₆₇ │ K₀₁₀...K₀₁₇₆₇ │ V₀₁₀...V₀₁₇₆₇ │  ← token 1
-│ ...                                                       │
 └────────────────────────────────────────────────────────────┘
-  stride = 3C between tokens (interleaved Q/K/V)
-
-After .contiguous() — THREE separate allocations:
-┌──────────────────────┐  ┌──────────────────────┐  ┌──────────────────────┐
-│ Q: [B, nh, T, hd]   │  │ K: [B, nh, T, hd]   │  │ V: [B, nh, T, hd]   │
-│ contiguous, stride=C │  │ contiguous, stride=C │  │ contiguous, stride=C │
-└──────────────────────┘  └──────────────────────┘  └──────────────────────┘
-  ↑ 3 full copies of data!
+  The stride-aware SDPA kernel reads this directly — no .contiguous().
+  Only copy: output [B,nh,T,hd] → transpose → reshape → [B,T,C] (1 copy).
 ```
 
-#### Packed Path — Memory (NO extra allocations)
+### Memory Layout — Packed Path
 
 ```
 Same qkv storage — kernel reads DIRECTLY with stride=3C:
 ┌────────────────────────────────────────────────────────────┐
 │ Q₀₀₀...Q₀₀₇₆₇ │ K₀₀₀...K₀₀₇₆₇ │ V₀₀₀...V₀₀₇₆₇ │  ← token 0
 │ Q₀₁₀...Q₀₁₇₆₇ │ K₀₁₀...K₀₁₇₆₇ │ V₀₁₀...V₀₁₇₆₇ │  ← token 1
-│ ...                                                       │
 └────────────────────────────────────────────────────────────┘
   Q_ptr──┘           K_ptr──┘           V_ptr──┘
-  All 3 are just pointer offsets. Zero extra VRAM.
+  Output written directly as [B,T,C] contiguous — zero extra copies.
 ```
