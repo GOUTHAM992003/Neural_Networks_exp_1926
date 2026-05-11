@@ -85,10 +85,10 @@ nvcc my_kernel.cu \
 > [!NOTE]  
 > Notice the **last line**: `code=compute_120` (not `sm_120`). This embeds *only PTX*, not SASS. This is the **forward compatibility safety net** — if someone runs PyTorch on a future `sm_130` GPU, the driver will JIT-compile the `compute_120` PTX into native `sm_130` SASS. It'll work, but may not be maximally optimized.
 
-### 2.4 What This Means For Your Ada RTX 6000 (sm_89)
+### 2.4 What This Means For My Ada RTX 6000 (sm_89)
 
 Since PyTorch's pip wheel includes `sm_89` SASS:
-- **Your GPU gets pre-compiled native code** — zero JIT overhead
+- **My GPU gets pre-compiled native code** — zero JIT overhead
 - The SASS is compiled using the `compute_89` virtual architecture, so it CAN use Ada-specific instructions (like FP8 tensor core instructions, `cp.async` optimizations, etc.)
 - But whether it ACTUALLY uses them depends on Level 2 (the kernel source code)
 
@@ -388,9 +388,9 @@ flowchart TD
 
 ---
 
-## 6. Connecting This To YOUR Project (Ada RTX 6000, sm_89)
+## 6. Connecting This To My Project (Ada RTX 6000, sm_89)
 
-Looking at your project (`master_gau_latest_ada_6000_sm89`), your Makefile targets **only** `sm_89`:
+Looking at my project (`master_gau_latest_ada_6000_sm89`), My Makefile targets **only** `sm_89`:
 
 ```makefile
 # Your compilation:
@@ -398,19 +398,19 @@ nvcc -arch=sm_89 ...
 ```
 
 This means:
-1. **Your kernels produce SASS only for sm_89** — they will NOT run on any other GPU
+1. **My kernels produce SASS only for sm_89** — they will NOT run on any other GPU
 2. **No PTX fallback** — no forward compatibility
 3. **No fat binary** — smallest possible binary, fastest possible compilation
 4. **This is the correct choice** for your use case (single-target performance optimization)
 
-### How your kernels map to the 4 categories:
+### How My kernels map to the 4 categories:
 
-| Your Component | Category | What Happens |
+| My Component | Category | What Happens |
 |---------------|----------|--------------|
-| Custom contiguous copy kernel | Cat 1/2 | Generic algorithm, but you could add sm_89 `cp.async` for async copies |
+| Custom contiguous copy kernel | Cat 1/2 | Generic algorithm, but i could add sm_89 `cp.async` for async copies |
 | Matmul (via cuBLASLt) | Cat 4 | cuBLAS internally picks the best sm_89 GEMM kernel |
-| SDPA/FlashAttention | Cat 3 | You use the Ampere/Ada code path (not Hopper) |
-| Sparse cross-entropy | Cat 1 | Your custom reduction — same algorithm works everywhere |
+| SDPA/FlashAttention | Cat 3 | i use the Ampere/Ada code path (not Hopper) |
+| Sparse cross-entropy | Cat 1 | our custom reduction — same algorithm works everywhere |
 | Activation backward | Cat 1 | Element-wise — memory-bound, no arch-specific code needed |
 
 ---
