@@ -85,3 +85,48 @@ checkpoints/
 *.qdstrm
 *.sqlite
 
+# =========================
+# BluTrain working dirs (not part of this repo — separate trees)
+# =========================
+BluTrain/
+BluTrain_new/
+final_merge_conflict_fix/
+
+# =========================
+# Gradient dump folders (large binary parameter dumps, multi-GB)
+# =========================
+cpp_grad_dumps*/
+py_grad_dumps*/
+**/cpp_grad_dumps*/
+**/py_grad_dumps*/
+
+# =========================
+# PyTorch init binary (large weight dump from dump_init.py)
+# =========================
+gpt2_init.bin
+**/gpt2_init.bin
+
+# =========================
+# Gradient stats CSVs
+# =========================
+cpp_grads*.csv
+py_grads*.csv
+grad_check*.csv
+grad_check*.txt
+per_param_diff*.csv
+per_module_diff*.csv
+
+# =========================
+# Training logs (large, often 100k+ lines)
+# =========================
+gpt2_*.log
+gpt2_*.txt
+**/gpt2_*.log
+*_grad_check*.txt
+
+# =========================
+# Chat / scratch markdown files (not source-of-truth docs)
+# =========================
+Resolving*.md
+HANDOFF.md
+
