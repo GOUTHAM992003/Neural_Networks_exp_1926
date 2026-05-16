@@ -1,21 +1,7 @@
-# Neural Networks Experiments
+# neural networks and deep-learning framework experiments
 
-This repository contains experiments with neural networks using custom tensor and autograd libraries.
+This repository contains experiments with neural networks using custom tensor and autograd libraries aimed to create a deep learning framework from scratch with no outer dependencies (no cublas or other nvidia libraries) using just cpp and cuda (custom C++ and cuda kernels for all types of operations including own  custom matmul library from scratch) ,enabling for all datatypes better than pytorch/ tensorflow and other  frameworks efficient training stack ... .  
 
-## Dependencies Not Included
-
-The following dependencies are **NOT included** in this repository due to size:
-
-### LibTorch (PyTorch C++ API)
-- **Location:** `libtorch_tests/libtorch/`
-- **Download:** https://pytorch.org/get-started/locally/
-- **Size:** ~2.5 GB
-
-To set up:
-```bash
-cd libtorch_tests/
-wget https://download.pytorch.org/libtorch/cu118/libtorch-cxx11-abi-shared-with-deps-2.1.0%2Bcu118.zip
-unzip libtorch-*.zip
 ```
 
 
