@@ -273,6 +273,138 @@ Array<int, 1024> my_buffer;   // size 1024 is baked in at compile time
 
 In our CUDA kernels this is everywhere — block sizes, thread counts, unroll factors all get passed this way. Because the compiler knows the value at compile time it can unroll loops completely, which gives massive performance gains. The hardware tile-config constants for our sgemm kernels like `BM=256, BN=128, BK=32, STAGES=2, THREADS=256` are all non-type template parameters.
 
+### 4.5 Full self-contained practice program — all four core types together
+
+To make sure the four template types are concrete and not just isolated snippets, here is a complete, compilable C++ program that exercises every one of them in a single file. I wrote this while learning and saved it as `template_practice.cpp` at the repo root. Anyone reading this doc can copy it, compile it, and watch each template feature in action.
+
+```cpp
+#include <iostream>
+#include <string>
+#include <typeinfo>
+
+// =================================================================
+// 1. FUNCTION TEMPLATES
+// =================================================================
+// Instead of writing one add for 'int', one for 'float', one for 'double'...
+// I define a placeholder 'T'. The compiler will generate the actual code.
+template <typename T>
+T add(T a, T b) {
+    std::cout << "[Template add] Operating on type: " << typeid(T).name() << "\n";
+    return a + b;
+}
+
+// =================================================================
+// 2. TEMPLATE SPECIALIZATION
+// =================================================================
+// What if a general template doesn't work for a specific type?
+// For example, what if I want to add two boolean values using logical OR?
+// I "specialize" the template for 'bool' specifically.
+template <>
+bool add<bool>(bool a, bool b) {
+    std::cout << "[Specialized add] Doing logical OR for booleans!\n";
+    return a || b;
+}
+
+// =================================================================
+// 3. STRUCT/CLASS TEMPLATES
+// =================================================================
+// This is exactly like our SumOp<T> or WelfordOps<T>!
+// It's a structure that can hold or operate on any type 'T'.
+template <typename T>
+struct MathOperator {
+    T identity;
+
+    T multiply(T a, T b) {
+        return a * b;
+    }
+};
+
+// =================================================================
+// 4. NON-TYPE TEMPLATE PARAMETERS
+// =================================================================
+// I can pass integers, sizes, or configurations as template parameters!
+// This is evaluated at compile time. This is how warp/block sizes
+// are configured in CUDA.
+template <typename T, int VectorSize>
+struct SIMDVector {
+    T data[VectorSize];
+
+    void print_info() {
+        std::cout << "Vector of type " << typeid(T).name()
+                  << " with compile-time constant size: " << VectorSize << "\n";
+    }
+};
+
+int main() {
+    std::cout << "--- 1. Function Template Practice ---\n";
+    // The compiler automatically figures out T is 'int' and generates:
+    //   int add(int, int)
+    int int_result = add(10, 20);
+    std::cout << "Int result: " << int_result << "\n\n";
+
+    // The compiler automatically figures out T is 'double' and generates:
+    //   double add(double, double)
+    double double_result = add(5.5, 4.5);
+    std::cout << "Double result: " << double_result << "\n\n";
+
+    // This calls the SPECIALIZED version I wrote specifically for bool.
+    // It does logical OR instead of arithmetic addition.
+    bool bool_result = add(true, false);
+    std::cout << "Bool result: " << std::boolalpha << bool_result << "\n\n";
+
+    std::cout << "--- 2. Struct/Class Template Practice ---\n";
+    // I explicitly tell the struct to use 'float'
+    MathOperator<float> float_op;
+    float_op.identity = 1.0f;
+    std::cout << "Float mult: " << float_op.multiply(2.5f, 4.0f) << "\n\n";
+
+    std::cout << "--- 3. Non-Type Template Parameter Practice ---\n";
+    // Creating a vector of size 8 (evaluated at compile time).
+    // The compiler stamps out a fresh SIMDVector struct with
+    // exactly 8 float slots — no runtime allocation.
+    SIMDVector<float, 8> my_vector;
+    my_vector.print_info();
+
+    return 0;
+}
+```
+
+**Compile and run:**
+
+```bash
+g++ -std=c++17 template_practice.cpp -o template_practice && ./template_practice
+```
+
+**Expected output:**
+
+```text
+--- 1. Function Template Practice ---
+[Template add] Operating on type: i
+Int result: 30
+
+[Template add] Operating on type: d
+Double result: 10
+
+[Specialized add] Doing logical OR for booleans!
+Bool result: true
+
+--- 2. Struct/Class Template Practice ---
+Float mult: 10
+
+--- 3. Non-Type Template Parameter Practice ---
+Vector of type f with compile-time constant size: 8
+```
+
+A few things to notice in the output that tie back to what we just learned:
+
+1. **`typeid(T).name()` shows the type the compiler picked for each call.** `i` means `int`, `d` means `double`, `f` means `float`. The names are mangled compiler-specific shorthand (this is GCC's style). It is proof that the compiler generated TWO completely separate functions — `add<int>` and `add<double>` — from one template blueprint.
+
+2. **The `[Specialized add]` line for `bool` proves specialization works.** When I called `add(true, false)`, the compiler skipped the general blueprint and used the specialized override. If specialization had not kicked in, it would have printed `[Template add] Operating on type: b` and tried to do arithmetic addition on booleans.
+
+3. **`SIMDVector<float, 8>` allocates 8 float slots on the stack at compile time.** No `new`, no `malloc`, no runtime size lookup. The compiler bakes `8` into the struct definition. This is exactly the same mechanism that lets our CUDA `sgemm_addmm_sm89_kernel<256, 128, 32, 2, 256, true>` pass tile dimensions as template parameters so the kernel code is fully unrolled and specialized at compile time.
+
+This file lives at the repo root (`/home/blu-bridge016/Downloads/Neural_Networks_exp_1926/template_practice.cpp`) — feel free to modify it, add more specializations, or try non-type parameters with `bool` flags to see how compile-time branching works.
+
 ---
 
 <a id="5-common-doubts"></a>
